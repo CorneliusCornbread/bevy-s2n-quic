@@ -29,11 +29,12 @@ pub struct QuicClient {
 impl QuicClient {
     /// Construct a client with default TLS settings. This will not allow you to connect to
     /// servers with self-signed certs.
-    pub fn new(runtime: &TokioRuntime) -> Self {
+    pub fn new(tokio_runtime: &TokioRuntime) -> Self {
+        let runtime = tokio_runtime.handle().clone();
         let client = runtime.block_on(build());
 
         Self {
-            runtime: runtime.handle().clone(),
+            runtime,
             client,
             id: QuicParentId::generate_unique(QuicParentType::Client),
         }
@@ -42,13 +43,14 @@ impl QuicClient {
     /// Construct a client with custom TLS settings. This is commonly used for development purposes
     /// to allow custom certs.
     pub fn new_with_tls<C: IntoCertificate>(
-        runtime: &TokioRuntime,
+        tokio_runtime: &TokioRuntime,
         certificate: C,
     ) -> Result<Self, TlsError> {
+        let runtime = tokio_runtime.handle().clone();
         let client = runtime.block_on(build_tls(certificate))?;
 
         let ret = Self {
-            runtime: runtime.handle().clone(),
+            runtime,
             client,
             id: QuicParentId::generate_unique(QuicParentType::Client),
         };

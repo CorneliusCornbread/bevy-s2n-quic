@@ -38,7 +38,7 @@ impl QuicServer {
         private_key: PK,
     ) -> Result<Self, Box<dyn Error>> {
         let handle = runtime.handle().clone();
-        let server = runtime.block_on(build_server(bind_ip, certificate, private_key))?;
+        let server = handle.block_on(build_server(bind_ip, certificate, private_key))?;
 
         Ok(Self {
             runtime: handle,

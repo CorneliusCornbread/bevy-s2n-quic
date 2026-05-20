@@ -35,6 +35,7 @@ use crate::common::{
         QuicBidirectionalStreamAttempt, QuicPeerStreamAttempt, QuicReceiveStreamAttempt,
         QuicSendStreamAttempt,
     },
+    task_state::TaskState,
 };
 
 pub mod disconnect;

@@ -30,7 +30,7 @@ use crate::common::{
         stream_flag::StreamFlag,
     },
     stream::{QuicPeerStream, receive::QuicReceiveStream, send::QuicSendStream},
-    task_state::QuicTaskState,
+    task_state::JoinHandleState,
 };
 
 /// Timeout used when the buffered stream type doesn't match what the command
@@ -38,7 +38,7 @@ use crate::common::{
 const ACCEPT_MISMATCH_TIMEOUT: Duration = Duration::from_millis(1);
 
 pub(in crate::common::connection) type ConnectionTaskState =
-    QuicTaskState<ConnectionDisconnectReason>;
+    JoinHandleState<ConnectionDisconnectReason>;
 
 pub(crate) enum ConnectionCommand {
     AcceptReceive {

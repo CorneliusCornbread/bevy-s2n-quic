@@ -1,11 +1,20 @@
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{Arc, OnceLock},
+};
 use tokio::{runtime::Handle, task::JoinHandle};
 
-// TODO: Change this to use Oncelock<T>
-// we're moving to a central orchestrator architecture for
-// async tasks.
+pub trait TaskState<T>
+where
+    T: Clone + From<Arc<dyn Error + Send + Sync>>,
+{
+    fn is_finished(&self) -> bool;
+
+    fn get_disconnect_reason(&mut self) -> Option<T>;
+}
+
 #[derive(Debug)]
-pub(crate) struct QuicTaskState<T>
+pub(crate) struct JoinHandleState<T>
 where
     T: Clone + From<Arc<dyn Error + Send + Sync>>,
 {
@@ -14,7 +23,7 @@ where
     runtime: Handle,
 }
 
-impl<T> QuicTaskState<T>
+impl<T> JoinHandleState<T>
 where
     T: Clone + From<Arc<dyn Error + Send + Sync>>,
 {
@@ -25,20 +34,20 @@ where
             runtime,
         }
     }
+}
 
-    pub fn is_finished(&self) -> bool {
+impl<T> TaskState<T> for JoinHandleState<T>
+where
+    T: Clone + From<Arc<dyn Error + Send + Sync>>,
+{
+    fn is_finished(&self) -> bool {
         if let Some(join) = &self.task {
             return join.is_finished();
         }
         true
     }
-}
 
-impl<T: Clone> QuicTaskState<T>
-where
-    T: From<Arc<dyn Error + Send + Sync>>,
-{
-    pub fn get_disconnect_reason(&mut self) -> Option<T> {
+    fn get_disconnect_reason(&mut self) -> Option<T> {
         if let Some(join_ref) = self.task.as_ref() {
             if !join_ref.is_finished() {
                 return None;
@@ -66,5 +75,40 @@ where
             );
         }
         self.disconnect_reason.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OnceLockState<T> {
+    lock: Arc<OnceLock<T>>,
+}
+
+impl<T> OnceLockState<T>
+where
+    T: Clone + From<Arc<dyn Error + Send + Sync>>,
+{
+    pub(crate) fn new() -> Self {
+        Self {
+            lock: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Sets the internal state for the OnceLock. Returns Err<T> in the event
+    /// the lock has already been set.
+    pub(crate) fn set(&mut self, value: T) -> Result<(), T> {
+        self.lock.set(value)
+    }
+}
+
+impl<T> TaskState<T> for OnceLockState<T>
+where
+    T: Clone + From<Arc<dyn Error + Send + Sync>>,
+{
+    fn is_finished(&self) -> bool {
+        self.lock.get().is_some()
+    }
+
+    fn get_disconnect_reason(&mut self) -> Option<T> {
+        self.lock.get().cloned()
     }
 }

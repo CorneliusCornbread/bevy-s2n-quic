@@ -12,6 +12,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use crate::common::stream::disconnect::StreamDisconnectReason;
 use crate::common::stream::id::StreamId;
 use crate::common::stream::task_state::StreamTaskState;
+use crate::common::task_state::TaskState;
 use crate::common::{HandleChannelError, QuicParentId};
 
 type AddrResult = Result<std::net::SocketAddr, s2n_quic::connection::Error>;

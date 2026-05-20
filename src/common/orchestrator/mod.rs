@@ -1,12 +1,47 @@
-use tokio::{runtime::Handle, task::JoinHandle};
+use tokio::{
+    runtime::Handle,
+    sync::mpsc::{self, Receiver, Sender},
+    task::JoinHandle,
+};
+
+/// Size of the orchestrator channel buffer before it is considered full.
+const ORCHESTRATOR_CHANNEL_SIZE: usize = 128;
+
+pub enum QuicTask {
+    Connection,
+    Send,
+    Receive,
+}
 
 pub(crate) struct AsyncOrchestrator {
     runtime: Handle,
     task_join: JoinHandle<()>,
+    task_sender: Sender<QuicTask>,
 }
 
-impl AsyncOrchestrator {}
+impl AsyncOrchestrator {
+    pub(crate) fn new(runtime: Handle) -> Self {
+        let (tx, rx) = mpsc::channel(ORCHESTRATOR_CHANNEL_SIZE);
 
-struct AsyncOrchestratorTask {}
+        let task = AsyncOrchestratorTask::new(rx);
+        let task_join = runtime.spawn(task.start());
 
-impl AsyncOrchestratorTask {}
+        Self {
+            runtime,
+            task_join,
+            task_sender: tx,
+        }
+    }
+}
+
+struct AsyncOrchestratorTask {
+    task_rec: Receiver<QuicTask>,
+}
+
+impl AsyncOrchestratorTask {
+    fn new(task_rec: Receiver<QuicTask>) -> Self {
+        Self { task_rec }
+    }
+
+    async fn start(self) {}
+}

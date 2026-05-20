@@ -20,9 +20,8 @@ use tokio::{
 
 use crate::common::{
     HandleChannelError, QuicParentId,
-    stream::{
-        disconnect::StreamDisconnectReason, id::StreamId, task_state::StreamTaskState,
-    },
+    stream::{disconnect::StreamDisconnectReason, id::StreamId},
+    task_state::{OnceLockState, TaskState},
 };
 
 type AddrResult = Result<std::net::SocketAddr, s2n_quic::connection::Error>;
@@ -39,7 +38,7 @@ const INBOUND_BUFF_SIZE: usize = 128;
 
 #[derive(Debug, Component)]
 pub struct QuicReceiveStream {
-    task_state: StreamTaskState,
+    task_state: OnceLockState<StreamDisconnectReason>,
     inbound_data: Receiver<RecvPacket>,
     inbound_control: Sender<RecControlMessage>,
     receive_errors: Receiver<Box<dyn Error + Send + Sync>>,
@@ -56,18 +55,21 @@ impl QuicReceiveStream {
             mpsc::channel(CONTROL_CHANNEL_SIZE);
         let (inbound_data_sender, inbound_data) = mpsc::channel(INBOUND_CHANNEL_SIZE);
 
+        let task_state = OnceLockState::new();
+
         let task = RecTask {
             rec,
             control: inbound_control_receiver,
             inbound_sender: inbound_data_sender,
             receive_errors: receive_error_sender,
             disconnect_flag: None,
+            task_state: task_state.clone(),
             addr,
             stream_id,
         };
 
+        // TODO: change this to use orchestrator
         let rec_task = runtime.spawn(task.start());
-        let task_state = StreamTaskState::new(runtime, rec_task);
 
         Self {
             task_state,
@@ -92,6 +94,12 @@ impl QuicReceiveStream {
     /// Returns `true` if this stream is still open
     pub fn is_open(&self) -> bool {
         !self.task_state.is_finished()
+    }
+
+    /// Gets the disconnect reason if the stream has closed.
+    /// Returns `None` if the stream is still open.
+    pub fn get_disconnect_reason(&mut self) -> Option<StreamDisconnectReason> {
+        self.task_state.get_disconnect_reason()
     }
 
     /// Notifies the peer to stop sending data on the stream.
@@ -126,12 +134,6 @@ impl QuicReceiveStream {
         }
     }
 
-    /// Gets the disconnect reason if the stream has closed.
-    /// Returns `None` if the stream is still open.
-    pub fn get_disconnect_reason(&mut self) -> Option<StreamDisconnectReason> {
-        self.task_state.get_disconnect_reason()
-    }
-
     /// Gets the ID information for the parent client or server for this stream
     pub fn parent_id(&self) -> QuicParentId {
         self.stream_id.parent_id()
@@ -153,6 +155,7 @@ struct RecTask {
     inbound_sender: Sender<RecvPacket>,
     receive_errors: Sender<Box<dyn Error + Send + Sync>>,
     disconnect_flag: Option<StreamDisconnectReason>,
+    task_state: OnceLockState<StreamDisconnectReason>,
     addr: AddrResult,
     stream_id: StreamId,
 }
@@ -163,7 +166,7 @@ impl RecTask {
         skip(self),
         fields(stream_id = %self.stream_id, remote_address = ?self.addr)
     )]
-    async fn start(mut self) -> StreamDisconnectReason {
+    async fn start(mut self) {
         info!("Receive stream opened.");
 
         let mut read_buf: [Bytes; INBOUND_BUFF_SIZE] =
@@ -192,7 +195,7 @@ impl RecTask {
                     else {
                         info!("Receive control channel is closed, closing receive stream.");
                         self.disconnect_flag = Some(StreamDisconnectReason::MspcChannelClosed {
-                            channel_name: "Control channel".into()
+                            channel_name: "Control channel"
                         })
                     };
                 }
@@ -203,26 +206,14 @@ impl RecTask {
             }
         }
 
-        let _send_res = self.rec.stop_sending(ErrorCode::UNKNOWN);
-        let instant = TokioInstant::now();
-
-        // Empty out receiver
-        while let Ok(Some(payload)) = self.rec.receive().await {
-            let packet = RecvPacket {
-                recv_at: instant.into_std(),
-                payload,
-            };
-
-            self.transfer_payload_data(packet);
-        }
+        self.stop_and_empty().await;
 
         info!("Receive stream has been closed");
 
-        if let Some(reason) = self.disconnect_flag {
-            return reason;
-        }
-
-        StreamDisconnectReason::NoReason
+        let _res = self.task_state.set(
+            self.disconnect_flag
+                .unwrap_or(StreamDisconnectReason::NoReason),
+        );
     }
 
     fn handle_receive_result(
@@ -298,6 +289,21 @@ impl RecTask {
                     channel_name: "Inbound receive channel".into(),
                 });
             }
+        }
+    }
+
+    async fn stop_and_empty(&mut self) {
+        let _send_res = self.rec.stop_sending(ErrorCode::UNKNOWN);
+        let instant = TokioInstant::now();
+
+        // Empty out receiver
+        while let Ok(Some(payload)) = self.rec.receive().await {
+            let packet = RecvPacket {
+                recv_at: instant.into_std(),
+                payload,
+            };
+
+            self.transfer_payload_data(packet);
         }
     }
 }
