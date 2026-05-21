@@ -4,6 +4,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub mod handle;
+
 /// Size of the orchestrator channel buffer before it is considered full.
 const ORCHESTRATOR_CHANNEL_SIZE: usize = 128;
 
