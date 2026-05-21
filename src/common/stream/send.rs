@@ -156,7 +156,7 @@ impl QuicSendStream {
     }
 }
 
-struct SendTask {
+pub(crate) struct SendTask {
     send: SendStream,
     control: Receiver<SendControlMessage>,
     outbound_receiver: Receiver<Bytes>,

@@ -4,15 +4,20 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::common::{
+    connection::task::ConnectionTask,
+    stream::{receive::RecTask, send::SendTask},
+};
+
 pub mod handle;
 
 /// Size of the orchestrator channel buffer before it is considered full.
 const ORCHESTRATOR_CHANNEL_SIZE: usize = 128;
 
-pub enum QuicTask {
-    Connection,
-    Send,
-    Receive,
+pub(crate) enum QuicTask {
+    Connection(ConnectionTask),
+    Send(SendTask),
+    Receive(RecTask),
 }
 
 pub(crate) struct AsyncOrchestrator {

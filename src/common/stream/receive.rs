@@ -149,7 +149,7 @@ enum RecControlMessage {
     StopSend(ErrorCode),
 }
 
-struct RecTask {
+pub(crate) struct RecTask {
     rec: ReceiveStream,
     control: Receiver<RecControlMessage>,
     inbound_sender: Sender<RecvPacket>,

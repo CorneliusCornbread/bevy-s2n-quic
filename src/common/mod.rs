@@ -7,7 +7,7 @@ use crate::common::id::IdGenerator;
 pub mod attempt;
 pub mod connection;
 pub(crate) mod id;
-pub(crate) mod orchestrator;
+pub mod orchestrator;
 pub mod plugin;
 pub mod runtime;
 pub mod status_code;
