@@ -12,6 +12,10 @@ pub struct OrchestratorHandle {
 }
 
 impl OrchestratorHandle {
+    pub(crate) fn new(sender: Sender<QuicTask>) -> Self {
+        Self { sender }
+    }
+
     #[allow(clippy::result_large_err)]
     pub(crate) fn push_connection(
         &self,

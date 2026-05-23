@@ -1,19 +1,26 @@
-use bevy::ecs::component::Component;
-use bevy::log::tracing::{self};
-use bevy::log::{error, info, warn};
+use bevy::{
+    ecs::component::Component,
+    log::{
+        error, info,
+        tracing::{self},
+        warn,
+    },
+};
 use bytes::Bytes;
 use s2n_quic::stream::SendStream;
 use std::error::Error;
-use tokio::runtime::Handle;
-use tokio::select;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::{
+    runtime::Handle,
+    select,
+    sync::mpsc::{self, Receiver, Sender, error::TrySendError},
+};
 
-use crate::common::stream::disconnect::StreamDisconnectReason;
-use crate::common::stream::id::StreamId;
-use crate::common::stream::task_state::StreamTaskState;
-use crate::common::task_state::TaskState;
-use crate::common::{HandleChannelError, QuicParentId};
+use crate::common::{
+    HandleChannelError, QuicParentId,
+    connection::disconnect::ConnectionDisconnectReason,
+    stream::{id::StreamId, task_state::StreamTaskState},
+    task_state::{OnceLockState, TaskState},
+};
 
 type AddrResult = Result<std::net::SocketAddr, s2n_quic::connection::Error>;
 
@@ -31,7 +38,7 @@ const MAX_OUTBOUND_BUF_SIZE: usize = 128;
 
 #[derive(Debug, Component)]
 pub struct QuicSendStream {
-    task_state: StreamTaskState,
+    task_state: OnceLockState<ConnectionDisconnectReason>,
     outbound_data: Sender<Bytes>,
     outbound_control: Sender<SendControlMessage>,
     send_errors: Receiver<Box<dyn Error + Send + Sync>>,
@@ -49,6 +56,8 @@ impl QuicSendStream {
         let (outbound_data, outbound_data_receiver) =
             mpsc::channel(OUTBOUND_CHANNEL_SIZE);
 
+        let task_state = OnceLockState::new();
+
         let task = SendTask {
             send,
             control: outbound_control_receiver,
@@ -59,8 +68,8 @@ impl QuicSendStream {
             stream_id,
         };
 
+        // TODO: change this to use orchestrator
         let send_task = runtime.spawn(task.start());
-        let task_state = StreamTaskState::new(runtime, send_task);
 
         Self {
             task_state,
@@ -141,7 +150,7 @@ impl QuicSendStream {
 
     /// Gets the disconnect reason if the stream has closed.
     /// Returns `None` if the stream is still open.
-    pub fn get_disconnect_reason(&mut self) -> Option<StreamDisconnectReason> {
+    pub fn get_disconnect_reason(&mut self) -> Option<ConnectionDisconnectReason> {
         self.task_state.get_disconnect_reason()
     }
 
@@ -161,7 +170,7 @@ pub(crate) struct SendTask {
     control: Receiver<SendControlMessage>,
     outbound_receiver: Receiver<Bytes>,
     send_errors: Sender<Box<dyn Error + Send + Sync>>,
-    disconnect_flag: Option<StreamDisconnectReason>,
+    disconnect_flag: Option<ConnectionDisconnectReason>,
     addr: AddrResult,
     stream_id: StreamId,
 }
@@ -172,7 +181,7 @@ impl SendTask {
         skip(self),
         fields(stream_id = %self.stream_id, remote_address = ?self.addr)
     )]
-    async fn start(mut self) -> StreamDisconnectReason {
+    async fn start(mut self) -> ConnectionDisconnectReason {
         info!("Send stream opened.");
 
         let mut send_buf = Vec::with_capacity(MIN_OUTBOUND_BUF_SIZE);
@@ -186,7 +195,7 @@ impl SendTask {
                             "Outbound send channel was closed by the remote peer."
                         );
 
-                        self.disconnect_flag = Some(StreamDisconnectReason::MspcChannelClosed{channel_name: "Outbound channel".into()})
+                        self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: "Outbound channel".into()})
                     }
 
                     let err_opt = self.send.send_vectored(&mut send_buf[..count]).await;
@@ -200,7 +209,7 @@ impl SendTask {
                                     "Send stream is in an invalid state, quitting:\n{}",
                                     source
                                 );
-                                self.disconnect_flag = Some(StreamDisconnectReason::InvalidStream)
+                                self.disconnect_flag = Some(ConnectionDisconnectReason::InvalidStream)
                             }
 
                             s2n_quic::stream::Error::StreamReset {
@@ -210,7 +219,7 @@ impl SendTask {
                                     "Send stream has encountered a stream reset:\n{}",
                                     error
                                 );
-                                self.disconnect_flag = Some(StreamDisconnectReason::Reset(error));
+                                self.disconnect_flag = Some(ConnectionDisconnectReason::Reset(error));
                             }
 
                             _ => {
@@ -240,7 +249,7 @@ impl SendTask {
                                     self.send_errors.try_send(Box::new(e)).handle_err();
                                 }
 
-                                self.disconnect_flag = Some(StreamDisconnectReason::UserClosed);
+                                self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
                             }
 
                             SendControlMessage::Flush => {
@@ -262,7 +271,7 @@ impl SendTask {
                         info!(
                             "Control channel has been dropped. Quitting...",
                         );
-                        self.disconnect_flag = Some(StreamDisconnectReason::MspcChannelClosed{channel_name: "Control channel".into()})
+                        self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: "Control channel".into()})
                     };
                 }
             }
@@ -288,7 +297,7 @@ impl SendTask {
         }
         // In theory this should never happen
         else {
-            StreamDisconnectReason::NoReason
+            ConnectionDisconnectReason::NoReason
         }
     }
 }

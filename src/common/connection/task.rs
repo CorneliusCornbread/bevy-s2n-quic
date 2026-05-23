@@ -37,6 +37,9 @@ use crate::common::{
 /// asked for, so we do a short poll to see if the right type is available.
 const ACCEPT_MISMATCH_TIMEOUT: Duration = Duration::from_millis(1);
 
+/// Connection command channel message
+const CONN_CMD_MSG: &str = "Connection command channel";
+
 pub(in crate::common::connection) type ConnectionTaskState =
     JoinHandleState<ConnectionDisconnectReason>;
 
@@ -196,7 +199,7 @@ impl ConnectionTask {
                     None => {
                         self.disconnect_flag =
                             Some(ConnectionDisconnectReason::MspcChannelClosed {
-                                channel_name: "Connection command channel".into(),
+                                channel_name: CONN_CMD_MSG,
                             });
                     }
                 }
@@ -214,7 +217,7 @@ impl ConnectionTask {
                             None => {
                                 self.disconnect_flag = Some(
                                     ConnectionDisconnectReason::MspcChannelClosed {
-                                        channel_name: "Connection command channel".into(),
+                                        channel_name: CONN_CMD_MSG
                                     },
                                 );
                             }

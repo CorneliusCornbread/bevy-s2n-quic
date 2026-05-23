@@ -1,22 +1,21 @@
-use aeronet_io::{anyhow::anyhow, connection::DisconnectReason};
-use s2n_quic::connection::{Error as ConnectionError, error::Code};
 use std::{error::Error, sync::Arc};
 
-const PEER_CLOSED_WITHOUT_CODE: &str =
-    "Connection has been closed by user without an error";
+use aeronet_io::{anyhow::anyhow, connection::DisconnectReason};
+use s2n_quic::connection::Error as ConnectionError;
 
 #[derive(Clone, Debug)]
 pub enum ConnectionDisconnectReason {
-    /// Connection was closed by the local user explicitly
-    UserClosed(Code),
-    /// Connection was closed by the peer without an error
+    UserClosed,
     PeerClosed,
-    /// Connection was closed or errored elsewhere
-    ConnectionError(ConnectionError),
+    Reset(s2n_quic::application::Error),
+    InvalidStream,
+    ConnectionError(s2n_quic::connection::Error),
     MspcChannelClosed {
-        channel_name: String,
+        channel_name: &'static str,
     },
     InternalError(Arc<dyn Error + Send + Sync>),
+    /// This should in theory never happen
+    NoReason,
 }
 
 impl From<Arc<dyn Error + Send + Sync>> for ConnectionDisconnectReason {
@@ -28,78 +27,37 @@ impl From<Arc<dyn Error + Send + Sync>> for ConnectionDisconnectReason {
 impl From<ConnectionDisconnectReason> for DisconnectReason {
     fn from(val: ConnectionDisconnectReason) -> Self {
         match val {
-            ConnectionDisconnectReason::UserClosed(code) => DisconnectReason::ByUser(
-                format!("Connection closed by user with error code {}", code),
-            ),
-            ConnectionDisconnectReason::PeerClosed => {
-                DisconnectReason::ByPeer(PEER_CLOSED_WITHOUT_CODE.to_owned())
+            ConnectionDisconnectReason::UserClosed => {
+                DisconnectReason::ByUser("Send stream stopped by self.".to_owned())
             }
-            ConnectionDisconnectReason::ConnectionError(conn_err) => match conn_err {
-                s2n_quic::connection::Error::Application {
-                    error, initiator, ..
-                } => match initiator {
-                    s2n_quic::provider::event::Location::Local => {
-                        DisconnectReason::ByUser(format!(
-                            "Connection has been closed by user with error code: {}",
-                            error
-                        ))
-                    }
-                    s2n_quic::provider::event::Location::Remote => {
-                        DisconnectReason::ByPeer(format!(
-                            "Connection has been closed by peer with error code: {}",
-                            error
-                        ))
-                    }
-                },
-                s2n_quic::connection::Error::Closed { initiator, .. } => {
-                    match initiator {
-                        s2n_quic::provider::event::Location::Local => {
-                            DisconnectReason::ByUser(PEER_CLOSED_WITHOUT_CODE.to_owned())
-                        }
-                        s2n_quic::provider::event::Location::Remote => {
-                            DisconnectReason::ByPeer(
-                                "Connection has been closed by peer without an error"
-                                    .to_owned(),
-                            )
-                        }
-                    }
-                }
-                s2n_quic::connection::Error::Transport {
-                    code,
-                    reason,
-                    initiator,
-                    ..
-                } => match initiator {
-                    s2n_quic::provider::event::Location::Local => {
-                        DisconnectReason::ByUser(format!(
-                            "Connection has been closed at the transport level by the user with the code: {}, with the reason {}",
-                            code, reason
-                        ))
-                    }
-                    s2n_quic::provider::event::Location::Remote => {
-                        DisconnectReason::ByPeer(format!(
-                            "Connection has been closed at the transport level by the peer with the code: {}, with the reason {}",
-                            code, reason
-                        ))
-                    }
-                },
-                s2n_quic::connection::Error::EndpointClosing { .. } => {
-                    DisconnectReason::ByUser("Local endpoint closing".to_owned())
-                }
-                _ => DisconnectReason::ByError(anyhow!(
-                    "Connection has been closed due to a connection error: {conn_err}"
-                )),
-            },
+            ConnectionDisconnectReason::PeerClosed => {
+                DisconnectReason::ByPeer("Stream closed by peer.".to_owned())
+            }
+            ConnectionDisconnectReason::Reset(error) => DisconnectReason::ByError(
+                anyhow!("Stream closed by reset with code: {error}"),
+            ),
+            ConnectionDisconnectReason::InvalidStream => {
+                DisconnectReason::ByError(anyhow!("Stream is no longer valid"))
+            }
+            ConnectionDisconnectReason::ConnectionError(error) => {
+                DisconnectReason::ByError(anyhow!(
+                    "Stream has been closed due to a connection error: {error}"
+                ))
+            }
+
             ConnectionDisconnectReason::MspcChannelClosed { channel_name } => {
                 DisconnectReason::ByError(anyhow!(
-                    "Connection was closed due to an IPC channel \"{channel_name}\" being closed"
+                    "Stream was closed due to an IPC channel \"{channel_name}\" being closed"
                 ))
             }
             ConnectionDisconnectReason::InternalError(error) => {
                 DisconnectReason::ByError(anyhow!(
-                    "Connection was closed due to an internal error: {error}"
+                    "Stream was closed due to an internal error: {error}"
                 ))
             }
+            ConnectionDisconnectReason::NoReason => DisconnectReason::ByError(anyhow!(
+                "Stream was closed without reason, this is a bug :("
+            )),
         }
     }
 }

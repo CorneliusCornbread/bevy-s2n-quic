@@ -16,8 +16,9 @@ use bevy::{
 };
 use std::time::Instant;
 
-use crate::common::stream::{
-    disconnect::StreamDisconnectReason, receive::QuicReceiveStream, send::QuicSendStream,
+use crate::common::{
+    connection::disconnect::ConnectionDisconnectReason,
+    stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
 
 const MIN_MTU: usize = 1200;
@@ -151,7 +152,11 @@ fn fire_rec_disconnect_events(
     }
 }
 
-fn fire_disconnect(cmd: &mut Commands, entity: Entity, reason: StreamDisconnectReason) {
+fn fire_disconnect(
+    cmd: &mut Commands,
+    entity: Entity,
+    reason: ConnectionDisconnectReason,
+) {
     cmd.trigger(Disconnected {
         entity,
         reason: reason.into(),

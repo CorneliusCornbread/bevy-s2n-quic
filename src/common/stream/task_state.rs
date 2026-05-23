@@ -1,6 +1,6 @@
 use crate::common::{
-    stream::disconnect::StreamDisconnectReason, task_state::JoinHandleState,
+    connection::disconnect::ConnectionDisconnectReason, task_state::JoinHandleState,
 };
 
 pub(in crate::common::stream) type StreamTaskState =
-    JoinHandleState<StreamDisconnectReason>;
+    JoinHandleState<ConnectionDisconnectReason>;

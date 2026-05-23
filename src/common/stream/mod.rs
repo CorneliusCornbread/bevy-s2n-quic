@@ -12,7 +12,6 @@ use crate::common::{
     stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
 
-pub mod disconnect;
 pub mod id;
 pub mod plugin;
 pub mod receive;

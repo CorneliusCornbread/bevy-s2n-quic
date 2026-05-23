@@ -1,3 +1,4 @@
+use futures::stream::FuturesUnordered;
 use tokio::{
     runtime::Handle,
     sync::mpsc::{self, Receiver, Sender},
@@ -6,6 +7,7 @@ use tokio::{
 
 use crate::common::{
     connection::task::ConnectionTask,
+    orchestrator::{self, handle::OrchestratorHandle},
     stream::{receive::RecTask, send::SendTask},
 };
 
@@ -23,7 +25,7 @@ pub(crate) enum QuicTask {
 pub(crate) struct AsyncOrchestrator {
     runtime: Handle,
     task_join: JoinHandle<()>,
-    task_sender: Sender<QuicTask>,
+    orchestrator: OrchestratorHandle,
 }
 
 impl AsyncOrchestrator {
@@ -32,12 +34,17 @@ impl AsyncOrchestrator {
 
         let task = AsyncOrchestratorTask::new(rx);
         let task_join = runtime.spawn(task.start());
+        let orchestrator = OrchestratorHandle::new(tx);
 
         Self {
             runtime,
             task_join,
-            task_sender: tx,
+            orchestrator,
         }
+    }
+
+    pub(crate) fn handle(&self) -> &OrchestratorHandle {
+        &self.orchestrator
     }
 }
 
@@ -50,5 +57,7 @@ impl AsyncOrchestratorTask {
         Self { task_rec }
     }
 
-    async fn start(self) {}
+    async fn start(self) {
+        'running: loop {}
+    }
 }
