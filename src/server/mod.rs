@@ -7,7 +7,8 @@ use tokio::{runtime::Handle, task::JoinError};
 
 use crate::{
     common::{
-        QuicParentId, QuicParentType, connection::QuicConnection, runtime::TokioRuntime,
+        QuicParentId, QuicParentType, connection::QuicConnection,
+        orchestrator::handle::OrchestratorHandle, runtime::TokioRuntime,
     },
     server::marker::QuicServerMarker,
 };
@@ -24,6 +25,7 @@ pub struct QuicServer {
     runtime: Handle,
     server: Server,
     id: QuicParentId,
+    orchestrator: OrchestratorHandle,
 }
 
 impl QuicServer {
@@ -39,11 +41,13 @@ impl QuicServer {
     ) -> Result<Self, Box<dyn Error>> {
         let handle = runtime.handle().clone();
         let server = handle.block_on(build_server(bind_ip, certificate, private_key))?;
+        let orchestrator = runtime.orchestrator().clone();
 
         Ok(Self {
             runtime: handle,
             server,
             id: QuicParentId::generate_unique(QuicParentType::Server),
+            orchestrator,
         })
     }
 
@@ -59,6 +63,7 @@ impl QuicServer {
                 if let Some(conn) = conn_opt {
                     let ret = ConnectionPoll::NewConnection(QuicConnection::new(
                         self.runtime.clone(),
+                        self.orchestrator.clone(),
                         conn,
                         self.id,
                     ));

@@ -29,6 +29,7 @@ use crate::common::{
         open_flag::OpenFlag,
         stream_flag::StreamFlag,
     },
+    orchestrator::{self, handle::OrchestratorHandle},
     stream::{QuicPeerStream, receive::QuicReceiveStream, send::QuicSendStream},
     task_state::{JoinHandleState, OnceLockState},
 };
@@ -62,6 +63,7 @@ pub(crate) enum ConnectionCommand {
 #[derive(Debug)]
 pub(crate) struct ConnectionHandleTask {
     connection: ConnectionHandle,
+    orchestrator: OrchestratorHandle,
     is_open: OpenFlag,
     remote_addr: Result<SocketAddr, ConnectionError>,
     connection_id: ConnectionId,
@@ -82,6 +84,7 @@ impl fmt::Display for ConnectionHandleTask {
 impl ConnectionHandleTask {
     pub(super) fn new(
         connection: ConnectionHandle,
+        orchestrator: OrchestratorHandle,
         is_open: OpenFlag,
         connection_id: ConnectionId,
     ) -> Self {
@@ -92,6 +95,7 @@ impl ConnectionHandleTask {
             is_open,
             remote_addr,
             connection_id,
+            orchestrator,
         }
     }
 
@@ -109,11 +113,13 @@ impl ConnectionHandleTask {
 
                 let quic_send = QuicSendStream::new(
                     Handle::current(),
+                    self.orchestrator.clone(),
                     send_stream,
                     self.connection_id.parent_id(),
                 );
                 let quic_rec = QuicReceiveStream::new(
                     Handle::current(),
+                    self.orchestrator.clone(),
                     rec_stream,
                     self.connection_id.parent_id(),
                 );
@@ -134,6 +140,7 @@ impl ConnectionHandleTask {
             Ok(stream) => {
                 let quic_send = QuicSendStream::new(
                     Handle::current(),
+                    self.orchestrator.clone(),
                     stream,
                     self.connection_id.parent_id(),
                 );
@@ -155,6 +162,7 @@ pub(crate) struct ConnectionTask {
     task_state: OnceLockState<ConnectionDisconnectReason>,
     /// Holds a stream that arrived before a matching command was ready to consume it.
     buffered_stream: Option<PeerStream>,
+    orchestrator: OrchestratorHandle,
 }
 
 impl ConnectionTask {
@@ -165,6 +173,7 @@ impl ConnectionTask {
         is_open: OpenFlag,
         pending_stream: Arc<StreamFlag>,
         task_state: OnceLockState<ConnectionDisconnectReason>,
+        orchestrator: OrchestratorHandle,
     ) -> Self {
         Self {
             connection,
@@ -175,6 +184,7 @@ impl ConnectionTask {
             connection_id,
             buffered_stream: None,
             task_state,
+            orchestrator,
         }
     }
 
@@ -276,6 +286,7 @@ impl ConnectionTask {
                 if let Some(stream) = self.buffered_stream.take() {
                     let peer_stream = QuicPeerStream::new(
                         Handle::current(),
+                        self.orchestrator.clone(),
                         stream,
                         self.connection_id.parent_id(),
                     );
@@ -296,6 +307,7 @@ impl ConnectionTask {
                     Some(PeerStream::Receive(stream)) => {
                         let rec = QuicReceiveStream::new(
                             Handle::current(),
+                            self.orchestrator.clone(),
                             stream,
                             self.connection_id.parent_id(),
                         );
@@ -322,11 +334,13 @@ impl ConnectionTask {
                         let (rec, send) = stream.split();
                         let rec = QuicReceiveStream::new(
                             Handle::current(),
+                            self.orchestrator.clone(),
                             rec,
                             self.connection_id.parent_id(),
                         );
                         let send = QuicSendStream::new(
                             Handle::current(),
+                            self.orchestrator.clone(),
                             send,
                             self.connection_id.parent_id(),
                         );
@@ -373,6 +387,7 @@ impl ConnectionTask {
                 let mapped = opt.map(|s| {
                     QuicReceiveStream::new(
                         Handle::current(),
+                        self.orchestrator.clone(),
                         s,
                         self.connection_id.parent_id(),
                     )
@@ -425,11 +440,13 @@ impl ConnectionTask {
                     let (rec, send) = bidir.split();
                     let rec = QuicReceiveStream::new(
                         Handle::current(),
+                        self.orchestrator.clone(),
                         rec,
                         self.connection_id.parent_id(),
                     );
                     let send = QuicSendStream::new(
                         Handle::current(),
+                        self.orchestrator.clone(),
                         send,
                         self.connection_id.parent_id(),
                     );

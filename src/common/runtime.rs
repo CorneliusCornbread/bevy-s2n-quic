@@ -1,7 +1,7 @@
 use bevy::ecs::resource::Resource;
 use tokio::runtime::{Handle, Runtime};
 
-use crate::common::orchestrator::AsyncOrchestrator;
+use crate::common::orchestrator::{AsyncOrchestrator, handle::OrchestratorHandle};
 
 #[derive(Resource)]
 pub struct TokioRuntime {
@@ -26,12 +26,15 @@ impl Default for TokioRuntime {
 }
 
 impl TokioRuntime {
+    /// Get the Tokio runtime [Handle] used for all
+    /// async tasks.
     pub fn handle(&self) -> &Handle {
         self.runtime.handle()
     }
 
-    // TODO: Finalize return type
-    pub fn get_orchestrator_state(&self) -> bool {
-        todo!()
+    /// Returns a handle to the async task orchestrator.
+    /// This allows for the management and scheduling of async tasks.
+    pub(crate) fn orchestrator(&self) -> &OrchestratorHandle {
+        self.orchestrator.handle()
     }
 }

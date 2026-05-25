@@ -18,6 +18,7 @@ use tokio::{
 use crate::common::{
     HandleChannelError, QuicParentId,
     connection::disconnect::ConnectionDisconnectReason,
+    orchestrator::{self, handle::OrchestratorHandle},
     stream::{id::StreamId, task_state::StreamTaskState},
     task_state::{OnceLockState, TaskState},
 };
@@ -45,10 +46,16 @@ pub struct QuicSendStream {
     outbound_control: Sender<SendControlMessage>,
     send_errors: Receiver<Box<dyn Error + Send + Sync>>,
     stream_id: StreamId,
+    orchestrator: OrchestratorHandle,
 }
 
 impl QuicSendStream {
-    pub fn new(runtime: Handle, send: SendStream, parent_id: QuicParentId) -> Self {
+    pub fn new(
+        runtime: Handle,
+        orchestrator: OrchestratorHandle,
+        send: SendStream,
+        parent_id: QuicParentId,
+    ) -> Self {
         let stream_id = StreamId::new(parent_id, send.id());
         let addr = send.connection().local_addr();
 
@@ -80,6 +87,7 @@ impl QuicSendStream {
             outbound_control,
             send_errors,
             stream_id,
+            orchestrator,
         }
     }
 
