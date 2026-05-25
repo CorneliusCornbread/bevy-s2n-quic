@@ -173,48 +173,59 @@ impl RecTask {
         let mut read_buf: [Bytes; INBOUND_BUFF_SIZE] =
             std::array::from_fn(|_| Bytes::new());
 
-        'running: loop {
-            select! {
-                biased;
-
-                result = self.rec.receive_vectored(&mut read_buf) => {
-                    self.handle_receive_result(&mut read_buf, result);
-                }
-
-                cmd_opt = self.control.recv() => {
-                    if let Some(cmd) = cmd_opt {
-                        match cmd {
-                            RecControlMessage::StopSend(error_code) => {
-                                self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
-
-                                if let Err(stream_err) = self.rec.stop_sending(error_code) {
-                                    warn!("Stream error on receive stop_send():\n{stream_err}");
-                                }
-                            }
-                        }
-                    }
-                    else {
-                        info!("Receive control channel is closed, closing receive stream.");
-                        self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed {
-                            channel_name: "Control channel"
-                        })
-                    };
-                }
-            }
-
-            if self.disconnect_flag.is_some() {
-                break 'running;
-            }
+        while self.disconnect_flag.is_none() {
+            self.poll_once().await;
         }
-
-        self.stop_and_empty().await;
-
-        info!("Receive stream has been closed");
 
         let _res = self.task_state.set(
             self.disconnect_flag
-                .unwrap_or(ConnectionDisconnectReason::NoReason),
+                .expect("Receive loop exited without the flag being set"),
         );
+    }
+
+    pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
+        if self.disconnect_flag.is_some() {
+            return &self.disconnect_flag;
+        }
+
+        let mut read_buf: [Bytes; INBOUND_BUFF_SIZE] =
+            std::array::from_fn(|_| Bytes::new());
+
+        select! {
+            biased;
+
+            result = self.rec.receive_vectored(&mut read_buf) => {
+                self.handle_receive_result(&mut read_buf, result);
+            }
+
+            cmd_opt = self.control.recv() => {
+                if let Some(cmd) = cmd_opt {
+                    match cmd {
+                        RecControlMessage::StopSend(error_code) => {
+                            self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
+
+                            if let Err(stream_err) = self.rec.stop_sending(error_code) {
+                                warn!("Stream error on receive stop_send():\n{stream_err}");
+                            }
+                        }
+                    }
+                }
+                else {
+                    info!("Receive control channel is closed, closing receive stream.");
+                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed {
+                        channel_name: "Control channel"
+                    })
+                };
+            }
+        }
+
+        if self.disconnect_flag.is_some() {
+            self.stop_and_empty().await;
+
+            info!("Receive stream has been closed");
+        }
+
+        return &self.disconnect_flag;
     }
 
     fn handle_receive_result(

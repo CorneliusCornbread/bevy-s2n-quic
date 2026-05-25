@@ -35,7 +35,7 @@ use crate::common::{
         QuicBidirectionalStreamAttempt, QuicPeerStreamAttempt, QuicReceiveStreamAttempt,
         QuicSendStreamAttempt,
     },
-    task_state::TaskState,
+    task_state::{OnceLockState, TaskState},
 };
 
 pub mod disconnect;
@@ -81,7 +81,7 @@ impl QuicConnectionAttempt {
 pub struct QuicConnection {
     runtime: Handle,
     conn_handle: ConnectionHandle,
-    task_state: ConnectionTaskState,
+    task_state: OnceLockState<ConnectionDisconnectReason>,
     conn_command_channel: mpsc::Sender<ConnectionCommand>,
     is_open: OpenFlag,
     connection_id: ConnectionId,
@@ -112,6 +112,8 @@ impl QuicConnection {
             );
         }
 
+        let task_state = OnceLockState::new();
+
         let is_open = OpenFlag::new(true);
         let conn_handle = connection.handle();
         let task = ConnectionTask::new(
@@ -120,14 +122,16 @@ impl QuicConnection {
             connection_id,
             is_open.clone(),
             pending_stream.clone(),
+            task_state.clone(),
         );
 
+        // TODO: move to task orchestrator
         let handle = runtime.spawn(task.start());
 
         Self {
             runtime: runtime.clone(),
             conn_handle,
-            task_state: ConnectionTaskState::new(runtime, handle),
+            task_state,
             conn_command_channel: send,
             is_open,
             connection_id,

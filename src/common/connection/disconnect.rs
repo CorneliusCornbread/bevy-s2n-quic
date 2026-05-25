@@ -9,13 +9,10 @@ pub enum ConnectionDisconnectReason {
     PeerClosed,
     Reset(s2n_quic::application::Error),
     InvalidStream,
+    //TODO: change this to store the error in an arc
     ConnectionError(s2n_quic::connection::Error),
-    MspcChannelClosed {
-        channel_name: &'static str,
-    },
+    MspcChannelClosed { channel_name: &'static str },
     InternalError(Arc<dyn Error + Send + Sync>),
-    /// This should in theory never happen
-    NoReason,
 }
 
 impl From<Arc<dyn Error + Send + Sync>> for ConnectionDisconnectReason {
@@ -55,9 +52,6 @@ impl From<ConnectionDisconnectReason> for DisconnectReason {
                     "Stream was closed due to an internal error: {error}"
                 ))
             }
-            ConnectionDisconnectReason::NoReason => DisconnectReason::ByError(anyhow!(
-                "Stream was closed without reason, this is a bug :("
-            )),
         }
     }
 }

@@ -36,6 +36,8 @@ const MIN_OUTBOUND_BUF_SIZE: usize = 64;
 /// Maximum size of the send buffer of Bytes chunks we can receive at once is to send to bevy
 const MAX_OUTBOUND_BUF_SIZE: usize = 128;
 
+const OUTBOUND_CHANNEL_NAME: &str = "Outbound channel";
+
 #[derive(Debug, Component)]
 pub struct QuicSendStream {
     task_state: OnceLockState<ConnectionDisconnectReason>,
@@ -61,6 +63,7 @@ impl QuicSendStream {
         let task = SendTask {
             send,
             control: outbound_control_receiver,
+            task_state: task_state.clone(),
             outbound_receiver: outbound_data_receiver,
             send_errors: send_error_sender,
             disconnect_flag: None,
@@ -168,6 +171,7 @@ impl QuicSendStream {
 pub(crate) struct SendTask {
     send: SendStream,
     control: Receiver<SendControlMessage>,
+    task_state: OnceLockState<ConnectionDisconnectReason>,
     outbound_receiver: Receiver<Bytes>,
     send_errors: Sender<Box<dyn Error + Send + Sync>>,
     disconnect_flag: Option<ConnectionDisconnectReason>,
@@ -181,7 +185,7 @@ impl SendTask {
         skip(self),
         fields(stream_id = %self.stream_id, remote_address = ?self.addr)
     )]
-    async fn start(mut self) -> ConnectionDisconnectReason {
+    async fn start(mut self) {
         info!("Send stream opened.");
 
         let mut send_buf = Vec::with_capacity(MIN_OUTBOUND_BUF_SIZE);
@@ -195,7 +199,7 @@ impl SendTask {
                             "Outbound send channel was closed by the remote peer."
                         );
 
-                        self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: "Outbound channel".into()})
+                        self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: OUTBOUND_CHANNEL_NAME.into()})
                     }
 
                     let err_opt = self.send.send_vectored(&mut send_buf[..count]).await;
@@ -292,13 +296,105 @@ impl SendTask {
             )
         }
 
-        if let Some(reason) = self.disconnect_flag {
-            reason
+        let _res = self.task_state.set(
+            self.disconnect_flag
+                .expect("Receive loop exited without the flag being set"),
+        );
+    }
+
+    pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
+        let mut send_buf = Vec::with_capacity(MIN_OUTBOUND_BUF_SIZE);
+
+        select! {
+            count = self.outbound_receiver.recv_many(&mut send_buf, MAX_OUTBOUND_BUF_SIZE) => {
+                // channel closed
+                if count == 0 {
+                    warn!(
+                        "Outbound send channel was closed by the remote peer."
+                    );
+
+                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: OUTBOUND_CHANNEL_NAME.into()})
+                }
+
+                let err_opt = self.send.send_vectored(&mut send_buf[..count]).await;
+                send_buf.clear();
+
+                if let Err(err) = err_opt {
+                    match err {
+                        s2n_quic::stream::Error::InvalidStream { source, .. }
+                        | s2n_quic::stream::Error::SendAfterFinish { source, .. } => {
+                            error!(
+                                "Send stream is in an invalid state, quitting:\n{}",
+                                source
+                            );
+                            self.disconnect_flag = Some(ConnectionDisconnectReason::InvalidStream)
+                        }
+
+                        s2n_quic::stream::Error::StreamReset {
+                            error, source: _, ..
+                        } => {
+                            error!(
+                                "Send stream has encountered a stream reset:\n{}",
+                                error
+                            );
+                            self.disconnect_flag = Some(ConnectionDisconnectReason::Reset(error));
+                        }
+
+                        _ => {
+                            error!(
+                                "Send stream error:\n{}",
+                                err
+                            );
+                        }
+                    }
+
+                    self.send_errors.try_send(Box::new(err)).handle_err();
+                }
+            }
+
+            cmd_opt = self.control.recv() => {
+                if let Some(cmd) = cmd_opt {
+                    match cmd {
+                        SendControlMessage::CloseAndQuit => {
+                            let res = self.send.close().await;
+
+                            if let Err(e) = res {
+                                error!(
+                                    "Send stream errored when closing stream:\n{}",
+                                    e
+                                );
+
+                                self.send_errors.try_send(Box::new(e)).handle_err();
+                            }
+
+                            self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
+                        }
+
+                        SendControlMessage::Flush => {
+                            let res = self.send.flush().await;
+
+                            if let Err(e) = res {
+                                error!(
+                                    "Send stream errored when flushing stream:\n{}",
+                                    e
+                                );
+
+                                self.send_errors.try_send(Box::new(e)).handle_err();
+                            }
+                        }
+                    }
+                }
+                else {
+                    // Control channel has been dropped
+                    info!(
+                        "Control channel has been dropped. Quitting...",
+                    );
+                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: "Control channel".into()})
+                };
+            }
         }
-        // In theory this should never happen
-        else {
-            ConnectionDisconnectReason::NoReason
-        }
+
+        return &self.disconnect_flag;
     }
 }
 

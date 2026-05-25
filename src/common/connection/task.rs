@@ -30,7 +30,7 @@ use crate::common::{
         stream_flag::StreamFlag,
     },
     stream::{QuicPeerStream, receive::QuicReceiveStream, send::QuicSendStream},
-    task_state::JoinHandleState,
+    task_state::{JoinHandleState, OnceLockState},
 };
 
 /// Timeout used when the buffered stream type doesn't match what the command
@@ -152,6 +152,7 @@ pub(crate) struct ConnectionTask {
     is_open: OpenFlag,
     pending_stream: Arc<StreamFlag>,
     connection_id: ConnectionId,
+    task_state: OnceLockState<ConnectionDisconnectReason>,
     /// Holds a stream that arrived before a matching command was ready to consume it.
     buffered_stream: Option<PeerStream>,
 }
@@ -163,6 +164,7 @@ impl ConnectionTask {
         connection_id: ConnectionId,
         is_open: OpenFlag,
         pending_stream: Arc<StreamFlag>,
+        task_state: OnceLockState<ConnectionDisconnectReason>,
     ) -> Self {
         Self {
             connection,
@@ -172,6 +174,7 @@ impl ConnectionTask {
             pending_stream,
             connection_id,
             buffered_stream: None,
+            task_state,
         }
     }
 
@@ -187,71 +190,81 @@ impl ConnectionTask {
         info!("New connection opened");
 
         while self.disconnect_flag.is_none() {
-            // If we have a buffered stream, we only need to wait for a command
-            // that will consume it.
-            if self.buffered_stream.is_some() {
-                self.pending_stream.set_true();
-                match self.cmd_receiver.recv().await {
-                    Some(cmd) => {
-                        let res = self.handle_command(cmd).await;
-                        self.handle_cmd_result(res).await;
-                    }
-                    None => {
-                        self.disconnect_flag =
-                            Some(ConnectionDisconnectReason::MspcChannelClosed {
-                                channel_name: CONN_CMD_MSG,
-                            });
-                    }
-                }
-            } else {
-                // No buffered stream: race commands against an incoming stream.
-                select! {
-                    biased;
-
-                    cmd_opt = self.cmd_receiver.recv() => {
-                        match cmd_opt {
-                            Some(cmd) => {
-                                let res = self.handle_command(cmd).await;
-                                self.handle_cmd_result(res).await;
-                            }
-                            None => {
-                                self.disconnect_flag = Some(
-                                    ConnectionDisconnectReason::MspcChannelClosed {
-                                        channel_name: CONN_CMD_MSG
-                                    },
-                                );
-                            }
-                        }
-                    }
-
-                    accept_res = self.connection.accept() => {
-                        match accept_res {
-                            Ok(Some(stream)) => {
-                                // Buffer it, the next command will consume it.
-                                self.buffered_stream = Some(stream);
-                            }
-                            Ok(None) => {
-                                self.disconnect_flag = Some(
-                                    ConnectionDisconnectReason::PeerClosed
-                                );
-                            }
-                            Err(err) => {
-                                if err.is_closed() {
-                                    self.is_open.set_closed();
-                                }
-                                self.disconnect_flag =
-                                    Some(ConnectionDisconnectReason::ConnectionError(err));
-                            }
-                        }
-                    }
-                }
-            }
+            self.poll_once();
         }
 
         self.disconnect_flag
             .unwrap_or(ConnectionDisconnectReason::InternalError(Arc::new(
                 MissingErrorData,
             )))
+    }
+
+    pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
+        if self.disconnect_flag.is_some() {
+            return &self.disconnect_flag;
+        }
+
+        // If we have a buffered stream, we only need to wait for a command
+        // that will consume it.
+        if self.buffered_stream.is_some() {
+            self.pending_stream.set_true();
+            match self.cmd_receiver.recv().await {
+                Some(cmd) => {
+                    let res = self.handle_command(cmd).await;
+                    self.handle_cmd_result(res).await;
+                }
+                None => {
+                    self.disconnect_flag =
+                        Some(ConnectionDisconnectReason::MspcChannelClosed {
+                            channel_name: CONN_CMD_MSG,
+                        });
+                }
+            }
+        } else {
+            // No buffered stream: race commands against an incoming stream.
+            select! {
+                biased;
+
+                cmd_opt = self.cmd_receiver.recv() => {
+                    match cmd_opt {
+                        Some(cmd) => {
+                            let res = self.handle_command(cmd).await;
+                            self.handle_cmd_result(res).await;
+                        }
+                        None => {
+                            self.disconnect_flag = Some(
+                                ConnectionDisconnectReason::MspcChannelClosed {
+                                    channel_name: CONN_CMD_MSG
+                                },
+                            );
+                        }
+                    }
+                }
+
+                accept_res = self.connection.accept() => {
+                    match accept_res {
+                        Ok(Some(stream)) => {
+                            // Buffer it, the next command will consume it.
+                            self.buffered_stream = Some(stream);
+                        }
+                        Ok(None) => {
+                            self.disconnect_flag = Some(
+                                ConnectionDisconnectReason::PeerClosed
+                            );
+                        }
+                        Err(err) => {
+                            if err.is_closed() {
+                                self.is_open.set_closed();
+                            }
+                            self.disconnect_flag =
+                                Some(ConnectionDisconnectReason::ConnectionError(err));
+                        }
+                    }
+                }
+            }
+        }
+
+        &self.disconnect_flag
     }
 
     async fn handle_command(
