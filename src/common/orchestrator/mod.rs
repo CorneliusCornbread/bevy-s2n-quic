@@ -1,13 +1,16 @@
-use futures::stream::{FuturesOrdered, FuturesUnordered};
+use bevy::log::info;
+use futures::FutureExt;
+use std::fmt;
 use tokio::{
     runtime::Handle,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver},
     task::JoinHandle,
 };
 
 use crate::common::{
     connection::task::ConnectionTask,
-    orchestrator::{self, handle::OrchestratorHandle},
+    orchestrator::handle::OrchestratorHandle,
+    status_code::StatusCode,
     stream::{receive::RecTask, send::SendTask},
 };
 
@@ -16,10 +19,30 @@ pub mod handle;
 /// Size of the orchestrator channel buffer before it is considered full.
 const ORCHESTRATOR_CHANNEL_SIZE: usize = 128;
 
+/// Error code to use when our orchestrator can't handle a new task
+pub(crate) const ORCHESTRATOR_ERROR_CODE: StatusCode = StatusCode::ServiceUnavailable;
+
+#[derive(Debug)]
 pub(crate) enum QuicTask {
     Connection(ConnectionTask),
     Send(SendTask),
     Receive(RecTask),
+}
+
+impl fmt::Display for QuicTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QuicTask::Connection(task) => {
+                write!(f, "QuicTask::Connection({})", task.id())
+            }
+            QuicTask::Send(task) => {
+                write!(f, "QuicTask::Send({})", task.id())
+            }
+            QuicTask::Receive(task) => {
+                write!(f, "QuicTask::Receive({})", task.id())
+            }
+        }
+    }
 }
 
 pub(crate) struct AsyncOrchestrator {
@@ -66,22 +89,36 @@ impl AsyncOrchestratorTask {
 
     async fn start(mut self) {
         loop {
-            self.task_rec.recv_many(&mut self.tasks, MAX_TASKS).await;
+            if !self.task_rec.is_empty() {
+                self.task_rec.recv_many(&mut self.tasks, MAX_TASKS).await;
+            }
 
-            let mut futures: FuturesUnordered<_> = self
-                .tasks
-                .iter_mut()
-                .enumerate()
-                .map(|(i, task)| async move {
-                    match task {
-                        QuicTask::Connection(connection_task) => {
-                            (i, connection_task.poll_once().await)
-                        }
-                        QuicTask::Send(send_task) => (i, send_task.poll_once().await),
-                        QuicTask::Receive(rec_task) => (i, rec_task.poll_once().await),
+            let mut finished_ind = Vec::new();
+
+            for (i, task) in self.tasks.iter_mut().enumerate() {
+                // If the task finishes and we get a disconnect flag
+                // push it to be marked for removal
+                if let (i, Some(Some(_))) = match task {
+                    QuicTask::Connection(connection_task) => {
+                        (i, connection_task.poll_once().now_or_never())
                     }
-                })
-                .collect();
+                    QuicTask::Send(send_task) => {
+                        (i, send_task.poll_once().now_or_never())
+                    }
+                    QuicTask::Receive(rec_task) => {
+                        (i, rec_task.poll_once().now_or_never())
+                    }
+                } {
+                    finished_ind.push(i);
+                }
+            }
+
+            for idx in finished_ind.into_iter().rev() {
+                let removed = self.tasks.swap_remove(idx);
+                info!("Removed quic task: {}", removed);
+            }
+
+            tokio::task::yield_now().await;
         }
     }
 }

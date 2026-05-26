@@ -7,7 +7,7 @@ use bevy::{
     },
 };
 use bytes::Bytes;
-use s2n_quic::stream::SendStream;
+use s2n_quic::{application, stream::SendStream};
 use std::error::Error;
 use tokio::{
     runtime::Handle,
@@ -18,7 +18,7 @@ use tokio::{
 use crate::common::{
     HandleChannelError, QuicParentId,
     connection::disconnect::ConnectionDisconnectReason,
-    orchestrator::{self, handle::OrchestratorHandle},
+    orchestrator::{self, ORCHESTRATOR_ERROR_CODE, handle::OrchestratorHandle},
     stream::{id::StreamId, task_state::StreamTaskState},
     task_state::{OnceLockState, TaskState},
 };
@@ -65,7 +65,7 @@ impl QuicSendStream {
         let (outbound_data, outbound_data_receiver) =
             mpsc::channel(OUTBOUND_CHANNEL_SIZE);
 
-        let task_state = OnceLockState::new();
+        let mut task_state = OnceLockState::new();
 
         let task = SendTask {
             send,
@@ -78,8 +78,23 @@ impl QuicSendStream {
             stream_id,
         };
 
-        // TODO: change this to use orchestrator
-        let send_task = runtime.spawn(task.start());
+        let res = orchestrator.push_send(task);
+
+        if let Err(e) = res {
+            error!(
+                "Unable to push new task for stream {}, with reason: {}",
+                stream_id, e
+            );
+
+            let _ = task_state.set(ConnectionDisconnectReason::OrchestratorError);
+
+            match e {
+                mpsc::error::TrySendError::Full(mut task)
+                | mpsc::error::TrySendError::Closed(mut task) => {
+                    task.early_close();
+                }
+            }
+        }
 
         Self {
             task_state,
@@ -176,6 +191,7 @@ impl QuicSendStream {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct SendTask {
     send: SendStream,
     control: Receiver<SendControlMessage>,
@@ -188,6 +204,14 @@ pub(crate) struct SendTask {
 }
 
 impl SendTask {
+    pub(crate) fn id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub(crate) fn early_close(&mut self) {
+        let _ = self.send.finish();
+    }
+
     #[tracing::instrument(
         name = "quic_send_task"
         skip(self),

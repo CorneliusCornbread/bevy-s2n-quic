@@ -1,6 +1,7 @@
 use s2n_quic::application::Error;
 
 /// A simple enum which uses HTTP status codes
+#[derive(Debug)]
 pub enum StatusCode {
     OK = 200,
     InternalServerError = 500,

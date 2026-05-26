@@ -7,7 +7,11 @@ use bevy::{
     },
     prelude::{Deref, DerefMut},
 };
-use s2n_quic::{Connection, application, connection::Handle as ConnectionHandle};
+use s2n_quic::{
+    Connection,
+    application::{self, Error},
+    connection::Handle as ConnectionHandle,
+};
 use std::sync::Arc;
 use tokio::{
     runtime::Handle,
@@ -28,10 +32,10 @@ use crate::common::{
         stream_flag::StreamFlag,
         task::{
             ConnectionCommand, ConnectionCommandError, ConnectionHandleTask,
-            ConnectionTask, ConnectionTaskState,
+            ConnectionTask,
         },
     },
-    orchestrator::{self, handle::OrchestratorHandle},
+    orchestrator::{ORCHESTRATOR_ERROR_CODE, handle::OrchestratorHandle},
     stream::{
         QuicBidirectionalStreamAttempt, QuicPeerStreamAttempt, QuicReceiveStreamAttempt,
         QuicSendStreamAttempt,
@@ -115,7 +119,7 @@ impl QuicConnection {
             );
         }
 
-        let task_state = OnceLockState::new();
+        let mut task_state = OnceLockState::new();
 
         let is_open = OpenFlag::new(true);
         let conn_handle = connection.handle();
@@ -129,8 +133,23 @@ impl QuicConnection {
             orchestrator.clone(),
         );
 
-        // TODO: move to task orchestrator
-        let handle = runtime.spawn(task.start());
+        let res = orchestrator.push_connection(task);
+
+        if let Err(e) = res {
+            error!(
+                "Unable to push new task for connection {}, with reason: {}",
+                connection_id, e
+            );
+
+            let _ = task_state.set(ConnectionDisconnectReason::OrchestratorError);
+
+            match e {
+                mpsc::error::TrySendError::Full(task)
+                | mpsc::error::TrySendError::Closed(task) => {
+                    task.close(ORCHESTRATOR_ERROR_CODE.into());
+                }
+            }
+        }
 
         Self {
             runtime: runtime.clone(),

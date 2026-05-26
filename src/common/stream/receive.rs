@@ -8,7 +8,7 @@ use bevy::{
     },
 };
 use bytes::Bytes;
-use s2n_quic::application::Error as ErrorCode;
+use s2n_quic::application::{self, Error as ErrorCode};
 use s2n_quic::stream::ReceiveStream;
 use std::error::Error;
 use tokio::{
@@ -21,7 +21,7 @@ use tokio::{
 use crate::common::{
     HandleChannelError, QuicParentId,
     connection::disconnect::ConnectionDisconnectReason,
-    orchestrator::handle::OrchestratorHandle,
+    orchestrator::{ORCHESTRATOR_ERROR_CODE, handle::OrchestratorHandle},
     stream::id::StreamId,
     task_state::{OnceLockState, TaskState},
 };
@@ -63,7 +63,7 @@ impl QuicReceiveStream {
             mpsc::channel(CONTROL_CHANNEL_SIZE);
         let (inbound_data_sender, inbound_data) = mpsc::channel(INBOUND_CHANNEL_SIZE);
 
-        let task_state = OnceLockState::new();
+        let mut task_state = OnceLockState::new();
 
         let task = RecTask {
             rec,
@@ -76,8 +76,23 @@ impl QuicReceiveStream {
             stream_id,
         };
 
-        // TODO: change this to use orchestrator
-        let rec_task = runtime.spawn(task.start());
+        let res = orchestrator.push_receive(task);
+
+        if let Err(e) = res {
+            error!(
+                "Unable to push new task for stream {}, with reason: {}",
+                stream_id, e
+            );
+
+            let _ = task_state.set(ConnectionDisconnectReason::OrchestratorError);
+
+            match e {
+                mpsc::error::TrySendError::Full(mut task)
+                | mpsc::error::TrySendError::Closed(mut task) => {
+                    task.stop_sending(ORCHESTRATOR_ERROR_CODE.into());
+                }
+            }
+        }
 
         Self {
             task_state,
@@ -158,6 +173,7 @@ enum RecControlMessage {
     StopSend(ErrorCode),
 }
 
+#[derive(Debug)]
 pub(crate) struct RecTask {
     task_state: OnceLockState<ConnectionDisconnectReason>,
     rec: ReceiveStream,
@@ -170,6 +186,14 @@ pub(crate) struct RecTask {
 }
 
 impl RecTask {
+    pub(crate) fn id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub(crate) fn stop_sending(&mut self, error_code: application::Error) {
+        let _ = self.rec.stop_sending(error_code);
+    }
+
     #[tracing::instrument(
         name = "quic_rec_task"
         skip(self),

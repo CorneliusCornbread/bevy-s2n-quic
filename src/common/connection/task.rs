@@ -41,9 +41,6 @@ const ACCEPT_MISMATCH_TIMEOUT: Duration = Duration::from_millis(1);
 /// Connection command channel message
 const CONN_CMD_MSG: &str = "Connection command channel";
 
-pub(in crate::common::connection) type ConnectionTaskState =
-    JoinHandleState<ConnectionDisconnectReason>;
-
 pub(crate) enum ConnectionCommand {
     AcceptReceive {
         respond_to: oneshot::Sender<ConnectionResponse<QuicReceiveStream>>,
@@ -186,6 +183,14 @@ impl ConnectionTask {
             task_state,
             orchestrator,
         }
+    }
+
+    pub(crate) fn id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
+    pub(crate) fn close(&self, error_code: application::Error) {
+        self.connection.close(error_code);
     }
 
     #[tracing::instrument(
