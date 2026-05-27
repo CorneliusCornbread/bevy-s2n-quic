@@ -172,8 +172,10 @@ impl QuicConnection {
     /// Returns an error if the async communication channel errors out due to being full.
     pub fn accept_stream(
         &mut self,
-    ) -> Result<QuicPeerStreamAttempt, ConnectionCommandError> {
-        self.pending_stream.set_false();
+    ) -> Result<Option<QuicPeerStreamAttempt>, ConnectionCommandError> {
+        if !self.pending_stream.swap(false) || !self.is_open() {
+            return Ok(None);
+        }
 
         let (send, rec) = oneshot::channel();
 
@@ -187,7 +189,7 @@ impl QuicConnection {
         let attempt =
             QuicPeerStreamAttempt::new(self.runtime.clone(), rec, self.parent_id());
 
-        Ok(attempt)
+        Ok(Some(attempt))
     }
 
     /// Accepts incoming receive streams, this will always return an [QuicReceiveStreamAttempt] even if
@@ -199,8 +201,10 @@ impl QuicConnection {
     /// Returns an error if the async communication channel errors out due to being full.
     pub fn accept_receive_stream(
         &mut self,
-    ) -> Result<QuicReceiveStreamAttempt, ConnectionCommandError> {
-        self.pending_stream.set_false();
+    ) -> Result<Option<QuicReceiveStreamAttempt>, ConnectionCommandError> {
+        if !self.pending_stream.swap(false) || !self.is_open() {
+            return Ok(None);
+        }
 
         let (send, rec) = oneshot::channel();
 
@@ -214,7 +218,7 @@ impl QuicConnection {
         let attempt =
             QuicReceiveStreamAttempt::new(self.runtime.clone(), rec, self.parent_id());
 
-        Ok(attempt)
+        Ok(Some(attempt))
     }
 
     /// Accepts incoming bidirectional streams, this will always return an [QuicBidirectionalStreamAttempt] even if
@@ -226,8 +230,10 @@ impl QuicConnection {
     /// Returns an error if the async communication channel errors out due to being full.
     pub fn accept_bidirectional_stream(
         &mut self,
-    ) -> Result<QuicBidirectionalStreamAttempt, ConnectionCommandError> {
-        self.pending_stream.set_false();
+    ) -> Result<Option<QuicBidirectionalStreamAttempt>, ConnectionCommandError> {
+        if !self.pending_stream.swap(false) || !self.is_open() {
+            return Ok(None);
+        }
 
         let (send, rec) = oneshot::channel();
 
@@ -244,7 +250,7 @@ impl QuicConnection {
             self.parent_id(),
         );
 
-        Ok(attempt)
+        Ok(Some(attempt))
     }
 
     /// Attempts to open a new bidirectional stream to be accepted by the remote peer.
@@ -334,6 +340,10 @@ impl QuicConnection {
     /// This flag is set by the general [s2n_quic::Connection::poll_accept()] poll,
     /// so the specific variants *could* be a receive stream, bidirectional stream, or
     /// it could be an error.
+    #[deprecated(
+        since = "0.18.3",
+        note = "Unnecessary since now all accept functions do this check internally and do so with atomic correctness. Resolves a bug and gets rid of unnecessary API."
+    )]
     pub fn should_poll_accept(&self) -> bool {
         self.pending_stream.get() && self.is_open()
     }

@@ -54,9 +54,7 @@ fn accept_streams(
     connection_query: Query<(Entity, &mut QuicConnection), With<QuicServerMarker>>,
 ) {
     for (connection_entity, mut connection) in connection_query {
-        if connection.should_poll_accept() {
-            handle_stream_accept(&mut commands, connection_entity, &mut connection);
-        }
+        handle_stream_accept(&mut commands, connection_entity, &mut connection);
     }
 }
 
@@ -67,7 +65,7 @@ fn handle_stream_accept(
     connection: &mut QuicConnection,
 ) {
     match connection.accept_stream() {
-        Ok(peer_attempt) => {
+        Ok(Some(peer_attempt)) => {
             commands.entity(connection_entity).with_children(|parent| {
                 parent.spawn((peer_attempt, QuicServerMarker));
             });
@@ -75,5 +73,6 @@ fn handle_stream_accept(
         Err(err) => {
             error!("Error accepting stream from connection: {}", err);
         }
+        _ => {}
     }
 }

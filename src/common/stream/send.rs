@@ -38,6 +38,7 @@ const MIN_OUTBOUND_BUF_SIZE: usize = 64;
 const MAX_OUTBOUND_BUF_SIZE: usize = 128;
 
 const OUTBOUND_CHANNEL_NAME: &str = "Outbound channel";
+const CONTROL_CHANNEL_NAME: &str = "Control channel";
 
 #[derive(Debug, Component)]
 pub struct QuicSendStream {
@@ -57,7 +58,6 @@ impl QuicSendStream {
         parent_id: QuicParentId,
     ) -> Self {
         let stream_id = StreamId::new(parent_id, send.id());
-        let addr = send.connection().local_addr();
 
         let (send_error_sender, send_errors) = mpsc::channel(DEBUG_CHANNEL_SIZE);
         let (outbound_control, outbound_control_receiver) =
@@ -67,16 +67,14 @@ impl QuicSendStream {
 
         let mut task_state = OnceLockState::new();
 
-        let task = SendTask {
+        let task = SendTask::new(
             send,
-            control: outbound_control_receiver,
-            task_state: task_state.clone(),
-            outbound_receiver: outbound_data_receiver,
-            send_errors: send_error_sender,
-            disconnect_flag: None,
-            addr,
+            outbound_control_receiver,
+            task_state.clone(),
+            outbound_data_receiver,
+            send_error_sender,
             stream_id,
-        };
+        );
 
         let res = orchestrator.push_send(task);
 
@@ -201,9 +199,32 @@ pub(crate) struct SendTask {
     disconnect_flag: Option<ConnectionDisconnectReason>,
     addr: AddrResult,
     stream_id: StreamId,
+    send_buf: Vec<Bytes>,
 }
 
 impl SendTask {
+    fn new(
+        send: SendStream,
+        control: Receiver<SendControlMessage>,
+        task_state: OnceLockState<ConnectionDisconnectReason>,
+        outbound_receiver: Receiver<Bytes>,
+        send_errors: Sender<Box<dyn Error + Send + Sync>>,
+        stream_id: StreamId,
+    ) -> Self {
+        let addr = send.connection().local_addr();
+        Self {
+            send,
+            control,
+            task_state,
+            outbound_receiver,
+            send_errors,
+            disconnect_flag: None,
+            addr,
+            stream_id,
+            send_buf: Vec::with_capacity(MIN_OUTBOUND_BUF_SIZE),
+        }
+    }
+
     pub(crate) fn id(&self) -> StreamId {
         self.stream_id
     }
@@ -220,112 +241,8 @@ impl SendTask {
     async fn start(mut self) {
         info!("Send stream opened.");
 
-        let mut send_buf = Vec::with_capacity(MIN_OUTBOUND_BUF_SIZE);
-
-        'running: loop {
-            select! {
-                count = self.outbound_receiver.recv_many(&mut send_buf, MAX_OUTBOUND_BUF_SIZE) => {
-                    // channel closed
-                    if count == 0 {
-                        warn!(
-                            "Outbound send channel was closed by the remote peer."
-                        );
-
-                        self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: OUTBOUND_CHANNEL_NAME.into()})
-                    }
-
-                    let err_opt = self.send.send_vectored(&mut send_buf[..count]).await;
-                    send_buf.clear();
-
-                    if let Err(err) = err_opt {
-                        match err {
-                            s2n_quic::stream::Error::InvalidStream { source, .. }
-                            | s2n_quic::stream::Error::SendAfterFinish { source, .. } => {
-                                error!(
-                                    "Send stream is in an invalid state, quitting:\n{}",
-                                    source
-                                );
-                                self.disconnect_flag = Some(ConnectionDisconnectReason::InvalidStream)
-                            }
-
-                            s2n_quic::stream::Error::StreamReset {
-                                error, source: _, ..
-                            } => {
-                                error!(
-                                    "Send stream has encountered a stream reset:\n{}",
-                                    error
-                                );
-                                self.disconnect_flag = Some(ConnectionDisconnectReason::Reset(error));
-                            }
-
-                            _ => {
-                                error!(
-                                    "Send stream error:\n{}",
-                                    err
-                                );
-                            }
-                        }
-
-                        self.send_errors.try_send(Box::new(err)).handle_err();
-                    }
-                }
-
-                cmd_opt = self.control.recv() => {
-                    if let Some(cmd) = cmd_opt {
-                        match cmd {
-                            SendControlMessage::CloseAndQuit => {
-                                let res = self.send.close().await;
-
-                                if let Err(e) = res {
-                                    error!(
-                                        "Send stream errored when closing stream:\n{}",
-                                        e
-                                    );
-
-                                    self.send_errors.try_send(Box::new(e)).handle_err();
-                                }
-
-                                self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
-                            }
-
-                            SendControlMessage::Flush => {
-                                let res = self.send.flush().await;
-
-                                if let Err(e) = res {
-                                    error!(
-                                        "Send stream errored when flushing stream:\n{}",
-                                        e
-                                    );
-
-                                    self.send_errors.try_send(Box::new(e)).handle_err();
-                                }
-                            }
-                        }
-                    }
-                    else {
-                        // Control channel has been dropped
-                        info!(
-                            "Control channel has been dropped. Quitting...",
-                        );
-                        self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: "Control channel".into()})
-                    };
-                }
-            }
-
-            if self.disconnect_flag.is_some() {
-                break 'running;
-            }
-        }
-
-        info!("Send stream has been closed",);
-
-        let dropped_count = self.outbound_receiver.len();
-
-        if dropped_count > 0 {
-            warn!(
-                "Send stream dropped {} messages, this will result in loss of data being sent",
-                dropped_count
-            )
+        while self.disconnect_flag.is_none() {
+            self.poll_once().await;
         }
 
         let _res = self.task_state.set(
@@ -335,21 +252,23 @@ impl SendTask {
     }
 
     pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
-        let mut send_buf = Vec::with_capacity(MIN_OUTBOUND_BUF_SIZE);
+        if self.disconnect_flag.is_some() {
+            return &self.disconnect_flag;
+        }
 
         select! {
-            count = self.outbound_receiver.recv_many(&mut send_buf, MAX_OUTBOUND_BUF_SIZE) => {
+            count = self.outbound_receiver.recv_many(&mut self.send_buf, MAX_OUTBOUND_BUF_SIZE) => {
                 // channel closed
                 if count == 0 {
                     warn!(
                         "Outbound send channel was closed by the remote peer."
                     );
 
-                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: OUTBOUND_CHANNEL_NAME.into()})
+                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: OUTBOUND_CHANNEL_NAME})
                 }
 
-                let err_opt = self.send.send_vectored(&mut send_buf[..count]).await;
-                send_buf.clear();
+                let err_opt = self.send.send_vectored(&mut self.send_buf[..count]).await;
+                self.send_buf.clear();
 
                 if let Err(err) = err_opt {
                     match err {
@@ -421,12 +340,29 @@ impl SendTask {
                     info!(
                         "Control channel has been dropped. Quitting...",
                     );
-                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: "Control channel".into()})
+                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: CONTROL_CHANNEL_NAME})
                 };
             }
         }
 
-        return &self.disconnect_flag;
+        // Disconnecting
+        if let Some(disconnect) = &self.disconnect_flag {
+            let _ = self.task_state.set(disconnect.clone());
+            let _ = self.send.close().await;
+
+            info!("Send stream has been closed");
+
+            let dropped_count = self.outbound_receiver.len();
+
+            if dropped_count > 0 {
+                warn!(
+                    "Send stream dropped {} messages, this will result in loss of data being sent",
+                    dropped_count
+                )
+            }
+        }
+
+        &self.disconnect_flag
     }
 }
 

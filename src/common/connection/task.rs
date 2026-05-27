@@ -205,7 +205,7 @@ impl ConnectionTask {
         info!("New connection opened");
 
         while self.disconnect_flag.is_none() {
-            self.poll_once();
+            self.poll_once().await;
         }
 
         self.disconnect_flag
@@ -222,7 +222,6 @@ impl ConnectionTask {
         // If we have a buffered stream, we only need to wait for a command
         // that will consume it.
         if self.buffered_stream.is_some() {
-            self.pending_stream.set_true();
             match self.cmd_receiver.recv().await {
                 Some(cmd) => {
                     let res = self.handle_command(cmd).await;
@@ -260,7 +259,7 @@ impl ConnectionTask {
                     match accept_res {
                         Ok(Some(stream)) => {
                             // Buffer it, the next command will consume it.
-                            self.buffered_stream = Some(stream);
+                            self.buffer_stream(stream);
                         }
                         Ok(None) => {
                             self.disconnect_flag = Some(
@@ -277,6 +276,10 @@ impl ConnectionTask {
                     }
                 }
             }
+        }
+
+        if let Some(disconnect) = &self.disconnect_flag {
+            let _ = self.task_state.set(disconnect.clone());
         }
 
         &self.disconnect_flag
@@ -488,6 +491,11 @@ impl ConnectionTask {
         };
 
         self.disconnect_flag = Some(ConnectionDisconnectReason::ConnectionError(err));
+    }
+
+    fn buffer_stream(&mut self, stream: PeerStream) {
+        self.pending_stream.set_true();
+        self.buffered_stream = Some(stream);
     }
 }
 

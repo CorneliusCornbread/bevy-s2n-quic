@@ -202,9 +202,6 @@ impl RecTask {
     async fn start(mut self) {
         info!("Receive stream opened.");
 
-        let mut read_buf: [Bytes; INBOUND_BUFF_SIZE] =
-            std::array::from_fn(|_| Bytes::new());
-
         while self.disconnect_flag.is_none() {
             self.poll_once().await;
         }
@@ -251,13 +248,18 @@ impl RecTask {
             }
         }
 
-        if self.disconnect_flag.is_some() {
+        if let Some(disconnect) = &self.disconnect_flag {
+            let state = disconnect.clone();
+            let _ = disconnect;
+
             self.stop_and_empty().await;
+
+            let _ = self.task_state.set(state);
 
             info!("Receive stream has been closed");
         }
 
-        return &self.disconnect_flag;
+        &self.disconnect_flag
     }
 
     fn handle_receive_result(

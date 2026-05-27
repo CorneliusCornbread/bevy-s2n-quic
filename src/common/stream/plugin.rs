@@ -56,7 +56,10 @@ fn handle_bidir_stream_attempt(
 
             #[cfg(feature = "stream-errors")]
             {
-                use {crate::common::attempt::QuicActionErrorComponent, std::time::SystemTime};
+                use {
+                    crate::common::attempt::QuicActionErrorComponent,
+                    std::time::SystemTime,
+                };
 
                 let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
                 let err_bundle = (err_comp, *parent_id);
@@ -115,7 +118,10 @@ fn handle_rec_stream_attempt(
 
             #[cfg(feature = "stream-errors")]
             {
-                use {crate::common::attempt::QuicActionErrorComponent, std::time::SystemTime};
+                use {
+                    crate::common::attempt::QuicActionErrorComponent,
+                    std::time::SystemTime,
+                };
 
                 let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
                 let err_bundle = (err_comp, *parent_id);
@@ -173,7 +179,10 @@ fn handle_peer_stream_attempt(
 
             #[cfg(feature = "stream-errors")]
             {
-                use {crate::common::attempt::QuicActionErrorComponent, std::time::SystemTime};
+                use {
+                    crate::common::attempt::QuicActionErrorComponent,
+                    std::time::SystemTime,
+                };
 
                 let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
                 let err_bundle = (err_comp, *parent_id);
@@ -193,7 +202,11 @@ fn handle_peer_stream_attempt(
             match peer_stream {
                 QuicPeerStream::Bidirectional(quic_receive_stream, quic_send_stream) => {
                     info!("Spawning peer (bidirectional) stream stream with {parent_id}");
-                    attempt_entity.insert((quic_receive_stream, quic_send_stream, QuicSession));
+                    attempt_entity.insert((
+                        quic_receive_stream,
+                        quic_send_stream,
+                        QuicSession,
+                    ));
                 }
                 QuicPeerStream::Receive(quic_receive_stream) => {
                     info!("Spawning peer (receive) stream stream with {parent_id}");

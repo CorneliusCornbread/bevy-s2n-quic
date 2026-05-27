@@ -25,7 +25,6 @@ impl StreamFlag {
         self.0.store(false, Ordering::Release)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn swap(&self, value: bool) -> bool {
         self.0.swap(value, Ordering::AcqRel)
     }
