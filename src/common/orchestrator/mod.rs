@@ -1,6 +1,6 @@
 use bevy::log::info;
 use futures::FutureExt;
-use std::fmt;
+use std::{cmp::max, fmt};
 use tokio::{
     runtime::Handle,
     sync::mpsc::{self, Receiver},
@@ -55,7 +55,7 @@ impl AsyncOrchestrator {
     pub(crate) fn new(runtime: Handle) -> Self {
         let (tx, rx) = mpsc::channel(ORCHESTRATOR_CHANNEL_SIZE);
 
-        let task = AsyncOrchestratorTask::new(rx);
+        let task = AsyncOrchestratorTask::new(rx, &runtime);
         let task_join = runtime.spawn(task.start());
         let orchestrator = OrchestratorHandle::new(tx);
 
@@ -74,16 +74,21 @@ impl AsyncOrchestrator {
 struct AsyncOrchestratorTask {
     task_rec: Receiver<QuicTask>,
     tasks: Vec<QuicTask>,
+    worker_count: usize,
 }
 
 const MAX_TASKS: usize = 32768;
 const MIN_TASKS_SIZE: usize = 32;
+const MIN_WORKERS: usize = 1;
 
 impl AsyncOrchestratorTask {
-    fn new(task_rec: Receiver<QuicTask>) -> Self {
+    fn new(task_rec: Receiver<QuicTask>, runtime: &Handle) -> Self {
+        let tokio_workers = runtime.metrics().num_workers();
+
         Self {
             task_rec,
             tasks: Vec::with_capacity(MIN_TASKS_SIZE),
+            worker_count: max(MIN_WORKERS, tokio_workers),
         }
     }
 
