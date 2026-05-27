@@ -21,6 +21,7 @@ impl StreamFlag {
         self.0.store(true, Ordering::Release)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_false(&self) {
         self.0.store(false, Ordering::Release)
     }

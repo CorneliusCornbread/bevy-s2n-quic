@@ -194,26 +194,13 @@ impl ConnectionTask {
     }
 
     #[tracing::instrument(
-        name = "quic_connection_task"
+        name = "quic_connection_poll"
         skip(self),
         fields(
             connection_id = %self.connection_id,
             remote_address = ?self.connection.remote_addr()
         )
     )]
-    pub(crate) async fn start(mut self) -> ConnectionDisconnectReason {
-        info!("New connection opened");
-
-        while self.disconnect_flag.is_none() {
-            self.poll_once().await;
-        }
-
-        self.disconnect_flag
-            .unwrap_or(ConnectionDisconnectReason::InternalError(Arc::new(
-                MissingErrorData,
-            )))
-    }
-
     pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
         if self.disconnect_flag.is_some() {
             return &self.disconnect_flag;

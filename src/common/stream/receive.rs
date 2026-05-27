@@ -195,23 +195,10 @@ impl RecTask {
     }
 
     #[tracing::instrument(
-        name = "quic_rec_task"
+        name = "quic_rec_poll"
         skip(self),
         fields(stream_id = %self.stream_id, remote_address = ?self.addr)
     )]
-    async fn start(mut self) {
-        info!("Receive stream opened.");
-
-        while self.disconnect_flag.is_none() {
-            self.poll_once().await;
-        }
-
-        let _res = self.task_state.set(
-            self.disconnect_flag
-                .expect("Receive loop exited without the flag being set"),
-        );
-    }
-
     pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
         if self.disconnect_flag.is_some() {
             return &self.disconnect_flag;
