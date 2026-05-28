@@ -9,6 +9,7 @@ use tokio::runtime::Handle;
 use crate::common::{
     QuicParentId,
     attempt::{QuicActionAttempt, TaskResult},
+    connection::id::ConnectionId,
     orchestrator::handle::OrchestratorHandle,
     stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
@@ -33,15 +34,17 @@ pub(crate) mod task_state;
 #[derive(Deref, DerefMut, Component)]
 #[component(storage = "SparseSet")]
 #[require(SessionEndpoint)]
-pub struct QuicReceiveStreamAttempt(QuicActionAttempt<Option<QuicReceiveStream>>);
+pub struct QuicReceiveStreamAttempt(
+    QuicActionAttempt<Option<QuicReceiveStream>, ConnectionId>,
+);
 
 impl QuicReceiveStreamAttempt {
     pub fn new(
         handle: Handle,
         task: impl TaskResult<Option<QuicReceiveStream>> + 'static + Send + Sync,
-        parent_id: QuicParentId,
+        id: ConnectionId,
     ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, parent_id))
+        Self(QuicActionAttempt::new(handle, task, id))
     }
 }
 
@@ -58,15 +61,15 @@ impl QuicReceiveStreamAttempt {
 #[derive(Deref, DerefMut, Component)]
 #[component(storage = "SparseSet")]
 #[require(SessionEndpoint)]
-pub struct QuicSendStreamAttempt(QuicActionAttempt<Option<QuicSendStream>>);
+pub struct QuicSendStreamAttempt(QuicActionAttempt<Option<QuicSendStream>, ConnectionId>);
 
 impl QuicSendStreamAttempt {
     pub fn new(
         handle: Handle,
         task: impl TaskResult<Option<QuicSendStream>> + 'static + Send + Sync,
-        parent_id: QuicParentId,
+        id: ConnectionId,
     ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, parent_id))
+        Self(QuicActionAttempt::new(handle, task, id))
     }
 }
 
@@ -85,7 +88,7 @@ impl QuicSendStreamAttempt {
 #[component(storage = "SparseSet")]
 #[require(SessionEndpoint)]
 pub struct QuicBidirectionalStreamAttempt(
-    QuicActionAttempt<Option<(QuicReceiveStream, QuicSendStream)>>,
+    QuicActionAttempt<Option<(QuicReceiveStream, QuicSendStream)>, ConnectionId>,
 );
 
 impl QuicBidirectionalStreamAttempt {
@@ -95,9 +98,9 @@ impl QuicBidirectionalStreamAttempt {
         + 'static
         + Send
         + Sync,
-        parent_id: QuicParentId,
+        id: ConnectionId,
     ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, parent_id))
+        Self(QuicActionAttempt::new(handle, task, id))
     }
 }
 
@@ -115,15 +118,15 @@ impl QuicBidirectionalStreamAttempt {
 #[derive(Component, Deref, DerefMut)]
 #[component(storage = "SparseSet")]
 #[require(SessionEndpoint)]
-pub struct QuicPeerStreamAttempt(QuicActionAttempt<Option<QuicPeerStream>>);
+pub struct QuicPeerStreamAttempt(QuicActionAttempt<Option<QuicPeerStream>, ConnectionId>);
 
 impl QuicPeerStreamAttempt {
     pub fn new(
         handle: Handle,
         task: impl TaskResult<Option<QuicPeerStream>> + 'static + Send + Sync,
-        parent_id: QuicParentId,
+        conn_id: ConnectionId,
     ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, parent_id))
+        Self(QuicActionAttempt::new(handle, task, conn_id))
     }
 }
 
@@ -137,25 +140,18 @@ impl QuicPeerStream {
         runtime: Handle,
         orchestrator: OrchestratorHandle,
         peer_stream: PeerStream,
-        parent_id: QuicParentId,
+        conn_id: ConnectionId,
     ) -> Self {
         match peer_stream {
             PeerStream::Bidirectional(bidirectional_stream) => {
                 let (rec, send) = bidirectional_stream.split();
-                let quic_rec = QuicReceiveStream::new(
-                    runtime.clone(),
-                    orchestrator.clone(),
-                    rec,
-                    parent_id,
-                );
-                let quic_send =
-                    QuicSendStream::new(runtime, orchestrator, send, parent_id);
+                let quic_rec = QuicReceiveStream::new(orchestrator.clone(), rec, conn_id);
+                let quic_send = QuicSendStream::new(orchestrator, send, conn_id);
 
                 QuicPeerStream::Bidirectional(quic_rec, quic_send)
             }
             PeerStream::Receive(rec) => {
-                let quic_rec =
-                    QuicReceiveStream::new(runtime.clone(), orchestrator, rec, parent_id);
+                let quic_rec = QuicReceiveStream::new(orchestrator, rec, conn_id);
 
                 QuicPeerStream::Receive(quic_rec)
             }

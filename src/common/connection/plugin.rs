@@ -10,7 +10,6 @@ use bevy::{
 use crate::common::{
     attempt::QuicActionError,
     connection::{QuicConnection, QuicConnectionAttempt},
-    orchestrator,
     runtime::TokioRuntime,
 };
 
@@ -34,7 +33,7 @@ fn handle_connection_attempts(
 
     for entity_bundle in query {
         let (entity, mut attempt) = entity_bundle;
-        let parent_id = attempt.parent_id();
+        let parent_id = attempt.id();
 
         let res = attempt.attempt_result();
 
@@ -76,7 +75,6 @@ fn handle_connection_attempts(
             continue;
         }
 
-        info!("New connection entity with {parent_id}");
         let conn = res.unwrap();
         let quic_conn = QuicConnection::new(
             handle_ref.clone(),
@@ -84,6 +82,8 @@ fn handle_connection_attempts(
             conn,
             parent_id,
         );
+        let id = quic_conn.id();
+        info!("New connection entity with {id}");
 
         commands
             .entity(entity)

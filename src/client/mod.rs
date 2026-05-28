@@ -9,10 +9,8 @@ use tokio::runtime::Handle;
 use crate::{
     client::marker::QuicClientMarker,
     common::{
-        QuicParentId, QuicParentType,
-        attempt::TaskError,
-        connection::QuicConnectionAttempt,
-        orchestrator::{self, handle::OrchestratorHandle},
+        QuicParentId, QuicParentType, attempt::TaskError,
+        connection::QuicConnectionAttempt, orchestrator::handle::OrchestratorHandle,
         runtime::TokioRuntime,
     },
 };
@@ -20,7 +18,7 @@ use crate::{
 pub mod acceptor;
 pub mod marker;
 
-/// The component which represents a client connection.
+/// The component which represents a client.
 #[derive(Component)]
 #[require(QuicClientMarker)]
 pub struct QuicClient {

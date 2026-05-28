@@ -54,25 +54,31 @@ impl<T> TaskResult<T> for JoinHandle<Result<T, TaskError>> {
 /// This is the structure which represents the async task
 /// being attempted and waited upon via sync polling with
 /// [attempt_result][QuicActionAttempt::attempt_result()]
-pub struct QuicActionAttempt<T> {
+pub struct QuicActionAttempt<T, I>
+where
+    I: Copy,
+{
     runtime: Handle,
     task_res: Box<dyn TaskResult<T> + Send + Sync>,
     /// A flag checking if the action state has returned a success value already
     returned_value: Option<QuicActionError>,
-    parent_id: QuicParentId,
+    id: I,
 }
 
-impl<T> QuicActionAttempt<T> {
+impl<T, I> QuicActionAttempt<T, I>
+where
+    I: Copy,
+{
     pub fn new(
         runtime: Handle,
         task: impl TaskResult<T> + 'static + Send + Sync,
-        parent_id: QuicParentId,
+        id: I,
     ) -> Self {
         Self {
             runtime,
             task_res: Box::new(task),
             returned_value: None,
-            parent_id,
+            id,
         }
     }
 
@@ -106,8 +112,8 @@ impl<T> QuicActionAttempt<T> {
         }
     }
 
-    pub fn parent_id(&self) -> QuicParentId {
-        self.parent_id
+    pub fn id(&self) -> I {
+        self.id
     }
 }
 

@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::common::{
     HandleChannelError, QuicParentId,
-    connection::disconnect::ConnectionDisconnectReason,
+    connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
     orchestrator::{ORCHESTRATOR_ERROR_CODE, handle::OrchestratorHandle},
     stream::id::StreamId,
     task_state::{OnceLockState, TaskState},
@@ -50,10 +50,9 @@ pub struct QuicReceiveStream {
 
 impl QuicReceiveStream {
     pub fn new(
-        runtime: Handle,
         orchestrator: OrchestratorHandle,
         rec: ReceiveStream,
-        parent_id: QuicParentId,
+        parent_id: ConnectionId,
     ) -> Self {
         let stream_id = StreamId::new(parent_id, rec.id());
         let addr = rec.connection().remote_addr();

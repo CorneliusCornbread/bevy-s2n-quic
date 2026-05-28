@@ -34,7 +34,6 @@ fn handle_bidir_stream_attempt(
 ) {
     for entity_bundle in query {
         let (entity, mut attempt) = entity_bundle;
-        let parent_id = attempt.parent_id();
 
         let res = attempt.attempt_result();
 
@@ -73,7 +72,8 @@ fn handle_bidir_stream_attempt(
         }
 
         if let Some((rec, send)) = res.unwrap() {
-            info!("Spawning bidirectional stream with {parent_id}");
+            let id = rec.id();
+            info!("Spawning bidirectional stream with {id}");
 
             commands
                 .entity(entity)
@@ -95,11 +95,10 @@ fn handle_rec_stream_attempt(
 ) {
     for entity_bundle in query {
         let (entity, mut attempt) = entity_bundle;
-        let parent_id = attempt.parent_id();
+        let id = attempt.id();
 
         let res = attempt.attempt_result();
 
-        // TODOL: make helper function with shmancy tracing span
         if let Err(e) = res {
             match &e {
                 QuicActionError::Pending => continue,
@@ -124,7 +123,7 @@ fn handle_rec_stream_attempt(
                 };
 
                 let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
-                let err_bundle = (err_comp, *parent_id);
+                let err_bundle = (err_comp, *id);
 
                 error_entity.insert(err_bundle);
             }
@@ -135,7 +134,7 @@ fn handle_rec_stream_attempt(
         }
 
         if let Some(rec) = res.unwrap() {
-            info!("Spawning receive stream with {parent_id}");
+            info!("Spawning receive stream with {id}");
 
             commands
                 .entity(entity)
@@ -157,7 +156,6 @@ fn handle_peer_stream_attempt(
 ) {
     for entity_bundle in query {
         let (entity, mut attempt) = entity_bundle;
-        let parent_id = attempt.parent_id();
 
         let res = attempt.attempt_result();
 
@@ -201,7 +199,8 @@ fn handle_peer_stream_attempt(
 
             match peer_stream {
                 QuicPeerStream::Bidirectional(quic_receive_stream, quic_send_stream) => {
-                    info!("Spawning peer (bidirectional) stream stream with {parent_id}");
+                    let id = quic_receive_stream.id();
+                    info!("Spawning peer (bidirectional) stream stream with {id}");
                     attempt_entity.insert((
                         quic_receive_stream,
                         quic_send_stream,
@@ -209,7 +208,8 @@ fn handle_peer_stream_attempt(
                     ));
                 }
                 QuicPeerStream::Receive(quic_receive_stream) => {
-                    info!("Spawning peer (receive) stream stream with {parent_id}");
+                    let id = quic_receive_stream.id();
+                    info!("Spawning peer (receive) stream stream with {id}");
                     attempt_entity.insert((quic_receive_stream, QuicSession));
                 }
             }

@@ -36,7 +36,7 @@ impl TokioRuntime {
 
     pub(crate) fn new(worker_threads: usize) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("Unable to create async runtime.");

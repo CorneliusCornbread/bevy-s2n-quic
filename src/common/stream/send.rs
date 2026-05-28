@@ -7,7 +7,7 @@ use bevy::{
     },
 };
 use bytes::Bytes;
-use s2n_quic::{application, stream::SendStream};
+use s2n_quic::stream::SendStream;
 use std::error::Error;
 use tokio::{
     runtime::Handle,
@@ -17,9 +17,9 @@ use tokio::{
 
 use crate::common::{
     HandleChannelError, QuicParentId,
-    connection::disconnect::ConnectionDisconnectReason,
-    orchestrator::{self, ORCHESTRATOR_ERROR_CODE, handle::OrchestratorHandle},
-    stream::{id::StreamId, task_state::StreamTaskState},
+    connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
+    orchestrator::handle::OrchestratorHandle,
+    stream::id::StreamId,
     task_state::{OnceLockState, TaskState},
 };
 
@@ -47,17 +47,16 @@ pub struct QuicSendStream {
     outbound_control: Sender<SendControlMessage>,
     send_errors: Receiver<Box<dyn Error + Send + Sync>>,
     stream_id: StreamId,
-    orchestrator: OrchestratorHandle,
+    _orchestrator: OrchestratorHandle,
 }
 
 impl QuicSendStream {
     pub fn new(
-        runtime: Handle,
         orchestrator: OrchestratorHandle,
         send: SendStream,
-        parent_id: QuicParentId,
+        conn_id: ConnectionId,
     ) -> Self {
-        let stream_id = StreamId::new(parent_id, send.id());
+        let stream_id = StreamId::new(conn_id, send.id());
 
         let (send_error_sender, send_errors) = mpsc::channel(DEBUG_CHANNEL_SIZE);
         let (outbound_control, outbound_control_receiver) =
@@ -100,7 +99,7 @@ impl QuicSendStream {
             outbound_control,
             send_errors,
             stream_id,
-            orchestrator,
+            _orchestrator: orchestrator,
         }
     }
 

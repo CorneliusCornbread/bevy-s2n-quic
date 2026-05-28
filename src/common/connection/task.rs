@@ -109,16 +109,14 @@ impl ConnectionHandleTask {
                 let (rec_stream, send_stream) = stream.split();
 
                 let quic_send = QuicSendStream::new(
-                    Handle::current(),
                     self.orchestrator.clone(),
                     send_stream,
-                    self.connection_id.parent_id(),
+                    self.connection_id,
                 );
                 let quic_rec = QuicReceiveStream::new(
-                    Handle::current(),
                     self.orchestrator.clone(),
                     rec_stream,
-                    self.connection_id.parent_id(),
+                    self.connection_id,
                 );
 
                 Ok(Some((quic_rec, quic_send)))
@@ -136,10 +134,9 @@ impl ConnectionHandleTask {
         match send_res {
             Ok(stream) => {
                 let quic_send = QuicSendStream::new(
-                    Handle::current(),
                     self.orchestrator.clone(),
                     stream,
-                    self.connection_id.parent_id(),
+                    self.connection_id,
                 );
                 Ok(Some(quic_send))
             }
@@ -283,7 +280,7 @@ impl ConnectionTask {
                         Handle::current(),
                         self.orchestrator.clone(),
                         stream,
-                        self.connection_id.parent_id(),
+                        self.connection_id,
                     );
                     if respond_to.send(Ok(Some(peer_stream))).is_err() {
                         warn!(
@@ -301,10 +298,9 @@ impl ConnectionTask {
                 match self.buffered_stream.take() {
                     Some(PeerStream::Receive(stream)) => {
                         let rec = QuicReceiveStream::new(
-                            Handle::current(),
                             self.orchestrator.clone(),
                             stream,
-                            self.connection_id.parent_id(),
+                            self.connection_id,
                         );
                         if respond_to.send(Ok(Some(rec))).is_err() {
                             warn!(
@@ -328,16 +324,14 @@ impl ConnectionTask {
                     Some(PeerStream::Bidirectional(stream)) => {
                         let (rec, send) = stream.split();
                         let rec = QuicReceiveStream::new(
-                            Handle::current(),
                             self.orchestrator.clone(),
                             rec,
-                            self.connection_id.parent_id(),
+                            self.connection_id,
                         );
                         let send = QuicSendStream::new(
-                            Handle::current(),
                             self.orchestrator.clone(),
                             send,
-                            self.connection_id.parent_id(),
+                            self.connection_id,
                         );
                         if respond_to.send(Ok(Some((rec, send)))).is_err() {
                             warn!(
@@ -381,10 +375,9 @@ impl ConnectionTask {
             Ok(opt) => {
                 let mapped = opt.map(|s| {
                     QuicReceiveStream::new(
-                        Handle::current(),
                         self.orchestrator.clone(),
                         s,
-                        self.connection_id.parent_id(),
+                        self.connection_id,
                     )
                 });
                 if respond_to.send(Ok(mapped)).is_err() {
@@ -434,16 +427,14 @@ impl ConnectionTask {
                 let mapped = opt.map(|bidir| {
                     let (rec, send) = bidir.split();
                     let rec = QuicReceiveStream::new(
-                        Handle::current(),
                         self.orchestrator.clone(),
                         rec,
-                        self.connection_id.parent_id(),
+                        self.connection_id,
                     );
                     let send = QuicSendStream::new(
-                        Handle::current(),
                         self.orchestrator.clone(),
                         send,
-                        self.connection_id.parent_id(),
+                        self.connection_id,
                     );
                     (rec, send)
                 });

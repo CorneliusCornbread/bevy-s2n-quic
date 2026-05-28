@@ -68,7 +68,7 @@ type ConnectionResponse<T> = Result<Option<T>, TaskError>;
 /// will be added on the entity.
 #[derive(Deref, DerefMut, Component)]
 #[component(storage = "SparseSet")]
-pub struct QuicConnectionAttempt(QuicActionAttempt<Connection>);
+pub struct QuicConnectionAttempt(QuicActionAttempt<Connection, QuicParentId>);
 
 impl QuicConnectionAttempt {
     pub(crate) fn new(
@@ -186,8 +186,7 @@ impl QuicConnection {
             return Err(err.into());
         }
 
-        let attempt =
-            QuicPeerStreamAttempt::new(self.runtime.clone(), rec, self.parent_id());
+        let attempt = QuicPeerStreamAttempt::new(self.runtime.clone(), rec, self.id());
 
         Ok(Some(attempt))
     }
@@ -215,8 +214,7 @@ impl QuicConnection {
             return Err(err.into());
         }
 
-        let attempt =
-            QuicReceiveStreamAttempt::new(self.runtime.clone(), rec, self.parent_id());
+        let attempt = QuicReceiveStreamAttempt::new(self.runtime.clone(), rec, self.id());
 
         Ok(Some(attempt))
     }
@@ -244,11 +242,8 @@ impl QuicConnection {
             return Err(err.into());
         }
 
-        let attempt = QuicBidirectionalStreamAttempt::new(
-            self.runtime.clone(),
-            rec,
-            self.parent_id(),
-        );
+        let attempt =
+            QuicBidirectionalStreamAttempt::new(self.runtime.clone(), rec, self.id());
 
         Ok(Some(attempt))
     }
@@ -269,7 +264,7 @@ impl QuicConnection {
         Ok(QuicBidirectionalStreamAttempt::new(
             self.runtime.clone(),
             join,
-            self.parent_id(),
+            self.id(),
         ))
     }
 
@@ -289,7 +284,7 @@ impl QuicConnection {
         Ok(QuicSendStreamAttempt::new(
             self.runtime.clone(),
             join,
-            self.parent_id(),
+            self.id(),
         ))
     }
 

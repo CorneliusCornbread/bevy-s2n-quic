@@ -18,7 +18,7 @@ pub mod marker;
 
 /// The component which manages an instance of a QuicServer.
 ///
-/// It is recommended you parent any [QuicServerConnection] to their related QuicServer entity.
+/// It is recommended you parent any [QuicConnection] to their related QuicServer entity.
 #[derive(Component)]
 #[require(QuicServerMarker)]
 pub struct QuicServer {
