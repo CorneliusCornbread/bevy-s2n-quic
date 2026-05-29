@@ -60,8 +60,12 @@ fn handle_bidir_stream_attempt(
                     std::time::SystemTime,
                 };
 
-                let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
-                let err_bundle = (err_comp, *parent_id);
+                let err_comp = QuicActionErrorComponent::new(
+                    e,
+                    SystemTime::now(),
+                    attempt.id().parent_id(),
+                );
+                let err_bundle = err_comp;
 
                 error_entity.insert(err_bundle);
             }
@@ -122,8 +126,9 @@ fn handle_rec_stream_attempt(
                     std::time::SystemTime,
                 };
 
-                let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
-                let err_bundle = (err_comp, *id);
+                let err_comp =
+                    QuicActionErrorComponent::new(e, SystemTime::now(), id.parent_id());
+                let err_bundle = err_comp;
 
                 error_entity.insert(err_bundle);
             }
@@ -182,8 +187,12 @@ fn handle_peer_stream_attempt(
                     std::time::SystemTime,
                 };
 
-                let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
-                let err_bundle = (err_comp, *parent_id);
+                let err_comp = QuicActionErrorComponent::new(
+                    e,
+                    SystemTime::now(),
+                    attempt.id().parent_id(),
+                );
+                let err_bundle = err_comp;
 
                 error_entity.insert(err_bundle);
             }

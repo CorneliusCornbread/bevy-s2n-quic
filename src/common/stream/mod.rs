@@ -7,7 +7,6 @@ use s2n_quic::stream::PeerStream;
 use tokio::runtime::Handle;
 
 use crate::common::{
-    QuicParentId,
     attempt::{QuicActionAttempt, TaskResult},
     connection::id::ConnectionId,
     orchestrator::handle::OrchestratorHandle,
@@ -19,7 +18,6 @@ pub mod plugin;
 pub mod receive;
 pub mod send;
 pub mod session;
-pub(crate) mod task_state;
 
 /// This is a structure which represents an in progress receive stream.
 /// Any pending streams this attempt may hold will be closed
@@ -137,7 +135,6 @@ pub enum QuicPeerStream {
 
 impl QuicPeerStream {
     pub fn new(
-        runtime: Handle,
         orchestrator: OrchestratorHandle,
         peer_stream: PeerStream,
         conn_id: ConnectionId,

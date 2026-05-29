@@ -1,4 +1,7 @@
-use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio::{
+    runtime::Handle,
+    sync::mpsc::{Sender, error::TrySendError},
+};
 
 use crate::common::{
     connection::task::ConnectionTask,
@@ -8,12 +11,13 @@ use crate::common::{
 
 #[derive(Clone, Debug)]
 pub struct OrchestratorHandle {
+    runtime: Handle,
     sender: Sender<QuicTask>,
 }
 
 impl OrchestratorHandle {
-    pub(crate) fn new(sender: Sender<QuicTask>) -> Self {
-        Self { sender }
+    pub(crate) fn new(sender: Sender<QuicTask>, runtime: Handle) -> Self {
+        Self { sender, runtime }
     }
 
     #[allow(clippy::result_large_err)]
@@ -90,5 +94,11 @@ impl OrchestratorHandle {
         };
 
         Ok(())
+    }
+
+    /// Returns a handle to the Tokio runtime used for
+    /// running async tasks.
+    pub fn tokio_handle(&self) -> &Handle {
+        &self.runtime
     }
 }

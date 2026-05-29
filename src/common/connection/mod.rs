@@ -9,7 +9,7 @@ use bevy::{
 };
 use s2n_quic::{
     Connection,
-    application::{self, Error},
+    application::{self},
     connection::Handle as ConnectionHandle,
 };
 use std::sync::Arc;

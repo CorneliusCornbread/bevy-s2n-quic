@@ -10,7 +10,6 @@ use bytes::Bytes;
 use s2n_quic::stream::SendStream;
 use std::error::Error;
 use tokio::{
-    runtime::Handle,
     select,
     sync::mpsc::{self, Receiver, Sender, error::TrySendError},
 };

@@ -12,7 +12,6 @@ use s2n_quic::application::{self, Error as ErrorCode};
 use s2n_quic::stream::ReceiveStream;
 use std::error::Error;
 use tokio::{
-    runtime::Handle,
     select,
     sync::mpsc::{self, Receiver, Sender},
     time::Instant as TokioInstant,
@@ -45,7 +44,7 @@ pub struct QuicReceiveStream {
     inbound_control: Sender<RecControlMessage>,
     receive_errors: Receiver<Box<dyn Error + Send + Sync>>,
     stream_id: StreamId,
-    orchestrator: OrchestratorHandle,
+    _orchestrator: OrchestratorHandle,
 }
 
 impl QuicReceiveStream {
@@ -99,7 +98,7 @@ impl QuicReceiveStream {
             inbound_control,
             receive_errors,
             stream_id,
-            orchestrator,
+            _orchestrator: orchestrator,
         }
     }
 
@@ -320,7 +319,7 @@ impl RecTask {
 
                 self.disconnect_flag =
                     Some(ConnectionDisconnectReason::MspcChannelClosed {
-                        channel_name: "Inbound receive channel".into(),
+                        channel_name: "Inbound receive channel",
                     });
             }
         }

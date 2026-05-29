@@ -57,7 +57,7 @@ impl AsyncOrchestrator {
 
         let task = AsyncOrchestratorTask::new(rx, &runtime);
         let task_join = runtime.spawn(task.start());
-        let orchestrator = OrchestratorHandle::new(tx);
+        let orchestrator = OrchestratorHandle::new(tx, runtime.clone());
 
         Self {
             runtime,

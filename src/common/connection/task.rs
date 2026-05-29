@@ -1,5 +1,4 @@
 use bevy::log::{
-    info,
     tracing::{self},
     warn,
 };
@@ -11,7 +10,6 @@ use s2n_quic::{
 use std::{error::Error, fmt, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
-    runtime::Handle,
     select,
     sync::{
         mpsc::{self, error::TrySendError},
@@ -29,9 +27,9 @@ use crate::common::{
         open_flag::OpenFlag,
         stream_flag::StreamFlag,
     },
-    orchestrator::{self, handle::OrchestratorHandle},
+    orchestrator::handle::OrchestratorHandle,
     stream::{QuicPeerStream, receive::QuicReceiveStream, send::QuicSendStream},
-    task_state::{JoinHandleState, OnceLockState},
+    task_state::OnceLockState,
 };
 
 /// Timeout used when the buffered stream type doesn't match what the command
@@ -277,7 +275,6 @@ impl ConnectionTask {
             ConnectionCommand::Accept { respond_to } => {
                 if let Some(stream) = self.buffered_stream.take() {
                     let peer_stream = QuicPeerStream::new(
-                        Handle::current(),
                         self.orchestrator.clone(),
                         stream,
                         self.connection_id,

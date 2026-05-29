@@ -64,8 +64,9 @@ fn handle_connection_attempts(
                     std::time::SystemTime,
                 };
 
-                let err_comp = QuicActionErrorComponent::new(e, SystemTime::now());
-                let err_bundle = (err_comp, *parent_id);
+                let err_comp =
+                    QuicActionErrorComponent::new(e, SystemTime::now(), parent_id);
+                let err_bundle = err_comp;
 
                 error_entity.insert(err_bundle);
             }

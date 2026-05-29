@@ -162,13 +162,23 @@ impl From<ConnectionError> for TaskError {
 pub struct QuicActionErrorComponent {
     error: QuicActionError,
     timestamp: SystemTime,
+    parent_id: QuicParentId,
 }
 
 impl QuicActionErrorComponent {
-    pub fn new(error: QuicActionError, timestamp: SystemTime) -> Self {
-        Self { error, timestamp }
+    pub fn new(
+        error: QuicActionError,
+        timestamp: SystemTime,
+        parent_id: QuicParentId,
+    ) -> Self {
+        Self {
+            error,
+            timestamp,
+            parent_id,
+        }
     }
 
+    /// Returns the actual [QuicActionError] held by this component.
     pub fn error(&self) -> &QuicActionError {
         &self.error
     }
@@ -176,5 +186,10 @@ impl QuicActionErrorComponent {
     /// The [SystemTime] at which this error was received by the sync (Bevy) side.
     pub fn timestamp(&self) -> &SystemTime {
         &self.timestamp
+    }
+
+    /// Returns the parent client or server which is responsible for this error.
+    pub fn parent_id(&self) -> QuicParentId {
+        self.parent_id
     }
 }

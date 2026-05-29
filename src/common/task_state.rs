@@ -14,6 +14,7 @@ where
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct JoinHandleState<T>
 where
     T: Clone + From<Arc<dyn Error + Send + Sync>>,
@@ -27,6 +28,7 @@ impl<T> JoinHandleState<T>
 where
     T: Clone + From<Arc<dyn Error + Send + Sync>>,
 {
+    #[allow(dead_code)]
     pub fn new(runtime: Handle, task: JoinHandle<T>) -> Self {
         Self {
             task: Some(task),
