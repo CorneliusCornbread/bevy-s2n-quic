@@ -9,7 +9,6 @@ pub enum ConnectionDisconnectReason {
     PeerClosed,
     Reset(s2n_quic::application::Error),
     InvalidStream,
-    //TODO: change this to store the error in an arc
     ConnectionError(s2n_quic::connection::Error),
     MspcChannelClosed { channel_name: &'static str },
     OrchestratorError,

@@ -18,7 +18,6 @@ use crate::common::{
 #[derive(Debug)]
 pub struct StreamAttemptPlugin;
 
-// TODO: create systems for send/receive versions
 impl Plugin for StreamAttemptPlugin {
     fn build(&self, app: &mut bevy::app::App) {
         app.add_systems(Update, handle_bidir_stream_attempt)

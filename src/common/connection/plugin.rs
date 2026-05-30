@@ -41,7 +41,7 @@ fn handle_connection_attempts(
             match e {
                 QuicActionError::Pending => {
                     continue;
-                } // TODO: Setup a timeout
+                }
                 QuicActionError::Consumed => {
                     info!(
                         "Already consumed connection attempt hasn't been cleaned up: {entity}"
