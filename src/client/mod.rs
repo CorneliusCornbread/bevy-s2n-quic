@@ -10,8 +10,7 @@ use crate::{
     client::marker::QuicClientMarker,
     common::{
         QuicParentId, QuicParentType, attempt::TaskError,
-        connection::QuicConnectionAttempt, orchestrator::handle::OrchestratorHandle,
-        runtime::TokioRuntime,
+        connection::QuicConnectionAttempt, runtime::TokioRuntime,
     },
 };
 
@@ -25,7 +24,6 @@ pub struct QuicClient {
     runtime: Handle,
     client: Client,
     id: QuicParentId,
-    orchestrator: OrchestratorHandle,
 }
 
 impl QuicClient {
@@ -34,13 +32,11 @@ impl QuicClient {
     pub fn new(tokio_runtime: &TokioRuntime) -> Self {
         let runtime = tokio_runtime.handle().clone();
         let client = runtime.block_on(build());
-        let orchestrator = tokio_runtime.orchestrator().clone();
 
         Self {
             runtime,
             client,
             id: QuicParentId::generate_unique(QuicParentType::Client),
-            orchestrator,
         }
     }
 
@@ -52,13 +48,11 @@ impl QuicClient {
     ) -> Result<Self, TlsError> {
         let runtime = tokio_runtime.handle().clone();
         let client = runtime.block_on(build_tls(certificate))?;
-        let orchestrator = tokio_runtime.orchestrator().clone();
 
         let ret = Self {
             runtime,
             client,
             id: QuicParentId::generate_unique(QuicParentType::Client),
-            orchestrator,
         };
 
         Ok(ret)

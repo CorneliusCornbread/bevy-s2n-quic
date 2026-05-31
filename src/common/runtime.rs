@@ -36,12 +36,13 @@ impl TokioRuntime {
 
     pub(crate) fn new(worker_threads: usize) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(worker_threads)
             .enable_all()
             .build()
             .expect("Unable to create async runtime.");
 
-        let orchestrator = AsyncOrchestrator::new(runtime.handle().clone());
+        let orchestrator =
+            AsyncOrchestrator::new(runtime.handle().clone(), worker_threads);
 
         Self {
             runtime,
