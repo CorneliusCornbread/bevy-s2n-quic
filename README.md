@@ -6,12 +6,13 @@ First start by selecting the relevant version of the crate based on the version 
 
 | Bevy Version | Aeronet Version (optional) | Crate Version |
 |--------------|-----------------|---------------|
-| 0.18         | 0.19            | 0.18          |
+| 0.18         | 0.20            | 0.18          |
+| 0.19         | 0.21            | 0.19          |
 
 You can add the crate to your project with the following addition to your `cargo.toml`
 ```toml
 [dependencies]
-bevy-s2n-quic = "0.18"
+bevy-s2n-quic = "0.19"
 ```
 
 And by adding the default plugins
