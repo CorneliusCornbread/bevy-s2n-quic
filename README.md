@@ -1,3 +1,5 @@
+
+
 # bevy-quic-networking
 A plugin for Bevy which implements components for the use of sending data over the QUIC protocol using Amazon's [s2n-quic](https://github.com/aws/s2n-quic).
 
@@ -9,7 +11,7 @@ First start by selecting the relevant version of the crate based on the version 
 | 0.18         | 0.20            | 0.18          |
 | 0.19         | 0.21            | 0.19          |
 
-You can add the crate to your project with the following addition to your `cargo.toml`
+You can add the crate to your project with the following addition to your `Cargo.toml`
 ```toml
 [dependencies]
 bevy-s2n-quic = "0.19"
