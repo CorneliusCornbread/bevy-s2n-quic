@@ -1,5 +1,3 @@
-
-
 # bevy-quic-networking
 A plugin for Bevy which implements components for the use of sending data over the QUIC protocol using Amazon's [s2n-quic](https://github.com/aws/s2n-quic).
 
