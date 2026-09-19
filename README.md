@@ -69,6 +69,10 @@ AI has been used for the purposes of indexing documentation, generating examples
 assisting in refactors or code snippets. All code is human authored with a human being responsible for maintaining any code which does not behave as
 intended.
 
+If you are familiar with the [REAL Rating](https://www.realgoodai.org/real-rating) this project would be self described as a level 3, or Moderate AI usage.
+
+<img width="122" height="132" alt="3 REAL rating" src="https://github.com/user-attachments/assets/89baf72e-c080-4e47-b0c3-2e607dec2c90" />
+
 # License
 
 Licensed under either of:
