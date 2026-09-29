@@ -102,21 +102,29 @@ impl QuicSendStream {
         }
     }
 
-    /// Returns `Some(())` in the event the close event was successful, if it wasn't
-    /// it's due to the Receiver of the message being dropped. In which case
-    /// it's likely the async task has been shut down, already quit, or crashed.
+    /// Queues a close request for the async task without blocking.
+    ///
+    /// Returns `Some(())` if the request was queued. `None` means either the
+    /// control channel is full (the request was dropped, try again later) or
+    /// the receiver was dropped, in which case the async task has likely
+    /// been shut down, already quit, or crashed. Use [`Self::is_open`] to
+    /// tell those apart.
     pub fn close(&mut self) -> Option<()> {
         self.outbound_control
-            .blocking_send(SendControlMessage::CloseAndQuit)
+            .try_send(SendControlMessage::CloseAndQuit)
             .ok()
     }
 
-    /// Returns `Some(())` in the event the flush event was successful, if it wasn't
-    /// it's due to the Receiver of the message being dropped. In which case
-    /// it's likely the async task has been shut down, already quit, or crashed.
+    /// Queues a flush request for the async task without blocking.
+    ///
+    /// Returns `Some(())` if the request was queued. `None` means either the
+    /// control channel is full (the request was dropped, try again later) or
+    /// the receiver was dropped, in which case the async task has likely
+    /// been shut down, already quit, or crashed. Use [`Self::is_open`] to
+    /// tell those apart.
     pub fn flush(&mut self) -> Option<()> {
         self.outbound_control
-            .blocking_send(SendControlMessage::Flush)
+            .try_send(SendControlMessage::Flush)
             .ok()
     }
 
@@ -161,11 +169,7 @@ impl QuicSendStream {
     /// Outputs any outstanding errors that have happened on the
     /// async side of this stream.
     pub fn log_outstanding_errors(&mut self) {
-        while !self.send_errors.is_empty() {
-            let Some(err) = self.send_errors.blocking_recv() else {
-                continue;
-            };
-
+        while let Ok(err) = self.send_errors.try_recv() {
             error!("Sender ID: {}, encountered error:\n{}", self.stream_id, err);
         }
     }

@@ -63,7 +63,7 @@ use bevy::{
         query::{With, Without},
         resource::Resource,
         schedule::IntoScheduleConfigs,
-        system::{Commands, Query, Res, ResMut},
+        system::{Commands, Local, Query, Res, ResMut},
     },
     log::{LogPlugin, error, info, warn},
     render::{
@@ -777,21 +777,26 @@ fn client_send(
 // Server-side streams are automatically accepted by SimpleServerAcceptorPlugin
 // and tagged with QuicServerMarker (see server/acceptor.rs).
 //
-// Uses the non-blocking `recv` rather than `recv_many`, which blocks the
-// calling thread until at least one packet is available. That would stall
-// the frame on any silent stream (e.g. the idle scenario).
+// `recv_many` never blocks, so silent streams (e.g. the idle scenario) cost
+// only an empty channel check.
+
+const SERVER_RECV_BATCH: usize = 256;
 
 fn server_recv(
     mut streams: Query<&mut QuicReceiveStream, With<QuicServerMarker>>,
     mut bench: ResMut<StressBench>,
+    mut buffer: Local<Vec<aeronet_io::packet::RecvPacket>>,
 ) {
     let mut received = 0u64;
 
     // Closed streams are still drained so buffered data is not miscounted.
     for mut stream in &mut streams {
         let mut any = false;
-        while let Some(packet) = stream.recv() {
-            received += packet.payload.len() as u64;
+        while stream.recv_many(&mut buffer, SERVER_RECV_BATCH) > 0 {
+            received += buffer
+                .drain(..)
+                .map(|packet| packet.payload.len() as u64)
+                .sum::<u64>();
             any = true;
         }
         if any {

@@ -107,10 +107,26 @@ impl QuicReceiveStream {
         self.inbound_data.try_recv().ok()
     }
 
-    /// Receive multiple packets of data and push them to the given
-    /// buffer for reading.
+    /// Receive up to `limit` packets that are already waiting and push them
+    /// to the given buffer for reading.
+    ///
+    /// Never blocks. Returns the number of packets pushed, which is `0` when
+    /// no data is waiting or the stream is closed and drained. Use
+    /// [`Self::is_open`] to tell those apart.
     pub fn recv_many(&mut self, buffer: &mut Vec<RecvPacket>, limit: usize) -> usize {
-        self.inbound_data.blocking_recv_many(buffer, limit)
+        buffer.reserve(limit.min(self.inbound_data.len()));
+
+        let mut count = 0;
+        while count < limit {
+            let Ok(packet) = self.inbound_data.try_recv() else {
+                break;
+            };
+
+            buffer.push(packet);
+            count += 1;
+        }
+
+        count
     }
 
     /// Returns `true` if this stream is still open
@@ -127,28 +143,33 @@ impl QuicReceiveStream {
     /// Notifies the peer to stop sending data on the stream.
     ///
     /// This requests the peer to finish the stream as soon as possible by issuing a reset with the provided error_code.
+    ///
+    /// Never blocks. If the control channel is full or closed the request is
+    /// dropped and a warning is logged.
     pub fn stop_send(&mut self, err_code: ErrorCode) {
-        let Err(_e) = self
+        let Err(e) = self
             .inbound_control
-            .blocking_send(RecControlMessage::StopSend(err_code))
+            .try_send(RecControlMessage::StopSend(err_code))
         else {
             return;
         };
 
-        warn!(
-            "Stop_send() called on stopped connection with ID: {}.",
-            self.stream_id
-        );
+        match e {
+            mpsc::error::TrySendError::Full(_) => warn!(
+                "Stop_send() dropped, control channel is full for stream with ID: {}.",
+                self.stream_id
+            ),
+            mpsc::error::TrySendError::Closed(_) => warn!(
+                "Stop_send() called on stopped connection with ID: {}.",
+                self.stream_id
+            ),
+        }
     }
 
     /// Outputs any outstanding errors that have happened on the
     /// async side of this stream.
     pub fn log_outstanding_errors(&mut self) {
-        while !self.receive_errors.is_empty() {
-            let Some(err) = self.receive_errors.blocking_recv() else {
-                continue;
-            };
-
+        while let Ok(err) = self.receive_errors.try_recv() {
             error!(
                 "Receiver ID: {}, encountered error:\n{}",
                 self.stream_id, err
