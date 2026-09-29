@@ -15,8 +15,9 @@
 ///   bidirectional stream. Clients are reused by later phases.
 /// - For every scenario in `--scenarios` the phase runs:
 ///   1. **warmup** – clients send, nothing is measured.
-///   2. **measure** – clients send a fixed payload every fixed tick, and
-///      frame time, CPU, and Tokio metrics are recorded.
+///   2. **measure** – clients send `--burst` messages of a fixed payload
+///      every fixed tick, and frame time, CPU, and Tokio metrics are
+///      recorded.
 ///   3. **drain** – sending stops, and the server keeps reading until
 ///      every sent byte has arrived (or the drain timeout passes).
 /// - Scenarios:
@@ -140,6 +141,7 @@ struct Config {
     ready_timeout: Duration,
     idle_fraction: f64,
     payload: Bytes,
+    burst: usize,
     tokio_threads: Option<usize>,
     windowed: bool,
     out: Option<PathBuf>,
@@ -156,6 +158,7 @@ impl Default for Config {
             ready_timeout: Duration::from_secs(30),
             idle_fraction: 0.1,
             payload: payload_of(DEFAULT_PAYLOAD_BYTES),
+            burst: 1,
             tokio_threads: None,
             windowed: false,
             out: None,
@@ -174,7 +177,8 @@ Options:
   --drain <SECS>          Max time to wait for in-flight data after a phase [default: 5]
   --ready-timeout <SECS>  Max time to wait for clients to connect [default: 30]
   --idle-fraction <F>     Fraction of streams sending in the idle scenario [default: 0.1]
-  --payload <BYTES>       Bytes sent per sender per fixed tick [default: 36]
+  --payload <BYTES>       Bytes per message [default: 36]
+  --burst <N>             Messages sent per sender per fixed tick [default: 1]
   --tokio-threads <N>     Tokio worker threads [default: library default]
   --windowed              Use DefaultPlugins with a window instead of headless
   --out <FILE>            Append the markdown results to FILE
@@ -244,6 +248,14 @@ impl Config {
                         .filter(|&n| n > 0)
                         .ok_or_else(|| format!("invalid --payload: {v}"))?;
                     cfg.payload = payload_of(size);
+                }
+                "--burst" => {
+                    let v = value()?;
+                    cfg.burst = v
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or_else(|| format!("invalid --burst: {v}"))?;
                 }
                 "--tokio-threads" => {
                     let v = value()?;
@@ -520,7 +532,7 @@ fn setup(mut commands: Commands, runtime: Res<TokioRuntime>, bench: Res<StressBe
          Mode:      {}\n\
          Clients:   {:?}  |  Scenarios: {:?}\n\
          Phase:     warmup {:?}, measure {:?}, drain ≤{:?}\n\
-         Payload:   {} B per sender per fixed tick  |  idle fraction {}\n\
+         Payload:   {} B × {} per sender per fixed tick  |  idle fraction {}\n\
          Tokio:     {} worker(s)  |  logical CPUs {}",
         if cfg.windowed { "windowed" } else { "headless" },
         cfg.client_counts,
@@ -529,6 +541,7 @@ fn setup(mut commands: Commands, runtime: Res<TokioRuntime>, bench: Res<StressBe
         cfg.duration,
         cfg.drain,
         cfg.payload.len(),
+        cfg.burst,
         cfg.idle_fraction,
         runtime.handle().metrics().num_workers(),
         available_parallelism(),
@@ -763,6 +776,7 @@ fn client_send(
 
     let senders = bench.senders;
     let payload = bench.cfg.payload.clone();
+    let burst = bench.cfg.burst;
     let mut sent = 0u64;
     let mut full = 0u64;
 
@@ -770,9 +784,11 @@ fn client_send(
         if meta.index >= senders || !stream.is_open() {
             continue;
         }
-        match stream.send(payload.clone()) {
-            Ok(()) => sent += payload.len() as u64,
-            Err(_) => full += 1,
+        for _ in 0..burst {
+            match stream.send(payload.clone()) {
+                Ok(()) => sent += payload.len() as u64,
+                Err(_) => full += 1,
+            }
         }
     }
 
@@ -931,11 +947,12 @@ fn report(bench: &StressBench) -> bool {
     );
     let _ = writeln!(
         md,
-        "- Per phase: warmup {:?}, measure {:?}, drain ≤{:?} | payload {} B/tick | idle fraction {}",
+        "- Per phase: warmup {:?}, measure {:?}, drain ≤{:?} | payload {} B × {}/tick | idle fraction {}",
         cfg.warmup,
         cfg.duration,
         cfg.drain,
         cfg.payload.len(),
+        cfg.burst,
         cfg.idle_fraction,
     );
     let _ = writeln!(

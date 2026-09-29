@@ -201,6 +201,79 @@ outbound channel. That backlog is the extra RSS. `tests/loopback.rs` covers
 the case where backpressure reaches `send` (it fails if the receiver drops
 data instead of pushing back).
 
+## Phase 3: per-frame batching (rejected, not merged)
+
+Experiment: `QuicSendStream::send` queued on the component, and a
+`flush_outbound` system (in `Last`) handed each stream's batch to its task
+as one channel message. The receive task handed packets to Bevy as one batch
+per read. It gave no gains (see the gate result below), so it was reverted
+and the code stays as in Phase 2. The numbers are kept as a record.
+
+- Same machine and settings as above
+- Phase 2 (`46517f9`) and Phase 3 were run alternately with the same benchmark
+  binary source (the benchmark gained `--burst <N>`, messages per sender
+  per fixed tick). 3 runs each at `--burst 1`, 2 runs each at `--burst 8`.
+- 0 lost bytes and all streams ready in every run of both builds.
+
+Min–max over the runs, `--burst 1` (the default command):
+
+| clients | scenario | frame avg ms (P2) | frame avg ms (P3) | frame p99 ms (P2) | frame p99 ms (P3) | cpu cores (P2) | cpu cores (P3) | max gq (P2) | max gq (P3) |
+| ------: | -------- | ----------------- | ----------------- | ----------------- | ----------------- | -------------- | -------------- | ----------: | ----------: |
+|     100 | active   | 0.14              | 0.15              | 0.22–0.42         | 0.21–0.23         | 0.15           | 0.15           |       45–48 |      99–100 |
+|     100 | idle     | 0.11–0.12         | 0.12              | 0.17–0.20         | 0.16–0.18         | 0.04           | 0.04           |         2–3 |          10 |
+|     300 | active   | 0.20–0.21         | 0.24              | 0.32–0.38         | 0.33–0.35         | 0.38–0.39      | 0.38           |     205–232 |     264–300 |
+|     300 | idle     | 0.14              | 0.15              | 0.21–0.28         | 0.20–0.25         | 0.06–0.07      | 0.06–0.07      |       10–11 |          30 |
+|     600 | active   | 0.29–0.30         | 0.36–0.37         | 0.45–0.60         | 0.55–0.58         | 0.75–0.77      | 0.77–0.78      |     500–516 |     546–562 |
+|     600 | idle     | 0.17–0.18         | 0.19              | 0.32–0.39         | 0.27–0.35         | 0.11           | 0.10–0.11      |       21–24 |       59–60 |
+
+`--burst 8`, 600 clients active: frame avg 0.41 ms (P2) vs 0.43–0.44 ms (P3),
+CPU 0.81–0.82 vs 0.82–0.83 cores. Other rows match within the same margins.
+
+Remote schedules (`tokio_unstable`, one run each):
+
+| clients | scenario | P2 burst 1 | P3 burst 1 | P2 burst 8 | P3 burst 8 |
+| ------: | -------- | ---------: | ---------: | ---------: | ---------: |
+|     100 | active   |     60 057 |     59 800 |     60 337 |     59 800 |
+|     300 | active   |    180 863 |    179 923 |    181 335 |    179 623 |
+|     600 | active   |    361 302 |    359 315 |    362 902 |    359 316 |
+|     600 | idle     |     36 229 |     35 880 |     36 371 |     35 940 |
+
+### Data-loss reproducer
+
+Same command as in Phase 2:
+
+| build   | sent (API) | received in window | lost B after drain | send full | peak RSS |
+| ------- | ---------: | -----------------: | -----------------: | --------: | -------: |
+| Phase 2 |    4838 MB |             770 MB |                  0 |         0 |   2.4 GB |
+| Phase 3 |    2416 MB |             780 MB |                  0 |    38 145 |   2.4 GB |
+
+### Observations
+
+- **Batching didn't reduce wakes.** Phase 2 already made exactly one remote
+  wake per sending stream per frame, even at 8 sends per frame. Once a task
+  is scheduled, more sends before it runs don't schedule it again, so Tokio
+  was already coalescing them. Phase 3 removes only the ~0.5% of wakes where
+  a task ran between two sends in the same frame.
+- **Busy frame time got worse**, not better: +0.03 ms at 300 active and
+  +0.06–0.07 ms (~22%) at 600, consistent across runs. Idle rows are +0.01 ms.
+  Likely causes are the extra `flush_outbound` pass over every send stream
+  and one `Vec` allocation per batch. This hasn't been profiled.
+- **CPU is unchanged** within noise.
+- Max global queue depth now equals the number of senders. All wakes happen
+  in one burst in `flush_outbound` instead of spread across `Update`. It
+  doesn't show up in CPU or frame p99.
+- **Backpressure now reaches the caller.** With the channel limited to 8
+  batches, `send` returns `Full` under overload (`send full` 38 145 in the
+  reproducer) and only half as much data is accepted, with the same
+  throughput. Peak RSS is unchanged, so the backlog seems to sit in s2n-quic
+  rather than in the channel.
+- **Gate result:** per-frame batching doesn't remove the remote-wake cost,
+  and the batching pass adds its own, so it was reverted. The wake cost is
+  inherent to waking Tokio tasks from a non-Tokio thread, so it needs
+  sharding (fewer tasks to wake) or a different handoff, not batching. The
+  backpressure gain came from the smaller outbound channel, not from
+  batching, and can be revisited on its own.
+
 ## Backpressure and data loss
 
 `--payload <BYTES>` raises the offered load until s2n-quic can't keep up.

@@ -1,5 +1,5 @@
 use aeronet_io::{
-    Session,
+    IoSystems, Session,
     connection::{Disconnect, Disconnected},
 };
 use bevy::{
@@ -9,6 +9,7 @@ use bevy::{
         entity::Entity,
         observer::On,
         query::With,
+        schedule::IntoScheduleConfigs,
         system::{Commands, Query},
         world::World,
     },
@@ -55,7 +56,8 @@ pub struct QuicAeronetPacketPlugin;
 
 impl Plugin for QuicAeronetPacketPlugin {
     fn build(&self, app: &mut bevy::app::App) {
-        app.add_systems(PreUpdate, (aeronet_session_recv, aeronet_session_send));
+        app.add_systems(PreUpdate, aeronet_session_recv.in_set(IoSystems::Poll))
+            .add_systems(PostUpdate, aeronet_session_send.in_set(IoSystems::Flush));
     }
 }
 
@@ -122,9 +124,9 @@ fn aeronet_session_send(
         #[cfg(feature = "performance-warns")]
         if res.is_err() {
             warn!(
-                "Drain send unable to fully drain send buffer. Remaining items in buffer: {}\nHas the state of '{}' been corrupted?",
-                session.send.len(),
-                parent_id
+                "Send stream for '{}' is full, {} packets were not sent. Is the network keeping up?",
+                parent_id,
+                session.send.len()
             )
         }
     }

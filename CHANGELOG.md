@@ -20,6 +20,9 @@
 
 ### Changed
 
+- `aeronet_session_recv` now runs in aeronet's `IoSystems::Poll`, and
+  `aeronet_session_send` runs in `IoSystems::Flush` (`PostUpdate`) instead of
+  `PreUpdate`. Packets written to `Session::send` go out the same frame.
 - The async orchestrator (dispatcher plus spin-polling workers) is replaced by
   one long-lived Tokio task per connection and stream. Idle connections no
   longer use CPU: the benchmark went from ~4 busy cores at any load to
@@ -50,6 +53,10 @@
 
 ### Fixed
 
+- With aeronet's `AeronetIoPlugin`, packets written to `Session::send` were
+  cleared at the end of the frame (after `IoSystems::Flush`) before
+  `aeronet_session_send` read them in the next `PreUpdate`, so they were never
+  sent.
 - Data loss on send streams under load. A partially sent batch could be
   dropped, which lost data whenever the network couldn't keep up
   (3.4 GB lost in the benchmark reproducer, now 0).

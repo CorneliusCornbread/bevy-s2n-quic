@@ -24,6 +24,10 @@ const CHUNK_SIZE: usize = 4096;
 const CHUNK_COUNT: u64 = 8192;
 const WORDS_PER_CHUNK: u64 = (CHUNK_SIZE / 8) as u64;
 
+/// Small, odd `recv_many` limit so reads that stop at the limit are
+/// exercised, mixed with single `recv` calls.
+const RECV_LIMIT: usize = 7;
+
 const TIMEOUT: Duration = Duration::from_secs(120);
 /// How long `send` must keep reporting a full channel to count as stalled.
 const STALL_TIME: Duration = Duration::from_millis(500);
@@ -178,7 +182,16 @@ fn stream_delivers_all_data_in_order_under_backpressure() {
 
         let open = rec.is_open();
         packets.clear();
-        let count = rec.recv_many(&mut packets, usize::MAX);
+        let mut count = rec.recv_many(&mut packets, RECV_LIMIT);
+        assert!(count <= RECV_LIMIT, "recv_many returned more than its limit");
+        assert_eq!(count, packets.len(), "recv_many count doesn't match");
+
+        // Mix in single receives, which must continue in the same order.
+        if let Some(packet) = rec.recv() {
+            packets.push(packet);
+            count += 1;
+        }
+
         for packet in &packets {
             received.extend_from_slice(&packet.payload);
         }
