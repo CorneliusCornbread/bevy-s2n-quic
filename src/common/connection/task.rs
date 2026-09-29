@@ -7,7 +7,9 @@ use s2n_quic::{
     connection::{Error as ConnectionError, Handle as ConnectionHandle},
     stream::PeerStream,
 };
-use std::{error::Error, fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    error::Error, fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration,
+};
 use thiserror::Error;
 use tokio::{
     select,
@@ -27,9 +29,8 @@ use crate::common::{
         open_flag::OpenFlag,
         stream_flag::StreamFlag,
     },
-    orchestrator::handle::OrchestratorHandle,
+    spawner::{QuicTask, SPAWN_REJECTED_ERROR_CODE, TaskSpawner},
     stream::{QuicPeerStream, receive::QuicReceiveStream, send::QuicSendStream},
-    task_state::OnceLockState,
 };
 
 /// Timeout used when the buffered stream type doesn't match what the command
@@ -58,7 +59,7 @@ pub(crate) enum ConnectionCommand {
 #[derive(Debug)]
 pub(crate) struct ConnectionHandleTask {
     connection: ConnectionHandle,
-    orchestrator: OrchestratorHandle,
+    spawner: TaskSpawner,
     is_open: OpenFlag,
     remote_addr: Result<SocketAddr, ConnectionError>,
     connection_id: ConnectionId,
@@ -79,7 +80,7 @@ impl fmt::Display for ConnectionHandleTask {
 impl ConnectionHandleTask {
     pub(super) fn new(
         connection: ConnectionHandle,
-        orchestrator: OrchestratorHandle,
+        spawner: TaskSpawner,
         is_open: OpenFlag,
         connection_id: ConnectionId,
     ) -> Self {
@@ -90,7 +91,7 @@ impl ConnectionHandleTask {
             is_open,
             remote_addr,
             connection_id,
-            orchestrator,
+            spawner,
         }
     }
 
@@ -107,12 +108,12 @@ impl ConnectionHandleTask {
                 let (rec_stream, send_stream) = stream.split();
 
                 let quic_send = QuicSendStream::new(
-                    self.orchestrator.clone(),
+                    self.spawner.clone(),
                     send_stream,
                     self.connection_id,
                 );
                 let quic_rec = QuicReceiveStream::new(
-                    self.orchestrator.clone(),
+                    self.spawner.clone(),
                     rec_stream,
                     self.connection_id,
                 );
@@ -131,11 +132,8 @@ impl ConnectionHandleTask {
 
         match send_res {
             Ok(stream) => {
-                let quic_send = QuicSendStream::new(
-                    self.orchestrator.clone(),
-                    stream,
-                    self.connection_id,
-                );
+                let quic_send =
+                    QuicSendStream::new(self.spawner.clone(), stream, self.connection_id);
                 Ok(Some(quic_send))
             }
             Err(err) => Err(err.into()),
@@ -151,10 +149,25 @@ pub(crate) struct ConnectionTask {
     is_open: OpenFlag,
     pending_stream: Arc<StreamFlag>,
     connection_id: ConnectionId,
-    task_state: OnceLockState<ConnectionDisconnectReason>,
     /// Holds a stream that arrived before a matching command was ready to consume it.
     buffered_stream: Option<PeerStream>,
-    orchestrator: OrchestratorHandle,
+    spawner: TaskSpawner,
+}
+
+impl fmt::Display for ConnectionTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "connection {}", self.connection_id)
+    }
+}
+
+impl QuicTask for ConnectionTask {
+    fn run(self) -> impl Future<Output = ConnectionDisconnectReason> + Send + 'static {
+        ConnectionTask::run(self)
+    }
+
+    fn reject(self) {
+        self.connection.close(SPAWN_REJECTED_ERROR_CODE.into());
+    }
 }
 
 impl ConnectionTask {
@@ -164,8 +177,7 @@ impl ConnectionTask {
         connection_id: ConnectionId,
         is_open: OpenFlag,
         pending_stream: Arc<StreamFlag>,
-        task_state: OnceLockState<ConnectionDisconnectReason>,
-        orchestrator: OrchestratorHandle,
+        spawner: TaskSpawner,
     ) -> Self {
         Self {
             connection,
@@ -175,39 +187,39 @@ impl ConnectionTask {
             pending_stream,
             connection_id,
             buffered_stream: None,
-            task_state,
-            orchestrator,
+            spawner,
         }
     }
 
-    pub(crate) fn id(&self) -> ConnectionId {
-        self.connection_id
-    }
-
-    pub(crate) fn close(&self, error_code: application::Error) {
-        self.connection.close(error_code);
-    }
-
     #[tracing::instrument(
-        name = "quic_connection_poll"
+        name = "quic_connection_task",
+        level = "debug",
         skip(self),
         fields(
             connection_id = %self.connection_id,
             remote_address = ?self.connection.remote_addr()
         )
     )]
-    pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
-        if self.disconnect_flag.is_some() {
-            return &self.disconnect_flag;
-        }
+    async fn run(mut self) -> ConnectionDisconnectReason {
+        loop {
+            self.step().await;
 
+            if let Some(reason) = self.disconnect_flag.take() {
+                return reason;
+            }
+
+            tokio::task::consume_budget().await;
+        }
+    }
+
+    async fn step(&mut self) {
         // If we have a buffered stream, we only need to wait for a command
         // that will consume it.
         if self.buffered_stream.is_some() {
             match self.cmd_receiver.recv().await {
                 Some(cmd) => {
                     let res = self.handle_command(cmd).await;
-                    self.handle_cmd_result(res).await;
+                    self.handle_cmd_result(res);
                 }
                 None => {
                     self.disconnect_flag =
@@ -216,55 +228,50 @@ impl ConnectionTask {
                         });
                 }
             }
-        } else {
-            // No buffered stream: race commands against an incoming stream.
-            select! {
-                biased;
+            return;
+        }
 
-                cmd_opt = self.cmd_receiver.recv() => {
-                    match cmd_opt {
-                        Some(cmd) => {
-                            let res = self.handle_command(cmd).await;
-                            self.handle_cmd_result(res).await;
-                        }
-                        None => {
-                            self.disconnect_flag = Some(
-                                ConnectionDisconnectReason::MspcChannelClosed {
-                                    channel_name: CONN_CMD_MSG
-                                },
-                            );
-                        }
+        // No buffered stream: race commands against an incoming stream.
+        select! {
+            biased;
+
+            cmd_opt = self.cmd_receiver.recv() => {
+                match cmd_opt {
+                    Some(cmd) => {
+                        let res = self.handle_command(cmd).await;
+                        self.handle_cmd_result(res);
+                    }
+                    None => {
+                        self.disconnect_flag = Some(
+                            ConnectionDisconnectReason::MspcChannelClosed {
+                                channel_name: CONN_CMD_MSG
+                            },
+                        );
                     }
                 }
+            }
 
-                accept_res = self.connection.accept() => {
-                    match accept_res {
-                        Ok(Some(stream)) => {
-                            // Buffer it, the next command will consume it.
-                            self.buffer_stream(stream);
+            accept_res = self.connection.accept() => {
+                match accept_res {
+                    Ok(Some(stream)) => {
+                        // Buffer it, the next command will consume it.
+                        self.buffer_stream(stream);
+                    }
+                    Ok(None) => {
+                        self.disconnect_flag = Some(
+                            ConnectionDisconnectReason::PeerClosed
+                        );
+                    }
+                    Err(err) => {
+                        if err.is_closed() {
+                            self.is_open.set_closed();
                         }
-                        Ok(None) => {
-                            self.disconnect_flag = Some(
-                                ConnectionDisconnectReason::PeerClosed
-                            );
-                        }
-                        Err(err) => {
-                            if err.is_closed() {
-                                self.is_open.set_closed();
-                            }
-                            self.disconnect_flag =
-                                Some(ConnectionDisconnectReason::ConnectionError(err));
-                        }
+                        self.disconnect_flag =
+                            Some(ConnectionDisconnectReason::ConnectionError(err));
                     }
                 }
             }
         }
-
-        if let Some(disconnect) = &self.disconnect_flag {
-            let _ = self.task_state.set(disconnect.clone());
-        }
-
-        &self.disconnect_flag
     }
 
     async fn handle_command(
@@ -275,7 +282,7 @@ impl ConnectionTask {
             ConnectionCommand::Accept { respond_to } => {
                 if let Some(stream) = self.buffered_stream.take() {
                     let peer_stream = QuicPeerStream::new(
-                        self.orchestrator.clone(),
+                        self.spawner.clone(),
                         stream,
                         self.connection_id,
                     );
@@ -295,7 +302,7 @@ impl ConnectionTask {
                 match self.buffered_stream.take() {
                     Some(PeerStream::Receive(stream)) => {
                         let rec = QuicReceiveStream::new(
-                            self.orchestrator.clone(),
+                            self.spawner.clone(),
                             stream,
                             self.connection_id,
                         );
@@ -321,12 +328,12 @@ impl ConnectionTask {
                     Some(PeerStream::Bidirectional(stream)) => {
                         let (rec, send) = stream.split();
                         let rec = QuicReceiveStream::new(
-                            self.orchestrator.clone(),
+                            self.spawner.clone(),
                             rec,
                             self.connection_id,
                         );
                         let send = QuicSendStream::new(
-                            self.orchestrator.clone(),
+                            self.spawner.clone(),
                             send,
                             self.connection_id,
                         );
@@ -371,11 +378,7 @@ impl ConnectionTask {
         match accept_res {
             Ok(opt) => {
                 let mapped = opt.map(|s| {
-                    QuicReceiveStream::new(
-                        self.orchestrator.clone(),
-                        s,
-                        self.connection_id,
-                    )
+                    QuicReceiveStream::new(self.spawner.clone(), s, self.connection_id)
                 });
                 if respond_to.send(Ok(mapped)).is_err() {
                     warn!(
@@ -424,12 +427,12 @@ impl ConnectionTask {
                 let mapped = opt.map(|bidir| {
                     let (rec, send) = bidir.split();
                     let rec = QuicReceiveStream::new(
-                        self.orchestrator.clone(),
+                        self.spawner.clone(),
                         rec,
                         self.connection_id,
                     );
                     let send = QuicSendStream::new(
-                        self.orchestrator.clone(),
+                        self.spawner.clone(),
                         send,
                         self.connection_id,
                     );
@@ -460,7 +463,7 @@ impl ConnectionTask {
         }
     }
 
-    async fn handle_cmd_result(&mut self, cmd_res: Result<(), ConnectionError>) {
+    fn handle_cmd_result(&mut self, cmd_res: Result<(), ConnectionError>) {
         let Err(err) = cmd_res else {
             return;
         };

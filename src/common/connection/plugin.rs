@@ -29,7 +29,7 @@ fn handle_connection_attempts(
     query: Query<(Entity, &mut QuicConnectionAttempt)>,
 ) {
     let handle_ref = runtime.handle();
-    let orchestrator = runtime.orchestrator();
+    let spawner = runtime.spawner();
 
     for entity_bundle in query {
         let (entity, mut attempt) = entity_bundle;
@@ -77,12 +77,8 @@ fn handle_connection_attempts(
         }
 
         let conn = res.unwrap();
-        let quic_conn = QuicConnection::new(
-            handle_ref.clone(),
-            orchestrator.clone(),
-            conn,
-            parent_id,
-        );
+        let quic_conn =
+            QuicConnection::new(handle_ref.clone(), spawner.clone(), conn, parent_id);
         let id = quic_conn.id();
         info!("New connection entity with {id}");
 

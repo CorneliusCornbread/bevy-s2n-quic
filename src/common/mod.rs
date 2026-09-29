@@ -10,6 +10,7 @@ pub(crate) mod id;
 pub mod orchestrator;
 pub mod plugin;
 pub mod runtime;
+pub mod spawner;
 pub mod status_code;
 pub mod stream;
 pub(crate) mod task_state;

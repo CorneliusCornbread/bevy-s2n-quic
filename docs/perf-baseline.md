@@ -116,6 +116,91 @@ Frame avg in ms, min–max over 3 runs:
   s2n-quic 1.83 → 1.89 bump in `07152f9` made no difference either.
 - 0 lost bytes and every stream ready in all 6 runs.
 
+## Phase 2: long-lived tasks
+
+The orchestrator is replaced by one Tokio task per connection and stream
+(`TaskSpawner`, no task limit). Each task is a `run()` loop that is never
+dropped mid-await.
+
+- Same machine and settings as above, default command
+- Compared against the Phase 1 `post` runs
+- 3 runs. The table shows run 2.
+
+| clients | scenario | senders | ready | frames | frame avg ms | frame p99 ms | frame max ms | interval p99 ms | cpu cores | tokio busy (worker-s) | tokio busy % | max gq | sent | received | send full | lost B | ok |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 100 | active | 100 | 100 | 599 | 0.15 | 0.35 | 0.53 | 16.74 | 0.15 | 1.47 | 4 | 49 | 2.20 MB | 2.20 MB | 0 | 0 | ✓ |
+| 100 | idle | 10 | 100 | 598 | 0.12 | 0.22 | 0.31 | 16.74 | 0.04 | 0.26 | 1 | 7 | 225.4 KB | 225.0 KB | 0 | 0 | ✓ |
+| 300 | active | 300 | 300 | 598 | 0.21 | 0.40 | 0.79 | 16.74 | 0.39 | 3.94 | 10 | 200 | 6.59 MB | 6.92 MB | 0 | 0 | ✓ |
+| 300 | idle | 30 | 300 | 599 | 0.14 | 0.24 | 0.68 | 16.73 | 0.07 | 0.54 | 1 | 11 | 676.1 KB | 676.1 KB | 0 | 0 | ✓ |
+| 600 | active | 600 | 600 | 598 | 0.31 | 0.65 | 1.18 | 16.74 | 0.78 | 8.26 | 21 | 499 | 13.18 MB | 13.95 MB | 0 | 0 | ✓ |
+| 600 | idle | 60 | 600 | 598 | 0.18 | 0.36 | 0.56 | 16.73 | 0.11 | 0.94 | 2 | 21 | 1.32 MB | 1.32 MB | 0 | 0 | ✓ |
+
+Min–max over 3 runs. Phase 1 frame avg is the `post` range above; Phase 1 CPU is `post` run 2.
+
+| clients | scenario | frame avg ms (P1) | frame avg ms (P2) | frame p99 ms (P2) | cpu cores (P1) | cpu cores (P2) | tokio busy % (P2) |
+| ------: | -------- | ----------------- | ----------------- | ----------------- | -------------: | -------------: | ----------------: |
+|     100 | active   | 0.14–0.15         | 0.14–0.15         | 0.35–0.42         |           3.95 |           0.15 |                 4 |
+|     100 | idle     | 0.12              | 0.12              | 0.19–0.22         |           3.97 |           0.04 |                 1 |
+|     300 | active   | 0.19              | 0.21–0.22         | 0.40–0.52         |           3.94 |           0.39 |                10 |
+|     300 | idle     | 0.14–0.15         | 0.14–0.15         | 0.24–0.27         |           3.97 |           0.07 |                 1 |
+|     600 | active   | 0.25–0.26         | 0.31–0.32         | 0.65–0.95         |           3.86 |           0.78 |             20–21 |
+|     600 | idle     | 0.17              | 0.18              | 0.33–0.36         |           3.98 |           0.11 |                 2 |
+
+### Remote wakes
+
+Built with `RUSTFLAGS="--cfg tokio_unstable"` (the benchmark then also
+reports Tokio's `remote_schedule_count` during the measure window). One run:
+
+| clients | scenario | remote schedules | per frame |
+| ------: | -------- | ---------------: | --------: |
+|     100 | active   |           60 225 |       101 |
+|     100 | idle     |            6 079 |        10 |
+|     300 | active   |          180 653 |       302 |
+|     300 | idle     |           18 109 |        30 |
+|     600 | active   |          361 855 |       604 |
+|     600 | idle     |           36 184 |        61 |
+
+```sh
+RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/unstable \
+    cargo run --release --example quic_concurrency_stress -- --clients 100,300,600
+```
+
+### Observations
+
+- **CPU is fixed.** 5–100× less CPU, and it now scales with work: 0.04
+  cores for 100 mostly idle connections, 0.78 cores for 600 busy ones.
+- **Idle frame time is unchanged**, within ±0.01 ms.
+- **Busy frame time is worse at scale:** +0.02–0.03 ms at 300 active
+  senders and +0.06 ms (~23%) at 600. p99 went from ~0.5 ms to 0.65–0.95 ms
+  at 600. It's small in absolute terms but consistent across runs.
+- **The cost is remote wakes.** Remote schedules are exactly one per sending
+  stream per frame. The Bevy thread's first `QuicSendStream::send` each frame
+  wakes that stream's parked send task, which goes through Tokio's global
+  inject queue and may unpark a worker. The extra frame time scales the same
+  way (~100 ns per wake), and max global queue depth went from ~2 to ~500 at
+  600 senders. The old workers never parked, so their wakes were almost free.
+  This is inferred from the correlation. It hasn't been profiled.
+- **Gate result:** the busy-scenario regression is remote wakes, so per the
+  plan this goes to Phase 3 before deciding on sharding.
+- All streams were ready in all 4 runs (including the `tokio_unstable` run),
+  with 0 lost bytes. With no task limit, the ramp-up `503` failures seen
+  on `cb9a574` can't occur.
+
+### Data-loss reproducer
+
+`--clients 600 --payload 65536 --warmup 1 --duration 2 --drain 90 --scenarios active`:
+
+| build      | sent (API) | received in window | lost B after drain | send full | peak RSS |
+| ---------- | ---------: | -----------------: | -----------------: | --------: | -------: |
+| `cb9a574`  |    4800 MB |             572 MB |  **3 427 729 408** |         0 |   2.1 GB |
+| Phase 2    |    4838 MB |             770 MB |              **0** |         0 |   2.4 GB |
+
+The drain finished in well under the 90 s. `send full` stays 0 because each
+sender only queues ~128 chunks in the 2 s window, below the 512-slot
+outbound channel. That backlog is the extra RSS. `tests/loopback.rs` covers
+the case where backpressure reaches `send` (it fails if the receiver drops
+data instead of pushing back).
+
 ## Backpressure and data loss
 
 `--payload <BYTES>` raises the offered load until s2n-quic can't keep up.

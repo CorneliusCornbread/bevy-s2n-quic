@@ -35,7 +35,7 @@ use crate::common::{
             ConnectionTask,
         },
     },
-    orchestrator::{ORCHESTRATOR_ERROR_CODE, handle::OrchestratorHandle},
+    spawner::TaskSpawner,
     stream::{
         QuicBidirectionalStreamAttempt, QuicPeerStreamAttempt, QuicReceiveStreamAttempt,
         QuicSendStreamAttempt,
@@ -85,7 +85,7 @@ impl QuicConnectionAttempt {
 #[derive(Debug, Component)]
 pub struct QuicConnection {
     runtime: Handle,
-    orchestrator: OrchestratorHandle,
+    spawner: TaskSpawner,
     conn_handle: ConnectionHandle,
     task_state: OnceLockState<ConnectionDisconnectReason>,
     conn_command_channel: mpsc::Sender<ConnectionCommand>,
@@ -102,7 +102,7 @@ impl QuicConnection {
     )]
     pub fn new(
         runtime: Handle,
-        orchestrator: OrchestratorHandle,
+        spawner: TaskSpawner,
         mut connection: Connection,
         parent_id: QuicParentId,
     ) -> Self {
@@ -119,7 +119,7 @@ impl QuicConnection {
             );
         }
 
-        let mut task_state = OnceLockState::new();
+        let task_state = OnceLockState::new();
 
         let is_open = OpenFlag::new(true);
         let conn_handle = connection.handle();
@@ -129,31 +129,14 @@ impl QuicConnection {
             connection_id,
             is_open.clone(),
             pending_stream.clone(),
-            task_state.clone(),
-            orchestrator.clone(),
+            spawner.clone(),
         );
 
-        let res = orchestrator.push_connection(task);
-
-        if let Err(e) = res {
-            error!(
-                "Unable to push new task for connection {}, with reason: {}",
-                connection_id, e
-            );
-
-            let _ = task_state.set(ConnectionDisconnectReason::OrchestratorError);
-
-            match e {
-                mpsc::error::TrySendError::Full(task)
-                | mpsc::error::TrySendError::Closed(task) => {
-                    task.close(ORCHESTRATOR_ERROR_CODE.into());
-                }
-            }
-        }
+        spawner.spawn(task, task_state.clone());
 
         Self {
             runtime: runtime.clone(),
-            orchestrator,
+            spawner,
             conn_handle,
             task_state,
             conn_command_channel: send,
@@ -254,7 +237,7 @@ impl QuicConnection {
     ) -> Result<QuicBidirectionalStreamAttempt, ConnectionCommandError> {
         let task = ConnectionHandleTask::new(
             self.conn_handle.clone(),
-            self.orchestrator.clone(),
+            self.spawner.clone(),
             self.is_open.clone(),
             self.connection_id,
         );
@@ -274,7 +257,7 @@ impl QuicConnection {
     ) -> Result<QuicSendStreamAttempt, ConnectionCommandError> {
         let task = ConnectionHandleTask::new(
             self.conn_handle.clone(),
-            self.orchestrator.clone(),
+            self.spawner.clone(),
             self.is_open.clone(),
             self.connection_id,
         );

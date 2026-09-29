@@ -393,6 +393,7 @@ struct WindowStart {
     at: Instant,
     cpu: Duration,
     tokio_busy: Duration,
+    remote_schedules: Option<u64>,
     bytes_sent: u64,
     bytes_received: u64,
     send_full: u64,
@@ -412,6 +413,9 @@ struct PhaseResult {
     cpu: Duration,
     tokio_busy: Duration,
     tokio_workers: usize,
+    /// Tasks scheduled from outside the Tokio workers during the window.
+    /// Only available with `--cfg tokio_unstable`.
+    remote_schedules: Option<u64>,
     max_global_queue: usize,
     sent: u64,
     received: u64,
@@ -600,6 +604,7 @@ fn drive(
                     at: Instant::now(),
                     cpu: process_cpu_time(),
                     tokio_busy: tokio_busy(&runtime),
+                    remote_schedules: remote_schedules(&runtime),
                     bytes_sent: bench.bytes_sent,
                     bytes_received: bench.bytes_received,
                     send_full: bench.send_full,
@@ -627,6 +632,9 @@ fn drive(
                     cpu: process_cpu_time().saturating_sub(start.cpu),
                     tokio_busy: tokio_busy(&runtime).saturating_sub(start.tokio_busy),
                     tokio_workers: runtime.handle().metrics().num_workers(),
+                    remote_schedules: remote_schedules(&runtime)
+                        .zip(start.remote_schedules)
+                        .map(|(end, start)| end - start),
                     max_global_queue: bench.max_global_queue,
                     sent: bench.bytes_sent - start.bytes_sent,
                     received: bench.bytes_received - start.bytes_received,
@@ -844,6 +852,19 @@ fn tokio_busy(runtime: &TokioRuntime) -> Duration {
         .sum()
 }
 
+/// Tasks scheduled onto the runtime from outside its worker threads, mostly
+/// wakes from the Bevy thread. Needs `RUSTFLAGS="--cfg tokio_unstable"`.
+fn remote_schedules(runtime: &TokioRuntime) -> Option<u64> {
+    #[cfg(tokio_unstable)]
+    return Some(runtime.handle().metrics().remote_schedule_count());
+
+    #[cfg(not(tokio_unstable))]
+    {
+        let _ = runtime;
+        None
+    }
+}
+
 fn mean(samples: &[f64]) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -867,7 +888,7 @@ fn summary_line(r: &PhaseResult) -> String {
     let wall = r.wall.as_secs_f64();
     format!(
         "{:>4} clients {:<6} ({:>4} sending): frame avg {:.2}ms p99 {:.2}ms | \
-         cpu {:.2} cores | tokio busy {:.0}% | max gq {} | rx {}/s | lost {} B{}",
+         cpu {:.2} cores | tokio busy {:.0}% | max gq {} | rx {}/s | lost {} B{}{}",
         r.phase.clients,
         r.phase.scenario.name(),
         r.senders,
@@ -878,6 +899,9 @@ fn summary_line(r: &PhaseResult) -> String {
         r.max_global_queue,
         fmt_bytes((r.received as f64 / wall) as u64),
         r.lost,
+        r.remote_schedules
+            .map(|n| format!(" | remote wakes {:.0}/frame", n as f64 / r.frames.max(1) as f64))
+            .unwrap_or_default(),
         if r.ok() { "" } else { "  [FAIL]" },
     )
 }
@@ -960,6 +984,23 @@ fn report(bench: &StressBench) -> bool {
 
     let ok = bench.results.iter().all(PhaseResult::ok);
     let _ = writeln!(md);
+
+    if bench.results.iter().any(|r| r.remote_schedules.is_some()) {
+        let _ = writeln!(md);
+        let _ = writeln!(md, "| clients | scenario | remote schedules | per frame |");
+        let _ = writeln!(md, "|---:|---|---:|---:|");
+        for r in &bench.results {
+            let n = r.remote_schedules.unwrap_or(0);
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {:.0} |",
+                r.phase.clients,
+                r.phase.scenario.name(),
+                n,
+                n as f64 / r.frames.max(1) as f64,
+            );
+        }
+    }
 
     println!("\n{md}");
     let _ = std::io::stdout().flush();

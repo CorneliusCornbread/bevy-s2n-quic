@@ -8,7 +8,7 @@ use bevy::{
 };
 use bytes::Bytes;
 use s2n_quic::stream::SendStream;
-use std::error::Error;
+use std::{error::Error, fmt, future::Future};
 use tokio::{
     select,
     sync::mpsc::{self, Receiver, Sender, error::TrySendError},
@@ -17,7 +17,7 @@ use tokio::{
 use crate::common::{
     HandleChannelError, QuicParentId,
     connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
-    orchestrator::handle::OrchestratorHandle,
+    spawner::{QuicTask, TaskSpawner},
     stream::id::StreamId,
     task_state::{OnceLockState, TaskState},
 };
@@ -37,7 +37,6 @@ const MIN_OUTBOUND_BUF_SIZE: usize = 64;
 const MAX_OUTBOUND_BUF_SIZE: usize = 128;
 
 const OUTBOUND_CHANNEL_NAME: &str = "Outbound channel";
-const CONTROL_CHANNEL_NAME: &str = "Control channel";
 
 #[derive(Debug, Component)]
 pub struct QuicSendStream {
@@ -46,15 +45,10 @@ pub struct QuicSendStream {
     outbound_control: Sender<SendControlMessage>,
     send_errors: Receiver<Box<dyn Error + Send + Sync>>,
     stream_id: StreamId,
-    _orchestrator: OrchestratorHandle,
 }
 
 impl QuicSendStream {
-    pub fn new(
-        orchestrator: OrchestratorHandle,
-        send: SendStream,
-        conn_id: ConnectionId,
-    ) -> Self {
+    pub fn new(spawner: TaskSpawner, send: SendStream, conn_id: ConnectionId) -> Self {
         let stream_id = StreamId::new(conn_id, send.id());
 
         let (send_error_sender, send_errors) = mpsc::channel(DEBUG_CHANNEL_SIZE);
@@ -63,34 +57,17 @@ impl QuicSendStream {
         let (outbound_data, outbound_data_receiver) =
             mpsc::channel(OUTBOUND_CHANNEL_SIZE);
 
-        let mut task_state = OnceLockState::new();
+        let task_state = OnceLockState::new();
 
         let task = SendTask::new(
             send,
             outbound_control_receiver,
-            task_state.clone(),
             outbound_data_receiver,
             send_error_sender,
             stream_id,
         );
 
-        let res = orchestrator.push_send(task);
-
-        if let Err(e) = res {
-            error!(
-                "Unable to push new task for stream {}, with reason: {}",
-                stream_id, e
-            );
-
-            let _ = task_state.set(ConnectionDisconnectReason::OrchestratorError);
-
-            match e {
-                mpsc::error::TrySendError::Full(mut task)
-                | mpsc::error::TrySendError::Closed(mut task) => {
-                    task.early_close();
-                }
-            }
-        }
+        spawner.spawn(task, task_state.clone());
 
         Self {
             task_state,
@@ -98,11 +75,13 @@ impl QuicSendStream {
             outbound_control,
             send_errors,
             stream_id,
-            _orchestrator: orchestrator,
         }
     }
 
     /// Queues a close request for the async task without blocking.
+    ///
+    /// Data queued with [`Self::send`] before the close request is still sent.
+    /// Once the task handles the request, further sends are rejected.
     ///
     /// Returns `Some(())` if the request was queued. `None` means either the
     /// control channel is full (the request was dropped, try again later) or
@@ -116,6 +95,8 @@ impl QuicSendStream {
     }
 
     /// Queues a flush request for the async task without blocking.
+    ///
+    /// Data queued with [`Self::send`] before the flush request is sent first.
     ///
     /// Returns `Some(())` if the request was queued. `None` means either the
     /// control channel is full (the request was dropped, try again later) or
@@ -195,20 +176,33 @@ impl QuicSendStream {
 pub(crate) struct SendTask {
     send: SendStream,
     control: Receiver<SendControlMessage>,
-    task_state: OnceLockState<ConnectionDisconnectReason>,
     outbound_receiver: Receiver<Bytes>,
     send_errors: Sender<Box<dyn Error + Send + Sync>>,
-    disconnect_flag: Option<ConnectionDisconnectReason>,
     addr: AddrResult,
     stream_id: StreamId,
     send_buf: Vec<Bytes>,
+}
+
+impl fmt::Display for SendTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "send stream {}", self.stream_id)
+    }
+}
+
+impl QuicTask for SendTask {
+    fn run(self) -> impl Future<Output = ConnectionDisconnectReason> + Send + 'static {
+        SendTask::run(self)
+    }
+
+    fn reject(mut self) {
+        let _ = self.send.finish();
+    }
 }
 
 impl SendTask {
     fn new(
         send: SendStream,
         control: Receiver<SendControlMessage>,
-        task_state: OnceLockState<ConnectionDisconnectReason>,
         outbound_receiver: Receiver<Bytes>,
         send_errors: Sender<Box<dyn Error + Send + Sync>>,
         stream_id: StreamId,
@@ -217,141 +211,161 @@ impl SendTask {
         Self {
             send,
             control,
-            task_state,
             outbound_receiver,
             send_errors,
-            disconnect_flag: None,
             addr,
             stream_id,
             send_buf: Vec::with_capacity(MIN_OUTBOUND_BUF_SIZE),
         }
     }
 
-    pub(crate) fn id(&self) -> StreamId {
-        self.stream_id
-    }
-
-    pub(crate) fn early_close(&mut self) {
-        let _ = self.send.finish();
-    }
-
     #[tracing::instrument(
-        name = "quic_send_poll"
+        name = "quic_send_task",
+        level = "debug",
         skip(self),
         fields(stream_id = %self.stream_id, remote_address = ?self.addr)
     )]
-    pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
-        if self.disconnect_flag.is_some() {
-            return &self.disconnect_flag;
-        }
+    async fn run(mut self) -> ConnectionDisconnectReason {
+        let mut control_open = true;
 
-        select! {
-            count = self.outbound_receiver.recv_many(&mut self.send_buf, MAX_OUTBOUND_BUF_SIZE) => {
-                // channel closed
-                if count == 0 {
-                    warn!(
-                        "Outbound send channel was closed by the remote peer."
-                    );
-
-                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: OUTBOUND_CHANNEL_NAME})
-                }
-
-                let err_opt = self.send.send_vectored(&mut self.send_buf[..count]).await;
-                self.send_buf.clear();
-
-                if let Err(err) = err_opt {
-                    match err {
-                        s2n_quic::stream::Error::InvalidStream { source, .. }
-                        | s2n_quic::stream::Error::SendAfterFinish { source, .. } => {
-                            error!(
-                                "Send stream is in an invalid state, quitting:\n{}",
-                                source
-                            );
-                            self.disconnect_flag = Some(ConnectionDisconnectReason::InvalidStream)
-                        }
-
-                        s2n_quic::stream::Error::StreamReset {
-                            error, source: _, ..
-                        } => {
-                            error!(
-                                "Send stream has encountered a stream reset:\n{}",
-                                error
-                            );
-                            self.disconnect_flag = Some(ConnectionDisconnectReason::Reset(error));
-                        }
-
-                        _ => {
-                            error!(
-                                "Send stream error:\n{}",
-                                err
-                            );
-                        }
+        let reason = loop {
+            select! {
+                count = self.outbound_receiver.recv_many(&mut self.send_buf, MAX_OUTBOUND_BUF_SIZE) => {
+                    if count == 0 {
+                        info!("Outbound send channel has been closed. Quitting...");
+                        break ConnectionDisconnectReason::MspcChannelClosed {
+                            channel_name: OUTBOUND_CHANNEL_NAME,
+                        };
                     }
 
-                    self.send_errors.try_send(Box::new(err)).handle_err();
-                }
-            }
-
-            cmd_opt = self.control.recv() => {
-                if let Some(cmd) = cmd_opt {
-                    match cmd {
-                        SendControlMessage::CloseAndQuit => {
-                            let res = self.send.close().await;
-
-                            if let Err(e) = res {
-                                error!(
-                                    "Send stream errored when closing stream:\n{}",
-                                    e
-                                );
-
-                                self.send_errors.try_send(Box::new(e)).handle_err();
-                            }
-
-                            self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
-                        }
-
-                        SendControlMessage::Flush => {
-                            let res = self.send.flush().await;
-
-                            if let Err(e) = res {
-                                error!(
-                                    "Send stream errored when flushing stream:\n{}",
-                                    e
-                                );
-
-                                self.send_errors.try_send(Box::new(e)).handle_err();
-                            }
-                        }
+                    if let Some(reason) = self.send_buffered().await {
+                        break reason;
                     }
                 }
-                else {
-                    // Control channel has been dropped
-                    info!(
-                        "Control channel has been dropped. Quitting...",
-                    );
-                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed{channel_name: CONTROL_CHANNEL_NAME})
-                };
+
+                cmd_opt = self.control.recv(), if control_open => {
+                    let Some(cmd) = cmd_opt else {
+                        // The component was dropped. Keep going until the
+                        // outbound channel is drained so queued data isn't lost.
+                        control_open = false;
+                        continue;
+                    };
+
+                    if let Some(reason) = self.handle_command(cmd).await {
+                        break reason;
+                    }
+                }
             }
+
+            tokio::task::consume_budget().await;
+        };
+
+        if !matches!(reason, ConnectionDisconnectReason::UserClosed)
+            && let Err(e) = self.send.close().await
+        {
+            info!("Send stream errored when closing stream: {e}");
         }
 
-        // Disconnecting
-        if let Some(disconnect) = &self.disconnect_flag {
-            let _ = self.task_state.set(disconnect.clone());
-            let _ = self.send.close().await;
+        info!("Send stream has been closed");
 
-            info!("Send stream has been closed");
-
-            let dropped_count = self.outbound_receiver.len();
-
-            if dropped_count > 0 {
-                warn!(
-                    "Send stream dropped {} messages, this will result in loss of data being sent",
-                    dropped_count
-                )
-            }
+        let dropped_count = self.outbound_receiver.len();
+        if dropped_count > 0 {
+            warn!(
+                "Send stream dropped {} messages, this will result in loss of data being sent",
+                dropped_count
+            )
         }
 
-        &self.disconnect_flag
+        reason
+    }
+
+    async fn handle_command(
+        &mut self,
+        cmd: SendControlMessage,
+    ) -> Option<ConnectionDisconnectReason> {
+        match cmd {
+            SendControlMessage::CloseAndQuit => {
+                // Send everything queued before the close request, and refuse
+                // anything queued after it.
+                self.outbound_receiver.close();
+                while self
+                    .outbound_receiver
+                    .recv_many(&mut self.send_buf, MAX_OUTBOUND_BUF_SIZE)
+                    .await
+                    > 0
+                {
+                    if let Some(reason) = self.send_buffered().await {
+                        return Some(reason);
+                    }
+                }
+
+                if let Err(e) = self.send.close().await {
+                    error!("Send stream errored when closing stream:\n{}", e);
+                    self.send_errors.try_send(Box::new(e)).handle_err();
+                }
+
+                Some(ConnectionDisconnectReason::UserClosed)
+            }
+
+            SendControlMessage::Flush => {
+                // Send everything queued before the flush request first.
+                let queued = self.outbound_receiver.len();
+                if queued > 0 {
+                    self.outbound_receiver
+                        .recv_many(&mut self.send_buf, queued)
+                        .await;
+
+                    if let Some(reason) = self.send_buffered().await {
+                        return Some(reason);
+                    }
+                }
+
+                if let Err(e) = self.send.flush().await {
+                    error!("Send stream errored when flushing stream:\n{}", e);
+                    self.send_errors.try_send(Box::new(e)).handle_err();
+                }
+
+                None
+            }
+        }
+    }
+
+    /// Sends everything in `send_buf`, then clears it. Returns a reason if the
+    /// stream can no longer be used.
+    async fn send_buffered(&mut self) -> Option<ConnectionDisconnectReason> {
+        let res = self.send.send_vectored(&mut self.send_buf).await;
+        self.send_buf.clear();
+
+        let Err(err) = res else {
+            return None;
+        };
+
+        let reason = match err {
+            s2n_quic::stream::Error::InvalidStream { source, .. }
+            | s2n_quic::stream::Error::SendAfterFinish { source, .. } => {
+                error!("Send stream is in an invalid state, quitting:\n{}", source);
+                Some(ConnectionDisconnectReason::InvalidStream)
+            }
+
+            s2n_quic::stream::Error::StreamReset { error, .. } => {
+                error!("Send stream has encountered a stream reset:\n{}", error);
+                Some(ConnectionDisconnectReason::Reset(error))
+            }
+
+            s2n_quic::stream::Error::ConnectionError { error, .. } => {
+                error!("Send stream connection error:\n{}", error);
+                Some(ConnectionDisconnectReason::ConnectionError(error))
+            }
+
+            _ => {
+                error!("Send stream error:\n{}", err);
+                None
+            }
+        };
+
+        self.send_errors.try_send(Box::new(err)).handle_err();
+
+        reason
     }
 }
 

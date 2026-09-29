@@ -3,7 +3,7 @@ use std::cmp::max;
 use bevy::{ecs::resource::Resource, tasks::available_parallelism};
 use tokio::runtime::{Handle, Runtime};
 
-use crate::common::orchestrator::{AsyncOrchestrator, handle::OrchestratorHandle};
+use crate::common::spawner::TaskSpawner;
 
 /// The number of workers determined by a percentage of total threads available.
 const DEFAULT_WORKER_PERCENT: f32 = 0.25;
@@ -13,17 +13,12 @@ const MIN_WORKERS: usize = 2;
 #[derive(Resource)]
 pub struct TokioRuntime {
     pub(crate) runtime: Runtime,
-    orchestrator: AsyncOrchestrator,
+    spawner: TaskSpawner,
 }
 
 impl Default for TokioRuntime {
     fn default() -> Self {
-        let mut worker_count =
-            ((available_parallelism() as f32) * DEFAULT_WORKER_PERCENT).ceil() as usize;
-
-        worker_count = max(MIN_WORKERS, worker_count);
-
-        Self::new(worker_count)
+        Self::new(Self::default_worker_count(), None)
     }
 }
 
@@ -34,25 +29,28 @@ impl TokioRuntime {
         self.runtime.handle()
     }
 
-    pub(crate) fn new(worker_threads: usize) -> Self {
+    pub(crate) fn default_worker_count() -> usize {
+        let worker_count =
+            ((available_parallelism() as f32) * DEFAULT_WORKER_PERCENT).ceil() as usize;
+
+        max(MIN_WORKERS, worker_count)
+    }
+
+    pub(crate) fn new(worker_threads: usize, max_tasks: Option<usize>) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .enable_all()
             .build()
             .expect("Unable to create async runtime.");
 
-        let orchestrator =
-            AsyncOrchestrator::new(runtime.handle().clone(), worker_threads);
+        let spawner = TaskSpawner::new(runtime.handle().clone(), max_tasks);
 
-        Self {
-            runtime,
-            orchestrator,
-        }
+        Self { runtime, spawner }
     }
 
-    /// Returns a handle to the async task orchestrator.
-    /// This allows for the management and scheduling of async tasks.
-    pub(crate) fn orchestrator(&self) -> &OrchestratorHandle {
-        self.orchestrator.handle()
+    /// Returns the spawner used to start the async task behind each
+    /// connection and stream.
+    pub fn spawner(&self) -> &TaskSpawner {
+        &self.spawner
     }
 }

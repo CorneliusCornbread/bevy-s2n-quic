@@ -9,7 +9,7 @@ use tokio::runtime::Handle;
 use crate::common::{
     attempt::{QuicActionAttempt, TaskResult},
     connection::id::ConnectionId,
-    orchestrator::handle::OrchestratorHandle,
+    spawner::TaskSpawner,
     stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
 
@@ -135,20 +135,20 @@ pub enum QuicPeerStream {
 
 impl QuicPeerStream {
     pub fn new(
-        orchestrator: OrchestratorHandle,
+        spawner: TaskSpawner,
         peer_stream: PeerStream,
         conn_id: ConnectionId,
     ) -> Self {
         match peer_stream {
             PeerStream::Bidirectional(bidirectional_stream) => {
                 let (rec, send) = bidirectional_stream.split();
-                let quic_rec = QuicReceiveStream::new(orchestrator.clone(), rec, conn_id);
-                let quic_send = QuicSendStream::new(orchestrator, send, conn_id);
+                let quic_rec = QuicReceiveStream::new(spawner.clone(), rec, conn_id);
+                let quic_send = QuicSendStream::new(spawner, send, conn_id);
 
                 QuicPeerStream::Bidirectional(quic_rec, quic_send)
             }
             PeerStream::Receive(rec) => {
-                let quic_rec = QuicReceiveStream::new(orchestrator, rec, conn_id);
+                let quic_rec = QuicReceiveStream::new(spawner, rec, conn_id);
 
                 QuicPeerStream::Receive(quic_rec)
             }
