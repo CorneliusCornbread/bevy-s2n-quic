@@ -1,7 +1,7 @@
 use std::cmp::max;
 
 use bevy::{ecs::resource::Resource, tasks::available_parallelism};
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::{Builder, Handle, Runtime};
 
 use crate::common::spawner::TaskSpawner;
 
@@ -9,6 +9,12 @@ use crate::common::spawner::TaskSpawner;
 const DEFAULT_WORKER_PERCENT: f32 = 0.25;
 
 const MIN_WORKERS: usize = 2;
+
+/// Name given to the runtime's threads unless the builder hook overrides it.
+const DEFAULT_THREAD_NAME: &str = "bevy-s2n-quic";
+
+/// Customizes the runtime [Builder] before it is built.
+pub(crate) type BuilderHook = Box<dyn FnOnce(&mut Builder) + Send>;
 
 #[derive(Resource)]
 pub struct TokioRuntime {
@@ -18,7 +24,7 @@ pub struct TokioRuntime {
 
 impl Default for TokioRuntime {
     fn default() -> Self {
-        Self::new(Self::default_worker_count(), None)
+        Self::new(Self::default_worker_count(), None, None)
     }
 }
 
@@ -29,20 +35,35 @@ impl TokioRuntime {
         self.runtime.handle()
     }
 
-    pub(crate) fn default_worker_count() -> usize {
+    /// The number of worker threads used when none is configured: 25% of the
+    /// available logical processors, and at least 2.
+    ///
+    /// Useful for sizing other thread pools (such as Bevy's) around the runtime.
+    pub fn default_worker_count() -> usize {
         let worker_count =
             ((available_parallelism() as f32) * DEFAULT_WORKER_PERCENT).ceil() as usize;
 
         max(MIN_WORKERS, worker_count)
     }
 
-    pub(crate) fn new(worker_threads: usize, max_tasks: Option<usize>) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+    /// Builds the runtime with `worker_threads` workers, then applies
+    /// `configure`, which may override any of the defaults.
+    pub(crate) fn new(
+        worker_threads: usize,
+        max_tasks: Option<usize>,
+        configure: Option<BuilderHook>,
+    ) -> Self {
+        let mut builder = Builder::new_multi_thread();
+        builder
             .worker_threads(worker_threads)
-            .enable_all()
-            .build()
-            .expect("Unable to create async runtime.");
+            .thread_name(DEFAULT_THREAD_NAME)
+            .enable_all();
 
+        if let Some(configure) = configure {
+            configure(&mut builder);
+        }
+
+        let runtime = builder.build().expect("Unable to create async runtime.");
         let spawner = TaskSpawner::new(runtime.handle().clone(), max_tasks);
 
         Self { runtime, spawner }

@@ -11,6 +11,13 @@
   limit by default.
 - `TokioRuntime::spawner()` and `TaskSpawner::new`, so connections and streams
   can be created outside Bevy (for example in tests).
+- `QuicAsyncPlugin::with_runtime_builder(hook)` customizes the Tokio runtime
+  `Builder` before it's built (worker count, `thread_name`, `on_thread_start`
+  for pinning or priority, and so on). The hook runs after the plugin's
+  defaults, so it can override them. The `quic_concurrency_stress` example
+  uses it to pin and nice the workers.
+- `TokioRuntime::default_worker_count()` is now public, to help size other
+  thread pools around the runtime.
 
 ### Deprecated
 
@@ -39,6 +46,8 @@
   queued data is still sent before the stream is closed.
 - Task tracing spans cover the whole task at `debug` level (`quic_send_task`,
   `quic_rec_task`, `quic_connection_task`) instead of one `info` span per poll.
+- Tokio worker threads are named `bevy-s2n-quic` instead of
+  `tokio-runtime-worker`. Override it with `with_runtime_builder`.
 
 - `QuicReceiveStream::recv_many` **no longer blocks**. It returns only the packets
   already waiting, up to `limit`, and returns `0` when there are none. It used to

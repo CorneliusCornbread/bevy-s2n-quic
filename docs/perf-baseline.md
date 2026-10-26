@@ -274,6 +274,113 @@ Same command as in Phase 2:
   backpressure gain came from the smaller outbound channel, not from
   batching, and can be revisited on its own.
 
+## Phase 4: runtime configuration and thread placement
+
+`QuicAsyncPlugin::with_runtime_builder` gives access to the Tokio `Builder`
+(worker count, `thread_name`, `on_thread_start`, ...). The benchmark now:
+
+- sizes Bevy's pools and Tokio's workers to fit the CPUs it may use: main +
+  1 IO + 1 async compute + up to 4 compute threads, plus the Tokio workers.
+  It used to create 4 IO + 4 async compute + 4 compute threads plus main and
+  4 workers (17 threads on 16 CPUs), though the IO and async pools sit idle.
+- with `--pin`, pins the Tokio workers (through `on_thread_start`) and the
+  Bevy threads (through `on_thread_spawn` and the main thread) to separate
+  physical cores. Tokio gets whole cores from the end of the allowed set,
+  so on this machine `6-7,14-15` and Bevy `0-5,8-13`.
+- with `--tokio-nice <N>`, sets the Tokio workers' nice value. That isn't
+  benchmarked below, because there's no contention to arbitrate at these loads.
+- with `--role server|clients`, runs the two ends as separate processes,
+  linked by a TCP control connection. The clients drive the phases, and the
+  server reports its received byte count back, so `lost B` still works.
+
+Same machine as above, s2n-quic 1.90, default command unless noted, 0 lost
+bytes and all streams ready in every run. `old` is the pre-Phase-4 benchmark
+(`5d67ba9`) built from the same lockfile. Runs were interleaved (old, new,
+pin, split, ...).
+
+### Single process: sizing and pinning
+
+Min–max over 3 runs each. `p99 spread` is the max − min of frame p99 over
+the runs.
+
+| clients | scenario | frame avg ms (old / new / pin) | frame p99 ms (old / new / pin) | p99 spread ms (old / new / pin) | cpu cores (old / new / pin) |
+| ------: | -------- | ------------------------------ | ------------------------------ | ------------------------------- | --------------------------- |
+|     100 | active   | 0.14–0.16 / 0.14–0.17 / 0.13–0.14 | 0.26–0.46 / 0.24–0.57 / 0.20–0.26 | 0.20 / 0.33 / **0.06** | 0.15 / 0.15 / 0.19 |
+|     100 | idle     | 0.11–0.14 / 0.11–0.12 / 0.11–0.12 | 0.20–0.29 / 0.18–0.24 / 0.17–0.35 | 0.09 / 0.06 / 0.18 | 0.04 / 0.04 / 0.04 |
+|     300 | active   | 0.21–0.24 / 0.21–0.25 / 0.19–0.21 | 0.32–0.78 / 0.31–0.98 / 0.30–0.53 | 0.46 / 0.67 / **0.23** | 0.38–0.42 / 0.39–0.42 / 0.50–0.51 |
+|     300 | idle     | 0.14–0.18 / 0.14–0.15 / 0.13–0.14 | 0.26–0.56 / 0.24–0.27 / 0.20–0.41 | 0.30 / 0.03 / 0.21 | 0.07–0.08 / 0.07 / 0.07 |
+|     600 | active   | 0.30–0.32 / 0.30–0.34 / 0.28–0.30 | 0.44–0.93 / 0.50–1.06 / 0.46–0.55 | 0.49 / 0.56 / **0.09** | 0.76–0.80 / 0.76–0.81 / 1.03–1.04 |
+|     600 | idle     | 0.17–0.19 / 0.17–0.19 / 0.16–0.17 | 0.32–0.38 / 0.29–0.43 / 0.30–0.31 | 0.06 / 0.14 / 0.01 | 0.11 / 0.10–0.11 / 0.12–0.13 |
+
+```sh
+cargo run --release --example quic_concurrency_stress -- --pin
+```
+
+### Separate server and clients processes
+
+The server (`taskset -c 0-3,8-11`) and the clients (`taskset -c 4-7,12-15`)
+run on disjoint physical cores, with 4 Tokio workers each (`--tokio-threads 4`,
+so the server's runtime matches the single-process runs). Each process then
+sizes itself to its 8 CPUs: Tokio 4 + Bevy 4 (compute 1). Server-process
+numbers:
+
+| clients | scenario | frame avg ms (split ×3) | frame p99 ms (split ×3) | cpu cores (split ×3) | frame avg ms (hog ×2) | frame p99 ms (hog ×2) | cpu cores (hog ×2) | frame avg ms (shared ×2) | frame p99 ms (shared ×2) |
+| ------: | -------- | ----------------------- | ----------------------- | -------------------- | --------------------- | --------------------- | ------------------ | ------------------------ | ------------------------ |
+|     100 | active   | 0.11                    | 0.16–0.20               | 0.09                 | 0.11–0.13             | 0.20–0.49             | 0.11–0.12          | 0.11                     | 0.15–0.28                |
+|     100 | idle     | 0.10                    | 0.14                    | 0.02                 | 0.11                  | 0.17–0.22             | 0.02               | 0.10                     | 0.14–0.18                |
+|     300 | active   | 0.14–0.15               | 0.21–0.25               | 0.25                 | 0.14–0.15             | 0.25–0.58             | 0.29–0.31          | 0.14–0.15                | 0.19–0.24                |
+|     300 | idle     | 0.11–0.12               | 0.16–0.18               | 0.03                 | 0.12–0.13             | 0.22–0.29             | 0.04               | 0.12                     | 0.17–0.18                |
+|     600 | active   | 0.20–0.21               | 0.30–0.35               | 0.47–0.48            | 0.19–0.20             | 0.31–0.36             | 0.56–0.61          | 0.19–0.21                | 0.29–0.48                |
+|     600 | idle     | 0.13–0.14               | 0.20–0.26               | 0.06                 | 0.14–0.15             | 0.37–0.38             | 0.08               | 0.12–0.13                | 0.17–0.20                |
+
+- `split`: as above.
+- `hog`: as `split`, plus a busy loop on each of the clients' 8 CPUs, so the
+  clients process is starved. Its frame p99 went from 0.2–0.9 ms to 3–8 ms.
+- `shared`: no `taskset`. Both processes may use all 16 CPUs.
+
+```sh
+taskset -c 0-3,8-11  cargo run --release --example quic_concurrency_stress -- --role server --tokio-threads 4
+taskset -c 4-7,12-15 cargo run --release --example quic_concurrency_stress -- --role clients --tokio-threads 4
+```
+
+### Observations
+
+- **Thread budgeting alone changes nothing.** `new` matches `old` in frame
+  time, CPU and p99 spread. The extra IO and async compute threads were idle,
+  so cutting them removed no contention.
+- **Pinning stabilizes p99.** In the busy rows the p99 spread across runs
+  drops from 0.33–0.67 ms to 0.06–0.23 ms, and frame avg improves by
+  0.01–0.04 ms. In the idle rows the spread is small either way
+  (0.01–0.21 ms) and doesn't favor pinning.
+- **Pinning costs CPU.** Up to 30% more process CPU (1.03 vs 0.78 cores at
+  600 active) and Tokio busy % rises from 20% to 28%. The 4 workers share 2
+  physical cores, so each runs on half an SMT core. This is inferred and
+  hasn't been profiled. Giving Tokio one physical core per worker would leave
+  Bevy fewer cores, so it's a trade-off and not a default.
+- **The server process is stable on its own.** Split-mode server p99 spread
+  is ≤0.06 ms in every row across 3 runs. Its frame avg (0.20–0.21 ms at 600
+  active) excludes the client half that the single-process numbers include
+  (0.30–0.34 ms).
+- **Server frame avg doesn't depend on client load.** With the clients
+  process starved, server frame avg is unchanged (±0.01 ms) in every row.
+- **Server p99 and CPU do shift a little under client load.** p99 is higher
+  in 5 of 6 rows (+0.03–0.3 ms, the largest single runs being 0.49 and
+  0.58 ms at 100 and 300 active). Only 600 active is unchanged. CPU is
+  +15–30% in every row, with the same bytes received, in both hog batches
+  (the earlier batch matched). The cause hasn't been profiled. Candidates are
+  lower all-core boost clocks with 8 extra busy cores, and burstier arrivals
+  from the starved clients. Process and core separation can't isolate either.
+- **Gate result:** partly met. p99 is stable across runs with `--pin` or
+  with split processes, but not with thread budgeting alone. Server-process
+  frame avg is independent of client load. Server p99 and CPU are mostly
+  independent, but rise modestly when the client side saturates its cores.
+- The first hog batch exposed a race in the control protocol, not in the
+  library: the server computed `lost` when `finish` arrived, by which time
+  the next phase's first messages (720 B) had landed, giving `lost -720`.
+  The clients now compute `lost` from the server's last report and send it
+  with `finish`. The tables above are from the fixed build. The
+  single-process runs don't use the control link.
+
 ## Backpressure and data loss
 
 `--payload <BYTES>` raises the offered load until s2n-quic can't keep up.
