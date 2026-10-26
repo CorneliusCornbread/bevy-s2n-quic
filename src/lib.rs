@@ -29,6 +29,9 @@ pub mod backend;
 pub mod client;
 pub mod common;
 pub mod config;
+// Not used by the Bevy layer until the backend is swapped.
+#[allow(dead_code, unused_imports)]
+pub(crate) mod driver;
 pub mod driver_plugin;
 pub mod server;
 
