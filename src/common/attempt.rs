@@ -1,5 +1,4 @@
 use bevy::ecs::component::Component;
-use s2n_quic::connection::Error as ConnectionError;
 use std::{error::Error, sync::Arc, time::SystemTime};
 use thiserror::Error as ThisError;
 use tokio::{
@@ -8,7 +7,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::common::QuicParentId;
+use crate::{
+    backend::s2n::from_s2n_connection_error,
+    common::{QuicParentId, error::ConnectionError},
+};
 
 /// This is a the trait which allows us to implement
 /// async attempt behaviour on any provider (e.g.)
@@ -16,7 +18,7 @@ use crate::common::QuicParentId;
 /// implementations.
 ///
 /// See [QuicActionAttempt] for more details.
-pub trait TaskResult<T> {
+pub(crate) trait TaskResult<T> {
     fn resolve_result(&mut self, handle: &Handle) -> Option<Result<T, TaskError>>;
 }
 
@@ -69,7 +71,7 @@ impl<T, I> QuicActionAttempt<T, I>
 where
     I: Copy,
 {
-    pub fn new(
+    pub(crate) fn new(
         runtime: Handle,
         task: impl TaskResult<T> + 'static + Send + Sync,
         id: I,
@@ -135,17 +137,16 @@ pub enum QuicActionError {
 /// An enum representing all the ways a [TaskResult] can fail.
 #[derive(Clone, Debug, ThisError)]
 #[error("Quic task failed")]
-#[non_exhaustive]
-pub enum TaskError {
+pub(crate) enum TaskError {
     #[error("ConnectionFailed: {0}")]
     ConnectionFailed(ConnectionError),
     #[error("Crashed: {0}")]
     TaskFailed(Arc<dyn Error + Send + Sync>),
 }
 
-impl From<ConnectionError> for TaskError {
-    fn from(value: ConnectionError) -> Self {
-        Self::ConnectionFailed(value)
+impl From<s2n_quic::connection::Error> for TaskError {
+    fn from(value: s2n_quic::connection::Error) -> Self {
+        Self::ConnectionFailed(from_s2n_connection_error(value))
     }
 }
 

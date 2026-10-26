@@ -50,7 +50,7 @@
 /// thread, one async compute thread, up to 4 compute threads, plus the Tokio
 /// workers. `--pin` (Linux) also pins the Tokio workers and the Bevy threads
 /// to separate physical cores, and `--tokio-nice <N>` sets the Tokio workers'
-/// nice value. Both use `QuicAsyncPlugin::with_runtime_builder` and Bevy's
+/// nice value. Both use `QuicDriverPlugin::on_thread_start` and Bevy's
 /// `on_thread_spawn` hooks.
 ///
 /// ## Metrics
@@ -100,23 +100,23 @@ use bevy::{
     utils::default,
 };
 use bevy_s2n_quic::{
-    QuicDefaultPlugins,
-    async_plugin::QuicAsyncPlugin,
-    client::{QuicClient, marker::QuicClientMarker},
+    QuicDefaultPlugins, backend,
+    client::{Connect, QuicClient, marker::QuicClientMarker},
     common::{
         connection::QuicConnection,
-        runtime::TokioRuntime,
+        runtime::QuicRuntime,
         stream::{receive::QuicReceiveStream, send::QuicSendStream},
     },
+    config::{QuicClientConfig, QuicServerConfig},
+    driver_plugin::QuicDriverPlugin,
     server::{QuicServer, marker::QuicServerMarker},
 };
 use bytes::Bytes;
-use s2n_quic::client::Connect;
 use std::{
     fmt::Write as _,
     io::{self, Read as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -447,7 +447,7 @@ impl ThreadPlan {
         let cpus = available_parallelism();
         let tokio = cfg
             .tokio_threads
-            .unwrap_or_else(TokioRuntime::default_worker_count);
+            .unwrap_or_else(QuicRuntime::default_thread_count);
         let compute = cpus
             .saturating_sub(tokio + Self::FIXED_BEVY_THREADS)
             .clamp(1, MAX_COMPUTE_THREADS);
@@ -506,32 +506,30 @@ impl ThreadPlan {
         }
     }
 
-    /// The Tokio runtime, with its workers pinned and niced through the
-    /// runtime builder hook.
-    fn async_plugin(&self) -> QuicAsyncPlugin {
+    /// The QUIC runtime, with its threads pinned and niced through the
+    /// thread start hook.
+    fn driver_plugin(&self) -> QuicDriverPlugin {
+        let plugin = QuicDriverPlugin::default().with_threads(self.tokio);
         let tokio_cpus = self.pinned.as_ref().map(|(tokio, _)| tokio.clone());
         let nice = self.tokio_nice;
 
-        QuicAsyncPlugin::new_with_threads(self.tokio).with_runtime_builder(
-            move |builder| {
-                if tokio_cpus.is_none() && nice.is_none() {
-                    return;
-                }
-                // Also runs for Tokio's blocking-pool threads, which is fine here.
-                builder.on_thread_start(move || {
-                    if let Some(cpus) = &tokio_cpus {
-                        pin_or_warn(cpus);
-                    }
-                    if let Some(nice) = nice
-                        && let Err(e) = affinity::set_current_thread_nice(nice)
-                    {
-                        warn_once(&NICE_WARNED, || {
-                            format!("can't set Tokio worker nice to {nice}: {e}")
-                        });
-                    }
+        if tokio_cpus.is_none() && nice.is_none() {
+            return plugin;
+        }
+
+        // Also runs for Tokio's blocking-pool threads, which is fine here.
+        plugin.on_thread_start(move || {
+            if let Some(cpus) = &tokio_cpus {
+                pin_or_warn(cpus);
+            }
+            if let Some(nice) = nice
+                && let Err(e) = affinity::set_current_thread_nice(nice)
+            {
+                warn_once(&NICE_WARNED, || {
+                    format!("can't set Tokio worker nice to {nice}: {e}")
                 });
-            },
-        )
+            }
+        })
     }
 
     fn describe(&self) -> String {
@@ -946,7 +944,7 @@ impl StressBench {
     }
 
     /// Starts the measure window.
-    fn start_window(&mut self, runtime: &TokioRuntime) {
+    fn start_window(&mut self, runtime: &QuicRuntime) {
         self.frame_work_ms.clear();
         self.frame_interval_ms.clear();
         self.max_global_queue = 0;
@@ -963,7 +961,7 @@ impl StressBench {
     }
 
     /// Ends the measure window, keeping the result until the drain is over.
-    fn finish_window(&mut self, runtime: &TokioRuntime, phase: Phase) {
+    fn finish_window(&mut self, runtime: &QuicRuntime, phase: Phase) {
         let start = self.window.take().expect("measure window missing");
         let mut work = std::mem::take(&mut self.frame_work_ms);
         let mut interval = std::mem::take(&mut self.frame_interval_ms);
@@ -980,7 +978,7 @@ impl StressBench {
             interval_p99_ms: percentile(&mut interval, 0.99),
             cpu: process_cpu_time().saturating_sub(start.cpu),
             tokio_busy: tokio_busy(runtime).saturating_sub(start.tokio_busy),
-            tokio_workers: runtime.handle().metrics().num_workers(),
+            tokio_workers: backend::tokio_handle(runtime).metrics().num_workers(),
             remote_schedules: remote_schedules(runtime)
                 .zip(start.remote_schedules)
                 .map(|(end, start)| end - start),
@@ -1104,7 +1102,7 @@ fn main() -> AppExit {
     }
 
     let role = cfg.role;
-    app.add_plugins(QuicDefaultPlugins.set(threads.async_plugin()))
+    app.add_plugins(QuicDefaultPlugins.set(threads.driver_plugin()))
         .insert_resource(StressBench::new(cfg, threads))
         .add_systems(Startup, setup)
         .add_systems(First, frame_begin)
@@ -1132,24 +1130,21 @@ fn main() -> AppExit {
 
 fn setup(
     mut commands: Commands,
-    runtime: Res<TokioRuntime>,
+    runtime: Res<QuicRuntime>,
     mut bench: ResMut<StressBench>,
 ) {
     let cfg = bench.cfg.clone();
 
     if cfg.runs_server() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let cert_str = format!("{manifest}/examples/certs/cert.pem");
-        let key_str = format!("{manifest}/examples/certs/key.pem");
+        let config = QuicServerConfig::from_pem_files(
+            format!("{manifest}/examples/certs/cert.pem"),
+            format!("{manifest}/examples/certs/key.pem"),
+        )
+        .expect("Failed to load the server certificate");
 
         commands.spawn(
-            QuicServer::bind(
-                &runtime,
-                cfg.addr,
-                Path::new(&cert_str),
-                Path::new(&key_str),
-            )
-            .expect("Failed to bind server"),
+            QuicServer::bind(&runtime, cfg.addr, &config).expect("Failed to bind server"),
         );
     }
 
@@ -1203,11 +1198,7 @@ fn frame_begin(mut bench: ResMut<StressBench>) {
     bench.frame_start = Instant::now();
 }
 
-fn frame_end(
-    time: Res<Time>,
-    runtime: Res<TokioRuntime>,
-    mut bench: ResMut<StressBench>,
-) {
+fn frame_end(time: Res<Time>, runtime: Res<QuicRuntime>, mut bench: ResMut<StressBench>) {
     if bench.stage != Stage::Measure {
         return;
     }
@@ -1216,14 +1207,16 @@ fn frame_end(
     bench.frame_work_ms.push(work);
     bench.frame_interval_ms.push(time.delta_secs_f64() * 1000.0);
 
-    let depth = runtime.handle().metrics().global_queue_depth();
+    let depth = backend::tokio_handle(&runtime)
+        .metrics()
+        .global_queue_depth();
     bench.max_global_queue = bench.max_global_queue.max(depth);
 }
 
 // ─── Stage machine (--role both|clients) ─────────────────────────────────────
 
 fn drive(
-    runtime: Res<TokioRuntime>,
+    runtime: Res<QuicRuntime>,
     mut bench: ResMut<StressBench>,
     ready_streams: Query<(), (With<StressClientStream>, With<QuicSendStream>)>,
     mut exit: MessageWriter<AppExit>,
@@ -1374,7 +1367,7 @@ fn client_control(mut bench: ResMut<StressBench>, mut exit: MessageWriter<AppExi
 // ─── Server control (--role server) ──────────────────────────────────────────
 
 fn serve_control(
-    runtime: Res<TokioRuntime>,
+    runtime: Res<QuicRuntime>,
     mut bench: ResMut<StressBench>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1438,7 +1431,7 @@ fn serve_control(
 
 fn handle_control(
     line: &str,
-    runtime: &TokioRuntime,
+    runtime: &QuicRuntime,
     bench: &mut StressBench,
 ) -> Result<(), String> {
     let mut words = line.split_whitespace();
@@ -1494,7 +1487,7 @@ fn handle_control(
 
 fn spawn_clients(
     mut commands: Commands,
-    runtime: Res<TokioRuntime>,
+    runtime: Res<QuicRuntime>,
     mut bench: ResMut<StressBench>,
 ) {
     if bench.stage != Stage::Ramp {
@@ -1510,8 +1503,15 @@ fn spawn_clients(
     }
 
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let cert_str = format!("{manifest}/examples/certs/cert.pem");
-    let cert_path = Path::new(&cert_str);
+    let config = match QuicClientConfig::new()
+        .with_root_pem_file(format!("{manifest}/examples/certs/cert.pem"))
+    {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Failed to load the client certificate: {e}");
+            return;
+        }
+    };
     let addr = bench.cfg.addr;
 
     for _ in 0..to_spawn {
@@ -1520,7 +1520,7 @@ fn spawn_clients(
         // the missing stream shows up in `streams_ready`.
         bench.spawned_clients += 1;
 
-        let mut client = match QuicClient::new_with_tls(&runtime, cert_path) {
+        let mut client = match QuicClient::new(&runtime, &config) {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create client: {e}");
@@ -1665,8 +1665,8 @@ fn process_cpu_time() -> Duration {
 }
 
 /// Busy time summed over all Tokio workers.
-fn tokio_busy(runtime: &TokioRuntime) -> Duration {
-    let metrics = runtime.handle().metrics();
+fn tokio_busy(runtime: &QuicRuntime) -> Duration {
+    let metrics = backend::tokio_handle(runtime).metrics();
     (0..metrics.num_workers())
         .map(|w| metrics.worker_total_busy_duration(w))
         .sum()
@@ -1674,9 +1674,13 @@ fn tokio_busy(runtime: &TokioRuntime) -> Duration {
 
 /// Tasks scheduled onto the runtime from outside its worker threads, mostly
 /// wakes from the Bevy thread. Needs `RUSTFLAGS="--cfg tokio_unstable"`.
-fn remote_schedules(runtime: &TokioRuntime) -> Option<u64> {
+fn remote_schedules(runtime: &QuicRuntime) -> Option<u64> {
     #[cfg(tokio_unstable)]
-    return Some(runtime.handle().metrics().remote_schedule_count());
+    return Some(
+        backend::tokio_handle(runtime)
+            .metrics()
+            .remote_schedule_count(),
+    );
 
     #[cfg(not(tokio_unstable))]
     {

@@ -1,22 +1,34 @@
-//! Loopback integration test on a plain Tokio runtime (no Bevy).
+//! Loopback integration test through the Bevy plugins.
 //!
 //! Pushes enough data through one stream to hit backpressure end to end and
 //! checks that every byte arrives exactly once and in order.
 
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use bevy_s2n_quic::common::{
-    QuicParentId, QuicParentType,
-    connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
-    spawner::TaskSpawner,
-    stream::{receive::QuicReceiveStream, send::QuicSendStream},
+use bevy::{
+    MinimalPlugins,
+    app::{App, PluginGroup},
+    ecs::{
+        entity::Entity,
+        query::{QueryFilter, With},
+        world::{Mut, World},
+    },
+};
+use bevy_s2n_quic::{
+    QuicDefaultPlugins,
+    client::{Connect, QuicClient, marker::QuicClientMarker},
+    common::{
+        connection::{QuicConnection, disconnect::ConnectionDisconnectReason},
+        error::SendError,
+        plugin::DisconnectHandlerPlugin,
+        runtime::QuicRuntime,
+        stream::{receive::QuicReceiveStream, send::QuicSendStream},
+    },
+    config::{QuicClientConfig, QuicServerConfig},
+    driver_plugin::QuicDriverPlugin,
+    server::{QuicServer, marker::QuicServerMarker},
 };
 use bytes::Bytes;
-use s2n_quic::{Client, Server, client::Connect};
-use tokio::sync::mpsc::error::TrySendError;
 
 /// Size of each chunk handed to `QuicSendStream::send`.
 const CHUNK_SIZE: usize = 4096;
@@ -46,84 +58,101 @@ fn deadline_check(start: Instant, what: &str) {
     assert!(start.elapsed() < TIMEOUT, "timed out while {what}");
 }
 
+fn find<F: QueryFilter>(world: &mut World) -> Option<Entity> {
+    world.query_filtered::<Entity, F>().iter(world).next()
+}
+
+/// Runs frames until `found` returns `Some`.
+fn update_until<T>(
+    app: &mut App,
+    start: Instant,
+    what: &str,
+    mut found: impl FnMut(&mut World) -> Option<T>,
+) -> T {
+    loop {
+        deadline_check(start, what);
+        app.update();
+        if let Some(value) = found(app.world_mut()) {
+            return value;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn send_stream(app: &mut App, entity: Entity) -> Mut<'_, QuicSendStream> {
+    app.world_mut()
+        .get_mut(entity)
+        .expect("send stream despawned")
+}
+
+fn receive_stream(app: &mut App, entity: Entity) -> Mut<'_, QuicReceiveStream> {
+    app.world_mut()
+        .get_mut(entity)
+        .expect("receive stream despawned")
+}
+
 #[test]
 fn stream_delivers_all_data_in_order_under_backpressure() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
+    let mut app = App::new();
+    // Disconnected streams would be despawned, but this test reads their
+    // disconnect reasons.
+    //
+    // Backpressure counts messages, not bytes. With more threads the receive
+    // channel and flow control window can absorb all 32 MiB, so the sender
+    // never stalls and the test fails.
+    let plugins = QuicDefaultPlugins
         .build()
-        .unwrap();
-    let spawner = TaskSpawner::new(runtime.handle().clone(), None);
+        .disable::<DisconnectHandlerPlugin>()
+        .set(QuicDriverPlugin::default().with_threads(2));
+    app.add_plugins((MinimalPlugins, plugins));
+    app.finish();
+    app.cleanup();
 
     let manifest = env!("CARGO_MANIFEST_DIR");
     let cert = format!("{manifest}/examples/certs/cert.pem");
     let key = format!("{manifest}/examples/certs/key.pem");
 
-    let (mut server, client) = runtime.block_on(async {
-        let server_tls = s2n_quic_tls::Server::builder()
-            .with_certificate(Path::new(&cert), Path::new(&key))
-            .unwrap()
-            .build()
-            .unwrap();
-        let server = Server::builder()
-            .with_tls(server_tls)
-            .unwrap()
-            .with_io("127.0.0.1:0")
-            .unwrap()
-            .start()
-            .unwrap();
+    let server_config = QuicServerConfig::from_pem_files(&cert, &key).unwrap();
+    let client_config = QuicClientConfig::new().with_root_pem_file(&cert).unwrap();
 
-        let client_tls = s2n_quic_tls::Client::builder()
-            .with_certificate(Path::new(&cert))
-            .unwrap()
-            .build()
+    let runtime = app.world().resource::<QuicRuntime>();
+    let server =
+        QuicServer::bind(runtime, "127.0.0.1:0".parse().unwrap(), &server_config)
             .unwrap();
-        let client = Client::builder()
-            .with_tls(client_tls)
-            .unwrap()
-            .with_io("0.0.0.0:0")
-            .unwrap()
-            .start()
-            .unwrap();
-
-        (server, client)
-    });
-
     let addr = server.local_addr().unwrap();
+    let mut client = QuicClient::new(runtime, &client_config).unwrap();
+    let attempt =
+        client.open_connection(Connect::new(addr).with_server_name("localhost"));
 
-    // Open a send stream from the client. Both connections must stay alive for
-    // the whole test.
-    let (client_conn, send) = runtime.block_on(async {
-        let mut client_conn = client
-            .connect(Connect::new(addr).with_server_name("localhost"))
-            .await
-            .unwrap();
-        let send = client_conn.open_send_stream().await.unwrap();
-        (client_conn, send)
+    app.world_mut().spawn(server);
+    app.world_mut().spawn(client).with_children(|parent| {
+        parent.spawn(attempt);
     });
-
-    let client_id = ConnectionId::new(
-        client_conn.id(),
-        QuicParentId::generate_unique(QuicParentType::Client),
-    );
-    let mut send = QuicSendStream::new(spawner.clone(), send, client_id);
-
-    // The peer only sees the stream once data is sent on it.
-    send.send(chunk(0)).unwrap();
-
-    let (server_conn, rec) = runtime.block_on(async {
-        let mut server_conn = server.accept().await.unwrap();
-        let rec = server_conn.accept_receive_stream().await.unwrap().unwrap();
-        (server_conn, rec)
-    });
-
-    let server_id = ConnectionId::new(
-        server_conn.id(),
-        QuicParentId::generate_unique(QuicParentType::Server),
-    );
-    let mut rec = QuicReceiveStream::new(spawner, rec, server_id);
 
     let start = Instant::now();
+
+    let client_conn = update_until(&mut app, start, "connecting", |world| {
+        find::<(With<QuicConnection>, With<QuicClientMarker>)>(world)
+    });
+
+    let stream_attempt = app
+        .world_mut()
+        .get_mut::<QuicConnection>(client_conn)
+        .unwrap()
+        .open_bidrectional_stream()
+        .unwrap();
+    app.world_mut().spawn((stream_attempt, QuicClientMarker));
+
+    let send = update_until(&mut app, start, "opening the stream", |world| {
+        find::<(With<QuicSendStream>, With<QuicClientMarker>)>(world)
+    });
+
+    // The peer only sees the stream once data is sent on it.
+    send_stream(&mut app, send).send(chunk(0)).unwrap();
+
+    let rec = update_until(&mut app, start, "accepting the stream", |world| {
+        find::<(With<QuicReceiveStream>, With<QuicServerMarker>)>(world)
+    });
 
     // Send without reading until the whole pipeline stalls: the outbound
     // channel, QUIC flow control and the inbound channel are all full. If the
@@ -135,20 +164,21 @@ fn stream_delivers_all_data_in_order_under_backpressure() {
     while let Some(data) = pending.take() {
         deadline_check(start, "filling the pipeline");
 
-        match send.send(data) {
+        match send_stream(&mut app, send).send(data) {
             Ok(()) => {
                 next += 1;
                 pending = (next < CHUNK_COUNT).then(|| chunk(next));
                 last_progress = Instant::now();
             }
-            Err(TrySendError::Full(data)) => {
+            Err(SendError::Full(data)) => {
                 pending = Some(data);
                 if last_progress.elapsed() > STALL_TIME {
                     break;
                 }
+                app.update();
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Err(TrySendError::Closed(_)) => panic!("send stream closed early"),
+            Err(SendError::Closed(_)) => panic!("send stream closed early"),
         }
     }
 
@@ -165,29 +195,35 @@ fn stream_delivers_all_data_in_order_under_backpressure() {
 
     loop {
         deadline_check(start, "transferring data");
+        app.update();
 
+        let mut sender = send_stream(&mut app, send);
         if let Some(data) = pending.take() {
-            match send.send(data) {
+            match sender.send(data) {
                 Ok(()) => {
                     next += 1;
                     pending = (next < CHUNK_COUNT).then(|| chunk(next));
                 }
-                Err(TrySendError::Full(data)) => pending = Some(data),
-                Err(TrySendError::Closed(_)) => panic!("send stream closed early"),
+                Err(SendError::Full(data)) => pending = Some(data),
+                Err(SendError::Closed(_)) => panic!("send stream closed early"),
             }
         } else if !closing {
             // Close only after everything is queued. Queued data is still sent.
-            closing = send.close().is_some();
+            closing = sender.close().is_some();
         }
 
-        let open = rec.is_open();
+        let mut receiver = receive_stream(&mut app, rec);
+        let open = receiver.is_open();
         packets.clear();
-        let mut count = rec.recv_many(&mut packets, RECV_LIMIT);
-        assert!(count <= RECV_LIMIT, "recv_many returned more than its limit");
+        let mut count = receiver.recv_many(&mut packets, RECV_LIMIT);
+        assert!(
+            count <= RECV_LIMIT,
+            "recv_many returned more than its limit"
+        );
         assert_eq!(count, packets.len(), "recv_many count doesn't match");
 
         // Mix in single receives, which must continue in the same order.
-        if let Some(packet) = rec.recv() {
+        if let Some(packet) = receiver.recv() {
             packets.push(packet);
             count += 1;
         }
@@ -222,25 +258,23 @@ fn stream_delivers_all_data_in_order_under_backpressure() {
     }
 
     // The sender finishes after the peer acknowledges all data.
-    while send.is_open() {
-        deadline_check(start, "closing the send stream");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    update_until(&mut app, start, "closing the send stream", |world| {
+        let stream = world.get::<QuicSendStream>(send).unwrap();
+        (!stream.is_open()).then_some(())
+    });
 
     assert!(
         matches!(
-            send.get_disconnect_reason(),
+            send_stream(&mut app, send).get_disconnect_reason(),
             Some(ConnectionDisconnectReason::UserClosed)
         ),
         "unexpected send disconnect reason"
     );
     assert!(
         matches!(
-            rec.get_disconnect_reason(),
+            receive_stream(&mut app, rec).get_disconnect_reason(),
             Some(ConnectionDisconnectReason::PeerClosed)
         ),
         "unexpected receive disconnect reason"
     );
-
-    drop((client_conn, server_conn));
 }

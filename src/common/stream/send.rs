@@ -14,12 +14,16 @@ use tokio::{
     sync::mpsc::{self, Receiver, Sender, error::TrySendError},
 };
 
-use crate::common::{
-    HandleChannelError, QuicParentId,
-    connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
-    spawner::{QuicTask, TaskSpawner},
-    stream::id::StreamId,
-    task_state::{OnceLockState, TaskState},
+use crate::{
+    backend::s2n::{from_s2n_code, from_s2n_connection_error},
+    common::{
+        HandleChannelError, QuicParentId,
+        connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
+        error::SendError,
+        spawner::{QuicTask, TaskSpawner},
+        stream::id::StreamId,
+        task_state::{OnceLockState, TaskState},
+    },
 };
 
 type AddrResult = Result<std::net::SocketAddr, s2n_quic::connection::Error>;
@@ -48,7 +52,11 @@ pub struct QuicSendStream {
 }
 
 impl QuicSendStream {
-    pub fn new(spawner: TaskSpawner, send: SendStream, conn_id: ConnectionId) -> Self {
+    pub(crate) fn new(
+        spawner: TaskSpawner,
+        send: SendStream,
+        conn_id: ConnectionId,
+    ) -> Self {
         let stream_id = StreamId::new(conn_id, send.id());
 
         let (send_error_sender, send_errors) = mpsc::channel(DEBUG_CHANNEL_SIZE);
@@ -116,8 +124,8 @@ impl QuicSendStream {
     }
 
     /// Tries to send one set of bytes
-    pub fn send(&mut self, data: Bytes) -> Result<(), TrySendError<Bytes>> {
-        self.outbound_data.try_send(data)
+    pub fn send(&mut self, data: Bytes) -> Result<(), SendError<Bytes>> {
+        self.outbound_data.try_send(data).map_err(to_send_error)
     }
 
     /// Take a vector of bytes and send bytes until an error is hit
@@ -125,12 +133,15 @@ impl QuicSendStream {
     pub fn send_many_drain(
         &mut self,
         data: &mut Vec<Bytes>,
-    ) -> Result<(), TrySendError<Bytes>> {
+    ) -> Result<(), SendError<Bytes>> {
         let mut sent_count = 0;
         let mut res = Ok(());
 
         for item in data.iter() {
-            res = self.outbound_data.try_send(item.clone());
+            res = self
+                .outbound_data
+                .try_send(item.clone())
+                .map_err(to_send_error);
             if res.is_err() {
                 break;
             }
@@ -349,12 +360,14 @@ impl SendTask {
 
             s2n_quic::stream::Error::StreamReset { error, .. } => {
                 error!("Send stream has encountered a stream reset:\n{}", error);
-                Some(ConnectionDisconnectReason::Reset(error))
+                Some(ConnectionDisconnectReason::Reset(from_s2n_code(error)))
             }
 
             s2n_quic::stream::Error::ConnectionError { error, .. } => {
                 error!("Send stream connection error:\n{}", error);
-                Some(ConnectionDisconnectReason::ConnectionError(error))
+                Some(ConnectionDisconnectReason::ConnectionError(
+                    from_s2n_connection_error(error),
+                ))
             }
 
             _ => {
@@ -366,6 +379,13 @@ impl SendTask {
         self.send_errors.try_send(Box::new(err)).handle_err();
 
         reason
+    }
+}
+
+fn to_send_error<T>(err: TrySendError<T>) -> SendError<T> {
+    match err {
+        TrySendError::Full(data) => SendError::Full(data),
+        TrySendError::Closed(data) => SendError::Closed(data),
     }
 }
 

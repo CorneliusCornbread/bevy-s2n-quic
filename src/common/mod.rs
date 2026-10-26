@@ -6,11 +6,11 @@ use crate::common::id::IdGenerator;
 
 pub mod attempt;
 pub mod connection;
+pub mod error;
 pub(crate) mod id;
-pub mod orchestrator;
 pub mod plugin;
 pub mod runtime;
-pub mod spawner;
+pub(crate) mod spawner;
 pub mod status_code;
 pub mod stream;
 pub(crate) mod task_state;

@@ -25,15 +25,16 @@
 //! | `stream-errors` | Adds error components when streams fail |
 //! | `performance-warns` | Warns when buffers fill faster than they drain (default) |
 
-pub mod async_plugin;
+pub mod backend;
 pub mod client;
 pub mod common;
+pub mod config;
+pub mod driver_plugin;
 pub mod server;
 
 use bevy::app::{PluginGroup, PluginGroupBuilder};
 
 use crate::{
-    async_plugin::QuicAsyncPlugin,
     client::acceptor::SimpleClientAcceptorPlugin,
     common::{
         connection::plugin::ConnectionAttemptPlugin,
@@ -43,6 +44,7 @@ use crate::{
             session::{QuicAeronetEventPlugin, QuicAeronetPacketPlugin},
         },
     },
+    driver_plugin::QuicDriverPlugin,
     server::acceptor::SimpleServerAcceptorPlugin,
 };
 
@@ -53,7 +55,7 @@ pub struct QuicDefaultPlugins;
 impl PluginGroup for QuicDefaultPlugins {
     fn build(self) -> bevy::app::PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
-            .add(QuicAsyncPlugin::default())
+            .add(QuicDriverPlugin::default())
             .add(ConnectionAttemptPlugin)
             .add(StreamAttemptPlugin)
             .add(SimpleServerAcceptorPlugin)

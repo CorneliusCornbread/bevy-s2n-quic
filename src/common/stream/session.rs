@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use crate::common::{
     connection::disconnect::ConnectionDisconnectReason,
+    error::AppErrorCode,
     stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
 
@@ -29,7 +30,7 @@ const PACKET_WARN_THRESH: usize = 400;
 /// The disconnect code which will be sent by QUIC when a disconnect is called
 /// via the [Disconnect](https://docs.rs/aeronet_io/latest/aeronet_io/connection/struct.Disconnect.html)
 /// event on any ReceiveStream.
-pub const AERONET_DISCONNECT_CODE: u32 = 12345;
+pub const AERONET_DISCONNECT_CODE: AppErrorCode = AppErrorCode::from_u32(12345);
 
 /// The component which is added once a stream of any kind has been
 /// successfully made.
@@ -172,7 +173,7 @@ fn add_disconnect_handler(world: &mut World) {
          send_query: Query<(&mut QuicSendStream, Entity)>| {
             for (mut stream, entity) in rec_query {
                 if entity == event.entity {
-                    stream.stop_send(AERONET_DISCONNECT_CODE.into());
+                    stream.stop_send(AERONET_DISCONNECT_CODE);
                 }
             }
 

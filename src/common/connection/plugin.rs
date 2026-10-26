@@ -2,16 +2,12 @@ use bevy::{
     app::{Plugin, Update},
     ecs::{
         entity::Entity,
-        system::{Commands, Query, Res},
+        system::{Commands, Query},
     },
     log::{error, info, tracing},
 };
 
-use crate::common::{
-    attempt::QuicActionError,
-    connection::{QuicConnection, QuicConnectionAttempt},
-    runtime::TokioRuntime,
-};
+use crate::common::{attempt::QuicActionError, connection::QuicConnectionAttempt};
 
 #[derive(Debug)]
 pub struct ConnectionAttemptPlugin;
@@ -25,20 +21,15 @@ impl Plugin for ConnectionAttemptPlugin {
 #[tracing::instrument(skip_all)]
 fn handle_connection_attempts(
     mut commands: Commands,
-    runtime: Res<TokioRuntime>,
     query: Query<(Entity, &mut QuicConnectionAttempt)>,
 ) {
-    let handle_ref = runtime.handle();
-    let spawner = runtime.spawner();
-
     for entity_bundle in query {
         let (entity, mut attempt) = entity_bundle;
-        let parent_id = attempt.id();
 
         let res = attempt.attempt_result();
 
         if let Err(e) = res {
-            match e {
+            match &e {
                 QuicActionError::Pending => {
                     continue;
                 }
@@ -50,7 +41,7 @@ fn handle_connection_attempts(
                 QuicActionError::ConnectionFailed(error) => {
                     error!("Error handling connection attempt: {:?}", error)
                 }
-                QuicActionError::Crashed(ref join_error) => {
+                QuicActionError::Crashed(join_error) => {
                     error!("Error joining connection attempt: {:?}", join_error)
                 }
             }
@@ -65,7 +56,7 @@ fn handle_connection_attempts(
                 };
 
                 let err_comp =
-                    QuicActionErrorComponent::new(e, SystemTime::now(), parent_id);
+                    QuicActionErrorComponent::new(e, SystemTime::now(), attempt.id());
                 let err_bundle = err_comp;
 
                 error_entity.insert(err_bundle);
@@ -76,9 +67,7 @@ fn handle_connection_attempts(
             continue;
         }
 
-        let conn = res.unwrap();
-        let quic_conn =
-            QuicConnection::new(handle_ref.clone(), spawner.clone(), conn, parent_id);
+        let quic_conn = res.unwrap();
         let id = quic_conn.id();
         info!("New connection entity with {id}");
 

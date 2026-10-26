@@ -7,13 +7,14 @@ use tokio::{
 };
 
 use crate::common::{
-    connection::disconnect::ConnectionDisconnectReason, status_code::StatusCode,
-    task_state::OnceLockState,
+    connection::disconnect::ConnectionDisconnectReason, error::AppErrorCode,
+    status_code::StatusCode, task_state::OnceLockState,
 };
 
 /// Error code used to close a stream or connection when the [TaskSpawner]
 /// refuses to start its task.
-pub(crate) const SPAWN_REJECTED_ERROR_CODE: StatusCode = StatusCode::ServiceUnavailable;
+pub(crate) const SPAWN_REJECTED_ERROR_CODE: AppErrorCode =
+    AppErrorCode::from_u32(StatusCode::ServiceUnavailable as u32);
 
 /// A long-lived async task driving one connection or stream until it disconnects.
 ///
@@ -32,7 +33,7 @@ pub(crate) trait QuicTask: fmt::Display + Send + 'static {
 
 /// Why a task stopped without returning a disconnect reason.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum TaskAborted {
+pub(crate) enum TaskAborted {
     /// The task panicked. The panic message is logged by Tokio's panic hook.
     #[error("The async task panicked.")]
     Panicked,
@@ -45,11 +46,11 @@ pub enum TaskAborted {
 /// Spawns the long-lived async task behind every connection and stream.
 ///
 /// Each task runs as its own Tokio task. If a task limit is set (see
-/// [QuicAsyncPlugin::with_max_tasks][crate::async_plugin::QuicAsyncPlugin::with_max_tasks]),
+/// [QuicDriverPlugin::with_max_tasks][crate::driver_plugin::QuicDriverPlugin::with_max_tasks]),
 /// new tasks are rejected once the limit is reached: the stream or connection
 /// is closed and reports [ConnectionDisconnectReason::OrchestratorError].
 #[derive(Clone, Debug)]
-pub struct TaskSpawner {
+pub(crate) struct TaskSpawner {
     handle: Handle,
     limit: Option<Arc<Semaphore>>,
 }
@@ -57,16 +58,11 @@ pub struct TaskSpawner {
 impl TaskSpawner {
     /// Creates a spawner that starts tasks on the given runtime, allowing at most
     /// `max_tasks` connection and stream tasks at once (`None` for no limit).
-    pub fn new(handle: Handle, max_tasks: Option<usize>) -> Self {
+    pub(crate) fn new(handle: Handle, max_tasks: Option<usize>) -> Self {
         Self {
             handle,
             limit: max_tasks.map(|n| Arc::new(Semaphore::new(n))),
         }
-    }
-
-    /// Returns a handle to the Tokio runtime used for running async tasks.
-    pub fn tokio_handle(&self) -> &Handle {
-        &self.handle
     }
 
     /// Spawns the task, setting `state` to the task's disconnect reason once it

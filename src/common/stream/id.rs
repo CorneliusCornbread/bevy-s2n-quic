@@ -23,7 +23,7 @@ impl Display for StreamId {
 impl StreamId {
     /// Creates a new StreamId with the relevant parent connection
     /// and the ID for this connection.
-    pub fn new(connection_id: ConnectionId, id: u64) -> Self {
+    pub(crate) fn new(connection_id: ConnectionId, id: u64) -> Self {
         Self { connection_id, id }
     }
 

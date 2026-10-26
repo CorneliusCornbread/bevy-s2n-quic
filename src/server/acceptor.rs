@@ -29,16 +29,7 @@ impl Plugin for SimpleServerAcceptorPlugin {
 
 fn accept_connections(mut commands: Commands, servers: Query<(&mut QuicServer, Entity)>) {
     for (mut server, entity) in servers {
-        let res = server.accept_connection();
-
-        if let Err(e) = res {
-            error!("Error handling server connection: {}", e);
-            continue;
-        }
-
-        let conn = res.unwrap();
-
-        match conn {
+        match server.accept_connection() {
             super::ConnectionPoll::None => continue,
             super::ConnectionPoll::ServerClosed => continue,
             super::ConnectionPoll::NewConnection(quic_connection) => {

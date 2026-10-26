@@ -7,11 +7,7 @@ use bevy::{
     },
     prelude::{Deref, DerefMut},
 };
-use s2n_quic::{
-    Connection,
-    application::{self},
-    connection::Handle as ConnectionHandle,
-};
+use s2n_quic::{Connection, connection::Handle as ConnectionHandle};
 use std::sync::Arc;
 use tokio::{
     runtime::Handle,
@@ -22,25 +18,26 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::common::{
-    QuicParentId,
-    attempt::{QuicActionAttempt, TaskError},
-    connection::{
-        disconnect::ConnectionDisconnectReason,
-        id::ConnectionId,
-        open_flag::OpenFlag,
-        stream_flag::StreamFlag,
-        task::{
-            ConnectionCommand, ConnectionCommandError, ConnectionHandleTask,
-            ConnectionTask,
+use crate::{
+    backend::s2n::to_s2n_code,
+    common::{
+        QuicParentId,
+        attempt::{QuicActionAttempt, TaskError},
+        connection::{
+            disconnect::ConnectionDisconnectReason,
+            id::ConnectionId,
+            open_flag::OpenFlag,
+            stream_flag::StreamFlag,
+            task::{ConnectionCommand, ConnectionHandleTask, ConnectionTask},
         },
+        error::AppErrorCode,
+        spawner::TaskSpawner,
+        stream::{
+            QuicBidirectionalStreamAttempt, QuicPeerStreamAttempt,
+            QuicReceiveStreamAttempt, QuicSendStreamAttempt,
+        },
+        task_state::{OnceLockState, TaskState},
     },
-    spawner::TaskSpawner,
-    stream::{
-        QuicBidirectionalStreamAttempt, QuicPeerStreamAttempt, QuicReceiveStreamAttempt,
-        QuicSendStreamAttempt,
-    },
-    task_state::{OnceLockState, TaskState},
 };
 
 pub mod disconnect;
@@ -48,7 +45,9 @@ pub mod id;
 pub(super) mod open_flag;
 pub mod plugin;
 pub(super) mod stream_flag;
-pub mod task;
+pub(crate) mod task;
+
+pub use task::ConnectionCommandError;
 
 /// Number of messages that can sit unhandled by the connection task
 const CONNECTION_CTRL_CHANNEL_SIZE: usize = 1024;
@@ -68,20 +67,19 @@ type ConnectionResponse<T> = Result<Option<T>, TaskError>;
 /// will be added on the entity.
 #[derive(Deref, DerefMut, Component)]
 #[component(storage = "SparseSet")]
-pub struct QuicConnectionAttempt(QuicActionAttempt<Connection, QuicParentId>);
+pub struct QuicConnectionAttempt(QuicActionAttempt<QuicConnection, QuicParentId>);
 
 impl QuicConnectionAttempt {
     pub(crate) fn new(
         handle: Handle,
-        conn_task: JoinHandle<Result<Connection, TaskError>>,
+        conn_task: JoinHandle<Result<QuicConnection, TaskError>>,
         parent_id: QuicParentId,
     ) -> Self {
         Self(QuicActionAttempt::new(handle, conn_task, parent_id))
     }
 }
 
-/// The component analogue to [Connection] in s2n-quic.
-/// This component manages the async behaviour of our Quic connection.
+/// A QUIC connection to a peer, from which streams are opened and accepted.
 #[derive(Debug, Component)]
 pub struct QuicConnection {
     runtime: Handle,
@@ -100,7 +98,7 @@ impl QuicConnection {
         name = "new_quic_connection"
         skip(runtime),
     )]
-    pub fn new(
+    pub(crate) fn new(
         runtime: Handle,
         spawner: TaskSpawner,
         mut connection: Connection,
@@ -166,7 +164,7 @@ impl QuicConnection {
         let send_res = self.conn_command_channel.try_send(cmd);
 
         if let Err(err) = send_res {
-            return Err(err.into());
+            return Err(ConnectionCommandError::from_send_error(&err));
         }
 
         let attempt = QuicPeerStreamAttempt::new(self.runtime.clone(), rec, self.id());
@@ -194,7 +192,7 @@ impl QuicConnection {
         let send_res = self.conn_command_channel.try_send(cmd);
 
         if let Err(err) = send_res {
-            return Err(err.into());
+            return Err(ConnectionCommandError::from_send_error(&err));
         }
 
         let attempt = QuicReceiveStreamAttempt::new(self.runtime.clone(), rec, self.id());
@@ -222,7 +220,7 @@ impl QuicConnection {
         let send_res = self.conn_command_channel.try_send(cmd);
 
         if let Err(err) = send_res {
-            return Err(err.into());
+            return Err(ConnectionCommandError::from_send_error(&err));
         }
 
         let attempt =
@@ -272,7 +270,7 @@ impl QuicConnection {
     }
 
     #[tracing::instrument(skip(self), fields(connection_id = %self.connection_id, remote_addr = ?self.conn_handle.remote_addr()))]
-    pub fn close(&self, code: application::Error) {
+    pub fn close(&self, code: AppErrorCode) {
         if !self.is_open() {
             return;
         }
@@ -296,7 +294,7 @@ impl QuicConnection {
             ),
         }
 
-        self.conn_handle.close(code);
+        self.conn_handle.close(to_s2n_code(code));
     }
 
     /// Returns true if the connection is still open.
@@ -315,9 +313,8 @@ impl QuicConnection {
     /// This also doesn't necessarily mean the [accept_bidirectional_stream][Self::accept_bidirectional_stream()]
     /// and [accept_receive_stream][Self::accept_receive_stream()] will both return something new.
     ///
-    /// This flag is set by the general [s2n_quic::Connection::poll_accept()] poll,
-    /// so the specific variants *could* be a receive stream, bidirectional stream, or
-    /// it could be an error.
+    /// This flag is set when any stream arrives, so the specific variants *could* be
+    /// a receive stream, bidirectional stream, or it could be an error.
     #[deprecated(
         since = "0.18.3",
         note = "Unnecessary since now all accept functions do this check internally and do so with atomic correctness. Resolves a bug and gets rid of unnecessary API."

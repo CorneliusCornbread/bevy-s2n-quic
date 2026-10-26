@@ -1,15 +1,16 @@
-use std::{error::Error, net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use bevy::ecs::component::Component;
 use s2n_quic::Server;
-use s2n_quic_tls::certificate::{IntoCertificate, IntoPrivateKey};
-use tokio::{runtime::Handle, task::JoinError};
+use tokio::runtime::Handle;
 
 use crate::{
+    backend::s2n::server_tls,
     common::{
-        QuicParentId, QuicParentType, connection::QuicConnection, runtime::TokioRuntime,
+        QuicParentId, QuicParentType, connection::QuicConnection, runtime::QuicRuntime,
         spawner::TaskSpawner,
     },
+    config::{ConfigError, QuicServerConfig},
     server::marker::QuicServerMarker,
 };
 
@@ -29,18 +30,19 @@ pub struct QuicServer {
 }
 
 impl QuicServer {
-    /// Creates a new QuicServer and binds it to the given address with the given certificates.
+    /// Creates a new QuicServer and binds it to the given address, presenting
+    /// the certificate from `config`.
     ///
-    /// QUIC requires some form of TLS certificate, this function accepts the same kinds of certs the regular s2n-quic
-    /// `bind()` function does.
-    pub fn bind<C: IntoCertificate, PK: IntoPrivateKey>(
-        runtime: &TokioRuntime,
-        bind_ip: SocketAddr,
-        certificate: C,
-        private_key: PK,
-    ) -> Result<Self, Box<dyn Error>> {
+    /// Bind to port `0` to let the OS pick a free port, then read it with
+    /// [Self::local_addr].
+    pub fn bind(
+        runtime: &QuicRuntime,
+        bind_addr: SocketAddr,
+        config: &QuicServerConfig,
+    ) -> Result<Self, ConfigError> {
         let handle = runtime.handle().clone();
-        let server = handle.block_on(build_server(bind_ip, certificate, private_key))?;
+        let tls = server_tls(config)?;
+        let server = handle.block_on(build_server(bind_addr, tls))?;
         let spawner = runtime.spawner().clone();
 
         Ok(Self {
@@ -52,7 +54,7 @@ impl QuicServer {
     }
 
     /// Polls to receive any new pending connections
-    pub fn accept_connection(&mut self) -> Result<ConnectionPoll, JoinError> {
+    pub fn accept_connection(&mut self) -> ConnectionPoll {
         let waker = Arc::new(futures::task::noop_waker_ref());
         let mut cx = std::task::Context::from_waker(&waker);
 
@@ -61,23 +63,26 @@ impl QuicServer {
         match poll {
             std::task::Poll::Ready(conn_opt) => {
                 if let Some(conn) = conn_opt {
-                    let ret = ConnectionPoll::NewConnection(QuicConnection::new(
+                    ConnectionPoll::NewConnection(QuicConnection::new(
                         self.runtime.clone(),
                         self.spawner.clone(),
                         conn,
                         self.id,
-                    ));
-
-                    Ok(ret)
+                    ))
                 } else {
                     bevy::log::info!(
                         "Server connection poll returned none, is our server not running?"
                     );
-                    Ok(ConnectionPoll::ServerClosed)
+                    ConnectionPoll::ServerClosed
                 }
             }
-            std::task::Poll::Pending => Ok(ConnectionPoll::None),
+            std::task::Poll::Pending => ConnectionPoll::None,
         }
+    }
+
+    /// The local address the server is bound to.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.server.local_addr()
     }
 
     pub fn id(&self) -> QuicParentId {
@@ -92,17 +97,19 @@ pub enum ConnectionPoll {
     NewConnection(QuicConnection),
 }
 
-async fn build_server<C: IntoCertificate, PK: IntoPrivateKey>(
-    ip: SocketAddr,
-    certificate: C,
-    private_key: PK,
-) -> Result<Server, Box<dyn Error>> {
-    let tls = s2n_quic_tls::Server::builder()
-        .with_certificate(certificate, private_key)?
-        .build()?;
+async fn build_server(
+    addr: SocketAddr,
+    tls: s2n_quic_tls::Server,
+) -> Result<Server, ConfigError> {
+    let endpoint_error = |reason: String| ConfigError::Endpoint { addr, reason };
 
-    let server = Server::builder().with_tls(tls)?.with_io(ip)?.start()?;
-    Ok(server)
+    Server::builder()
+        .with_tls(tls)
+        .map_err(|e| ConfigError::Tls(e.to_string()))?
+        .with_io(addr)
+        .map_err(|e| endpoint_error(e.to_string()))?
+        .start()
+        .map_err(|e| endpoint_error(e.to_string()))
 }
 
 pub enum QuitReason {

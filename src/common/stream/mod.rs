@@ -37,7 +37,7 @@ pub struct QuicReceiveStreamAttempt(
 );
 
 impl QuicReceiveStreamAttempt {
-    pub fn new(
+    pub(crate) fn new(
         handle: Handle,
         task: impl TaskResult<Option<QuicReceiveStream>> + 'static + Send + Sync,
         id: ConnectionId,
@@ -62,7 +62,7 @@ impl QuicReceiveStreamAttempt {
 pub struct QuicSendStreamAttempt(QuicActionAttempt<Option<QuicSendStream>, ConnectionId>);
 
 impl QuicSendStreamAttempt {
-    pub fn new(
+    pub(crate) fn new(
         handle: Handle,
         task: impl TaskResult<Option<QuicSendStream>> + 'static + Send + Sync,
         id: ConnectionId,
@@ -90,7 +90,7 @@ pub struct QuicBidirectionalStreamAttempt(
 );
 
 impl QuicBidirectionalStreamAttempt {
-    pub fn new(
+    pub(crate) fn new(
         handle: Handle,
         task: impl TaskResult<Option<(QuicReceiveStream, QuicSendStream)>>
         + 'static
@@ -119,7 +119,7 @@ impl QuicBidirectionalStreamAttempt {
 pub struct QuicPeerStreamAttempt(QuicActionAttempt<Option<QuicPeerStream>, ConnectionId>);
 
 impl QuicPeerStreamAttempt {
-    pub fn new(
+    pub(crate) fn new(
         handle: Handle,
         task: impl TaskResult<Option<QuicPeerStream>> + 'static + Send + Sync,
         conn_id: ConnectionId,
@@ -134,7 +134,7 @@ pub enum QuicPeerStream {
 }
 
 impl QuicPeerStream {
-    pub fn new(
+    pub(crate) fn new(
         spawner: TaskSpawner,
         peer_stream: PeerStream,
         conn_id: ConnectionId,

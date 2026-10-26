@@ -1,15 +1,16 @@
 use std::{error::Error, sync::Arc};
 
 use aeronet_io::{anyhow::anyhow, connection::DisconnectReason};
-use s2n_quic::connection::Error as ConnectionError;
+
+use crate::common::error::{AppErrorCode, ConnectionError};
 
 #[derive(Clone, Debug)]
 pub enum ConnectionDisconnectReason {
     UserClosed,
     PeerClosed,
-    Reset(s2n_quic::application::Error),
+    Reset(AppErrorCode),
     InvalidStream,
-    ConnectionError(s2n_quic::connection::Error),
+    ConnectionError(ConnectionError),
     MspcChannelClosed { channel_name: &'static str },
     OrchestratorError,
     InternalError(Arc<dyn Error + Send + Sync>),
@@ -55,24 +56,5 @@ impl From<ConnectionDisconnectReason> for DisconnectReason {
                 ))
             }
         }
-    }
-}
-
-pub trait ConnectionErrorDisconnected {
-    /// Returns `true` if this error represents a closed or unrecoverable connection.
-    fn is_closed(&self) -> bool;
-}
-
-impl ConnectionErrorDisconnected for ConnectionError {
-    fn is_closed(&self) -> bool {
-        matches!(
-            self,
-            ConnectionError::Closed { .. }
-                | ConnectionError::Transport { .. }
-                | ConnectionError::Application { .. }
-                | ConnectionError::EndpointClosing { .. }
-                | ConnectionError::IdleTimerExpired { .. }
-                | ConnectionError::NoValidPath { .. }
-        )
     }
 }

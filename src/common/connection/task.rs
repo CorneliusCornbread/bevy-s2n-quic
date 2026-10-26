@@ -3,13 +3,11 @@ use bevy::log::{
     warn,
 };
 use s2n_quic::{
-    Connection, application,
+    Connection,
     connection::{Error as ConnectionError, Handle as ConnectionHandle},
     stream::PeerStream,
 };
-use std::{
-    error::Error, fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration,
-};
+use std::{fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
     select,
@@ -20,17 +18,18 @@ use tokio::{
     time::timeout,
 };
 
-use crate::common::{
-    attempt::TaskError,
-    connection::{
-        ConnectionResponse,
-        disconnect::{ConnectionDisconnectReason, ConnectionErrorDisconnected},
-        id::ConnectionId,
-        open_flag::OpenFlag,
-        stream_flag::StreamFlag,
+use crate::{
+    backend::s2n::{from_s2n_connection_error, is_closed, to_s2n_code},
+    common::{
+        attempt::TaskError,
+        connection::{
+            ConnectionResponse, disconnect::ConnectionDisconnectReason, id::ConnectionId,
+            open_flag::OpenFlag, stream_flag::StreamFlag,
+        },
+        error::AppErrorCode,
+        spawner::{QuicTask, SPAWN_REJECTED_ERROR_CODE, TaskSpawner},
+        stream::{QuicPeerStream, receive::QuicReceiveStream, send::QuicSendStream},
     },
-    spawner::{QuicTask, SPAWN_REJECTED_ERROR_CODE, TaskSpawner},
-    stream::{QuicPeerStream, receive::QuicReceiveStream, send::QuicSendStream},
 };
 
 /// Timeout used when the buffered stream type doesn't match what the command
@@ -51,7 +50,7 @@ pub(crate) enum ConnectionCommand {
     Accept {
         respond_to: oneshot::Sender<ConnectionResponse<QuicPeerStream>>,
     },
-    Close(application::Error),
+    Close(AppErrorCode),
 }
 
 // TODO: This could be made public and used elsewhere as a async way to open new connections
@@ -166,7 +165,8 @@ impl QuicTask for ConnectionTask {
     }
 
     fn reject(self) {
-        self.connection.close(SPAWN_REJECTED_ERROR_CODE.into());
+        self.connection
+            .close(to_s2n_code(SPAWN_REJECTED_ERROR_CODE));
     }
 }
 
@@ -263,11 +263,14 @@ impl ConnectionTask {
                         );
                     }
                     Err(err) => {
-                        if err.is_closed() {
+                        if is_closed(&err) {
                             self.is_open.set_closed();
                         }
-                        self.disconnect_flag =
-                            Some(ConnectionDisconnectReason::ConnectionError(err));
+                        self.disconnect_flag = Some(
+                            ConnectionDisconnectReason::ConnectionError(
+                                from_s2n_connection_error(err),
+                            ),
+                        );
                     }
                 }
             }
@@ -354,7 +357,7 @@ impl ConnectionTask {
             }
 
             ConnectionCommand::Close(code) => {
-                self.connection.close(code);
+                self.connection.close(to_s2n_code(code));
                 Ok(())
             }
         }
@@ -389,15 +392,12 @@ impl ConnectionTask {
                 Ok(())
             }
             Err(err) => {
-                if respond_to
-                    .send(Err(TaskError::ConnectionFailed(err)))
-                    .is_err()
-                {
+                if respond_to.send(Err(err.into())).is_err() {
                     warn!(
                         "Accept receive errored and response handler was already closed."
                     );
                 }
-                if err.is_closed() {
+                if is_closed(&err) {
                     self.is_open.set_closed();
                 }
                 Err(err)
@@ -447,15 +447,12 @@ impl ConnectionTask {
                 Ok(())
             }
             Err(err) => {
-                if respond_to
-                    .send(Err(TaskError::ConnectionFailed(err)))
-                    .is_err()
-                {
+                if respond_to.send(Err(err.into())).is_err() {
                     warn!(
                         "Accept bidir errored and response handler was already closed."
                     );
                 }
-                if err.is_closed() {
+                if is_closed(&err) {
                     self.is_open.set_closed();
                 }
                 Err(err)
@@ -468,7 +465,9 @@ impl ConnectionTask {
             return;
         };
 
-        self.disconnect_flag = Some(ConnectionDisconnectReason::ConnectionError(err));
+        self.disconnect_flag = Some(ConnectionDisconnectReason::ConnectionError(
+            from_s2n_connection_error(err),
+        ));
     }
 
     fn buffer_stream(&mut self, stream: PeerStream) {
@@ -490,25 +489,11 @@ pub enum ConnectionCommandError {
     Closed,
 }
 
-impl<T> From<TrySendError<T>> for ConnectionCommandError {
-    fn from(value: TrySendError<T>) -> Self {
-        match value {
+impl ConnectionCommandError {
+    pub(crate) fn from_send_error<T>(err: &TrySendError<T>) -> Self {
+        match err {
             TrySendError::Full(_) => Self::Full,
             TrySendError::Closed(_) => Self::Closed,
         }
     }
 }
-
-#[derive(Debug)]
-pub struct MissingErrorData;
-
-impl fmt::Display for MissingErrorData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Connection task exited without a given reason. This is a bug!"
-        )
-    }
-}
-
-impl Error for MissingErrorData {}

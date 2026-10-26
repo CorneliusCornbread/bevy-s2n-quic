@@ -8,7 +8,6 @@ use bevy::{
     },
 };
 use bytes::Bytes;
-use s2n_quic::application::Error as ErrorCode;
 use s2n_quic::stream::ReceiveStream;
 use std::{error::Error, fmt, future::Future};
 use tokio::{
@@ -17,12 +16,16 @@ use tokio::{
     time::Instant as TokioInstant,
 };
 
-use crate::common::{
-    HandleChannelError, QuicParentId,
-    connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
-    spawner::{QuicTask, SPAWN_REJECTED_ERROR_CODE, TaskSpawner},
-    stream::id::StreamId,
-    task_state::{OnceLockState, TaskState},
+use crate::{
+    backend::s2n::{from_s2n_code, from_s2n_connection_error, to_s2n_code},
+    common::{
+        HandleChannelError, QuicParentId,
+        connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
+        error::AppErrorCode,
+        spawner::{QuicTask, SPAWN_REJECTED_ERROR_CODE, TaskSpawner},
+        stream::id::StreamId,
+        task_state::{OnceLockState, TaskState},
+    },
 };
 
 type AddrResult = Result<std::net::SocketAddr, s2n_quic::connection::Error>;
@@ -48,7 +51,7 @@ pub struct QuicReceiveStream {
 }
 
 impl QuicReceiveStream {
-    pub fn new(
+    pub(crate) fn new(
         spawner: TaskSpawner,
         rec: ReceiveStream,
         parent_id: ConnectionId,
@@ -129,7 +132,7 @@ impl QuicReceiveStream {
     ///
     /// Never blocks. If the control channel is full or closed the request is
     /// dropped and a warning is logged.
-    pub fn stop_send(&mut self, err_code: ErrorCode) {
+    pub fn stop_send(&mut self, err_code: AppErrorCode) {
         let Err(e) = self
             .inbound_control
             .try_send(RecControlMessage::StopSend(err_code))
@@ -172,7 +175,7 @@ impl QuicReceiveStream {
 }
 
 enum RecControlMessage {
-    StopSend(ErrorCode),
+    StopSend(AppErrorCode),
 }
 
 #[derive(Debug)]
@@ -199,7 +202,9 @@ impl QuicTask for RecTask {
     }
 
     fn reject(mut self) {
-        let _ = self.rec.stop_sending(SPAWN_REJECTED_ERROR_CODE.into());
+        let _ = self
+            .rec
+            .stop_sending(to_s2n_code(SPAWN_REJECTED_ERROR_CODE));
     }
 }
 
@@ -251,7 +256,7 @@ impl RecTask {
             RecControlMessage::StopSend(error_code) => {
                 self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
 
-                if let Err(stream_err) = self.rec.stop_sending(error_code) {
+                if let Err(stream_err) = self.rec.stop_sending(to_s2n_code(error_code)) {
                     warn!("Stream error on receive stop_send():\n{stream_err}");
                 }
             }
@@ -287,7 +292,9 @@ impl RecTask {
                     s2n_quic::stream::Error::ConnectionError { error, .. } => {
                         error!("Receive stream connection error: {error}");
                         self.disconnect_flag =
-                            Some(ConnectionDisconnectReason::ConnectionError(error));
+                            Some(ConnectionDisconnectReason::ConnectionError(
+                                from_s2n_connection_error(error),
+                            ));
                     }
 
                     s2n_quic::stream::Error::InvalidStream { source, .. } => {
@@ -299,7 +306,7 @@ impl RecTask {
                     s2n_quic::stream::Error::StreamReset { error, source, .. } => {
                         error!("Receive stream reset: {error}, Source: {source}");
                         self.disconnect_flag =
-                            Some(ConnectionDisconnectReason::Reset(error));
+                            Some(ConnectionDisconnectReason::Reset(from_s2n_code(error)));
                     }
 
                     _ => {
@@ -363,7 +370,7 @@ impl RecTask {
             return;
         }
 
-        let _send_res = self.rec.stop_sending(ErrorCode::UNKNOWN);
+        let _send_res = self.rec.stop_sending(to_s2n_code(AppErrorCode::UNKNOWN));
         let recv_at = TokioInstant::now().into_std();
 
         while let Ok(Some(payload)) = self.rec.receive().await {
