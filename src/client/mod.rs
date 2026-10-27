@@ -1,19 +1,15 @@
-use std::net::SocketAddr;
-
 use bevy::ecs::component::Component;
-use s2n_quic::Client;
-use tokio::runtime::Handle;
 
 use crate::{
-    backend::s2n::{client_tls, to_s2n_connect},
     client::marker::QuicClientMarker,
     common::{
         QuicParentId, QuicParentType,
-        connection::{QuicConnection, QuicConnectionAttempt},
-        runtime::QuicRuntime,
-        spawner::TaskSpawner,
+        connection::{QuicConnection, QuicConnectionAttempt, id::ConnectionId},
+        router::Notice,
+        runtime::{Link, QuicRuntime},
     },
     config::{ConfigError, QuicClientConfig},
+    driver::{Command, EndpointId, EndpointSetup},
 };
 
 pub mod acceptor;
@@ -23,12 +19,15 @@ pub mod marker;
 pub use connect::Connect;
 
 /// The component which represents a client.
+///
+/// Dropping the client stops it making connections. Connections it already
+/// made stay open.
 #[derive(Component)]
 #[require(QuicClientMarker)]
 pub struct QuicClient {
-    runtime: Handle,
-    spawner: TaskSpawner,
-    client: Client,
+    link: Link,
+    driver: usize,
+    endpoint: EndpointId,
     id: QuicParentId,
 }
 
@@ -42,14 +41,17 @@ impl QuicClient {
         runtime: &QuicRuntime,
         config: &QuicClientConfig,
     ) -> Result<Self, ConfigError> {
-        let handle = runtime.handle().clone();
-        let tls = client_tls(config)?;
-        let client = handle.block_on(build(config.bind_addr(), tls))?;
+        let setup = EndpointSetup::client(config, runtime.endpoint_options())?;
+        let driver = runtime.pick_driver();
+        let link = runtime.link(driver);
+        let endpoint = link.driver.ids().endpoint();
+        link.driver
+            .open_endpoint(endpoint, config.bind_addr(), setup)?;
 
         Ok(Self {
-            runtime: handle,
-            spawner: runtime.spawner().clone(),
-            client,
+            link,
+            driver,
+            endpoint,
             id: QuicParentId::generate_unique(QuicParentType::Client),
         })
     }
@@ -65,33 +67,36 @@ impl QuicClient {
         &mut self,
         connect: Connect,
     ) -> (QuicConnectionAttempt, QuicClientMarker) {
-        let attempt = self.client.connect(to_s2n_connect(&connect));
-        let (runtime, spawner, id) =
-            (self.runtime.clone(), self.spawner.clone(), self.id);
+        let conn = self.link.driver.ids().conn();
+        let connection_id = ConnectionId::new(conn.0, self.id);
+        let remote_addr = connect.addr();
 
-        let conn_task = self.runtime.spawn(async move {
-            let connection = attempt.await?;
-            Ok(QuicConnection::new(runtime, spawner, connection, id))
+        // Registered before connecting, so the router knows the connection
+        // before any of its events arrive.
+        self.link.notify(Notice::Conn {
+            conn,
+            id: connection_id,
+            driver: self.driver,
+        });
+        self.link.send(Command::Connect {
+            endpoint: self.endpoint,
+            conn,
+            connect,
         });
 
+        let connection =
+            QuicConnection::new(self.link.clone(), conn, connection_id, remote_addr);
         (
-            QuicConnectionAttempt::new(self.runtime.clone(), conn_task, self.id),
+            QuicConnectionAttempt::new(connection, self.id),
             QuicClientMarker,
         )
     }
 }
 
-async fn build(
-    addr: SocketAddr,
-    tls: s2n_quic_tls::Client,
-) -> Result<Client, ConfigError> {
-    let endpoint_error = |reason: String| ConfigError::Endpoint { addr, reason };
-
-    Client::builder()
-        .with_tls(tls)
-        .map_err(|e| ConfigError::Tls(e.to_string()))?
-        .with_io(addr)
-        .map_err(|e| endpoint_error(e.to_string()))?
-        .start()
-        .map_err(|e| endpoint_error(e.to_string()))
+impl Drop for QuicClient {
+    fn drop(&mut self) {
+        self.link.send(Command::ReleaseEndpoint {
+            endpoint: self.endpoint,
+        });
+    }
 }

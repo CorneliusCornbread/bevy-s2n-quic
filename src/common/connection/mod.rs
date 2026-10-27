@@ -1,62 +1,43 @@
 use bevy::{
-    ecs::component::Component,
-    log::{
-        error,
-        tracing::{self},
-        warn,
-    },
+    ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld},
     prelude::{Deref, DerefMut},
 };
-use s2n_quic::{Connection, connection::Handle as ConnectionHandle};
-use std::sync::Arc;
-use tokio::{
-    runtime::Handle,
-    sync::{
-        mpsc::{self},
-        oneshot,
-    },
-    task::JoinHandle,
+use bytes::Bytes;
+use std::{
+    collections::VecDeque,
+    fmt,
+    net::SocketAddr,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
+use thiserror::Error;
 
 use crate::{
-    backend::s2n::to_s2n_code,
     common::{
         QuicParentId,
-        attempt::{QuicActionAttempt, TaskError},
+        attempt::{OpenRequest, QuicActionAttempt},
         connection::{
-            disconnect::ConnectionDisconnectReason,
-            id::ConnectionId,
-            open_flag::OpenFlag,
-            stream_flag::StreamFlag,
-            task::{ConnectionCommand, ConnectionHandleTask, ConnectionTask},
+            disconnect::ConnectionDisconnectReason, id::ConnectionId,
+            stats::ConnectionStats,
         },
-        error::AppErrorCode,
-        spawner::TaskSpawner,
+        error::{AppErrorCode, ConnectionError},
+        router::{self, ConnDelivery, Notice},
+        runtime::Link,
         stream::{
-            QuicBidirectionalStreamAttempt, QuicPeerStreamAttempt,
+            QuicBidirectionalStreamAttempt, QuicPeerStream, QuicPeerStreamAttempt,
             QuicReceiveStreamAttempt, QuicSendStreamAttempt,
         },
-        task_state::{OnceLockState, TaskState},
     },
+    driver::{Command, ConnId, Dir},
 };
 
 pub mod disconnect;
 pub mod id;
-pub(super) mod open_flag;
 pub mod plugin;
-pub(super) mod stream_flag;
-pub(crate) mod task;
-
-pub use task::ConnectionCommandError;
-
-/// Number of messages that can sit unhandled by the connection task
-const CONNECTION_CTRL_CHANNEL_SIZE: usize = 1024;
-
-type ConnectionResponse<T> = Result<Option<T>, TaskError>;
+pub mod stats;
 
 /// This is a structure which represents an in progress connection.
-/// Any pending connections this attempt may hold will be closed
-/// if this structure is dropped without being handled.
+/// The connection is closed if this is dropped before it connects.
 ///
 /// Attempts are all handled internally. Put them on an entity
 /// and they will be replaced with a full [QuicConnection]
@@ -70,263 +51,259 @@ type ConnectionResponse<T> = Result<Option<T>, TaskError>;
 pub struct QuicConnectionAttempt(QuicActionAttempt<QuicConnection, QuicParentId>);
 
 impl QuicConnectionAttempt {
-    pub(crate) fn new(
-        handle: Handle,
-        conn_task: JoinHandle<Result<QuicConnection, TaskError>>,
-        parent_id: QuicParentId,
-    ) -> Self {
-        Self(QuicActionAttempt::new(handle, conn_task, parent_id))
+    pub(crate) fn new(connection: QuicConnection, parent_id: QuicParentId) -> Self {
+        Self(QuicActionAttempt::new_connect(connection, parent_id))
     }
 }
 
 /// A QUIC connection to a peer, from which streams are opened and accepted.
-#[derive(Debug, Component)]
+///
+/// The connection's state, such as [Self::is_open] and [Self::stats], is
+/// mirrored from the network thread once per frame, in
+/// [IoSystems::Poll](https://docs.rs/aeronet_io/latest/aeronet_io/enum.IoSystems.html),
+/// so it can be up to one frame out of date.
+///
+/// Dropping the component closes the connection.
+#[derive(Component)]
+#[component(on_insert, on_discard)]
 pub struct QuicConnection {
-    runtime: Handle,
-    spawner: TaskSpawner,
-    conn_handle: ConnectionHandle,
-    task_state: OnceLockState<ConnectionDisconnectReason>,
-    conn_command_channel: mpsc::Sender<ConnectionCommand>,
-    is_open: OpenFlag,
+    link: Link,
+    conn: ConnId,
     connection_id: ConnectionId,
-    /// Flag set by async wakers as soon as there's a new stream
-    pending_stream: Arc<StreamFlag>,
+    remote_addr: SocketAddr,
+    connected: bool,
+    /// [Self::close] was called.
+    closing: AtomicBool,
+    lost: Option<ConnectionError>,
+    accepted: VecDeque<QuicPeerStream>,
+    stats: ConnectionStats,
+    next_request: u64,
+}
+
+impl fmt::Debug for QuicConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuicConnection")
+            .field("id", &self.connection_id)
+            .field("remote_addr", &self.remote_addr)
+            .field("connected", &self.connected)
+            .field("closing", &self.closing.load(Ordering::Relaxed))
+            .field("lost", &self.lost)
+            .field("accepted", &self.accepted.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuicConnection {
-    #[tracing::instrument(
-        name = "new_quic_connection"
-        skip(runtime),
-    )]
     pub(crate) fn new(
-        runtime: Handle,
-        spawner: TaskSpawner,
-        mut connection: Connection,
-        parent_id: QuicParentId,
+        link: Link,
+        conn: ConnId,
+        connection_id: ConnectionId,
+        remote_addr: SocketAddr,
     ) -> Self {
-        let res = connection.keep_alive(true);
-        let (send, rec) = mpsc::channel(CONNECTION_CTRL_CHANNEL_SIZE);
-        let connection_id = ConnectionId::new(connection.id(), parent_id);
-
-        let pending_stream = Arc::new(StreamFlag::new(false));
-
-        if let Err(e) = res {
-            warn!(
-                "Unable to mark new connection with keep alive, is the connection already closed? Reason: \"{}\"",
-                e
-            );
-        }
-
-        let task_state = OnceLockState::new();
-
-        let is_open = OpenFlag::new(true);
-        let conn_handle = connection.handle();
-        let task = ConnectionTask::new(
-            connection,
-            rec,
-            connection_id,
-            is_open.clone(),
-            pending_stream.clone(),
-            spawner.clone(),
-        );
-
-        spawner.spawn(task, task_state.clone());
-
         Self {
-            runtime: runtime.clone(),
-            spawner,
-            conn_handle,
-            task_state,
-            conn_command_channel: send,
-            is_open,
+            link,
+            conn,
             connection_id,
-            pending_stream,
+            remote_addr,
+            connected: false,
+            closing: AtomicBool::new(false),
+            lost: None,
+            accepted: VecDeque::new(),
+            stats: ConnectionStats::default(),
+            next_request: 0,
         }
     }
 
-    /// Accepts any incoming streams, this will always return an [QuicPeerStreamAttempt] even if
-    /// there are no pending streams.
+    fn on_insert(world: DeferredWorld, context: HookContext) {
+        router::bind::<Self>(world, context);
+    }
+
+    fn on_discard(world: DeferredWorld, context: HookContext) {
+        router::unbind::<Self>(world, context);
+    }
+
+    pub(crate) fn conn(&self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    pub(crate) fn lost_reason(&self) -> Option<&ConnectionError> {
+        self.lost.as_ref()
+    }
+
+    pub(crate) fn deliver(&mut self, delivery: ConnDelivery) {
+        match delivery {
+            ConnDelivery::Connected => self.connected = true,
+            ConnDelivery::Lost(reason) => {
+                self.lost.get_or_insert(reason);
+            }
+            ConnDelivery::Accepted(stream) => self.accepted.push_back(*stream),
+            ConnDelivery::Stats(stats) => self.stats = stats,
+        }
+    }
+
+    /// Takes the oldest stream the peer opened, if any.
     ///
-    /// There's also a chance that an accept will successfully get a stream even if there aren't
-    /// any pending streams due to network timings.
-    ///
-    /// Returns an error if the async communication channel errors out due to being full.
+    /// Returns an attempt that resolves to the stream, so it can be spawned
+    /// and handled like other stream attempts.
     pub fn accept_stream(
         &mut self,
     ) -> Result<Option<QuicPeerStreamAttempt>, ConnectionCommandError> {
-        if !self.pending_stream.swap(false) || !self.is_open() {
+        if !self.is_open() {
             return Ok(None);
         }
 
-        let (send, rec) = oneshot::channel();
-
-        let cmd = ConnectionCommand::Accept { respond_to: send };
-        let send_res = self.conn_command_channel.try_send(cmd);
-
-        if let Err(err) = send_res {
-            return Err(ConnectionCommandError::from_send_error(&err));
-        }
-
-        let attempt = QuicPeerStreamAttempt::new(self.runtime.clone(), rec, self.id());
-
-        Ok(Some(attempt))
+        let attempt = self
+            .accepted
+            .pop_front()
+            .map(|stream| QuicPeerStreamAttempt::new_ready(Some(stream), self.id()));
+        Ok(attempt)
     }
 
-    /// Accepts incoming receive streams, this will always return an [QuicReceiveStreamAttempt] even if
-    /// there are no pending streams.
-    ///
-    /// There's also a chance that an accept will successfully get a stream even if there aren't
-    /// any pending streams due to network timings.
-    ///
-    /// Returns an error if the async communication channel errors out due to being full.
+    /// Takes the oldest receive stream the peer opened, if any. Bidirectional
+    /// streams are left for [Self::accept_stream] and
+    /// [Self::accept_bidirectional_stream].
     pub fn accept_receive_stream(
         &mut self,
     ) -> Result<Option<QuicReceiveStreamAttempt>, ConnectionCommandError> {
-        if !self.pending_stream.swap(false) || !self.is_open() {
+        if !self.is_open() {
             return Ok(None);
         }
 
-        let (send, rec) = oneshot::channel();
-
-        let cmd = ConnectionCommand::AcceptReceive { respond_to: send };
-        let send_res = self.conn_command_channel.try_send(cmd);
-
-        if let Err(err) = send_res {
-            return Err(ConnectionCommandError::from_send_error(&err));
-        }
-
-        let attempt = QuicReceiveStreamAttempt::new(self.runtime.clone(), rec, self.id());
-
-        Ok(Some(attempt))
+        let index = self
+            .accepted
+            .iter()
+            .position(|stream| matches!(stream, QuicPeerStream::Receive(_)));
+        let attempt = match index.and_then(|i| self.accepted.remove(i)) {
+            Some(QuicPeerStream::Receive(recv)) => {
+                Some(QuicReceiveStreamAttempt::new_ready(Some(recv), self.id()))
+            }
+            _ => None,
+        };
+        Ok(attempt)
     }
 
-    /// Accepts incoming bidirectional streams, this will always return an [QuicBidirectionalStreamAttempt] even if
-    /// there are no pending streams.
-    ///
-    /// There's also a chance that an accept will successfully get a stream even if there aren't
-    /// any pending streams due to network timings.
-    ///
-    /// Returns an error if the async communication channel errors out due to being full.
+    /// Takes the oldest bidirectional stream the peer opened, if any. Receive
+    /// streams are left for [Self::accept_stream] and
+    /// [Self::accept_receive_stream].
     pub fn accept_bidirectional_stream(
         &mut self,
     ) -> Result<Option<QuicBidirectionalStreamAttempt>, ConnectionCommandError> {
-        if !self.pending_stream.swap(false) || !self.is_open() {
+        if !self.is_open() {
             return Ok(None);
         }
 
-        let (send, rec) = oneshot::channel();
-
-        let cmd = ConnectionCommand::AcceptBidirectional { respond_to: send };
-        let send_res = self.conn_command_channel.try_send(cmd);
-
-        if let Err(err) = send_res {
-            return Err(ConnectionCommandError::from_send_error(&err));
-        }
-
-        let attempt =
-            QuicBidirectionalStreamAttempt::new(self.runtime.clone(), rec, self.id());
-
-        Ok(Some(attempt))
+        let index = self
+            .accepted
+            .iter()
+            .position(|stream| matches!(stream, QuicPeerStream::Bidirectional(..)));
+        let attempt = match index.and_then(|i| self.accepted.remove(i)) {
+            Some(QuicPeerStream::Bidirectional(recv, send)) => Some(
+                QuicBidirectionalStreamAttempt::new_ready(Some((recv, send)), self.id()),
+            ),
+            _ => None,
+        };
+        Ok(attempt)
     }
 
-    /// Attempts to open a new bidirectional stream to be accepted by the remote peer.
+    /// Opens a new bidirectional stream. If the peer's stream limit is
+    /// reached, the attempt waits until the peer allows more.
+    ///
+    /// Returns [ConnectionCommandError::Closed] if the connection is closed.
     pub fn open_bidrectional_stream(
         &mut self,
     ) -> Result<QuicBidirectionalStreamAttempt, ConnectionCommandError> {
-        let task = ConnectionHandleTask::new(
-            self.conn_handle.clone(),
-            self.spawner.clone(),
-            self.is_open.clone(),
-            self.connection_id,
-        );
-
-        let join = self.runtime.spawn(task.open_bidirectional());
-
-        Ok(QuicBidirectionalStreamAttempt::new(
-            self.runtime.clone(),
-            join,
-            self.id(),
-        ))
+        let request = self.open(Dir::Bi)?;
+        Ok(QuicBidirectionalStreamAttempt::new_open(request, self.id()))
     }
 
-    /// Attempts to open a new send stream to be accepted by the remote peer.
+    /// Opens a new send stream. If the peer's stream limit is reached, the
+    /// attempt waits until the peer allows more.
+    ///
+    /// Returns [ConnectionCommandError::Closed] if the connection is closed.
     pub fn open_send_stream(
         &mut self,
     ) -> Result<QuicSendStreamAttempt, ConnectionCommandError> {
-        let task = ConnectionHandleTask::new(
-            self.conn_handle.clone(),
-            self.spawner.clone(),
-            self.is_open.clone(),
-            self.connection_id,
-        );
-
-        let join = self.runtime.spawn(task.open_send());
-
-        Ok(QuicSendStreamAttempt::new(
-            self.runtime.clone(),
-            join,
-            self.id(),
-        ))
+        let request = self.open(Dir::Uni)?;
+        Ok(QuicSendStreamAttempt::new_open(request, self.id()))
     }
 
-    #[tracing::instrument(skip(self), fields(connection_id = %self.connection_id, remote_addr = ?self.conn_handle.remote_addr()))]
+    fn open(&mut self, dir: Dir) -> Result<OpenRequest, ConnectionCommandError> {
+        if !self.is_open() {
+            return Err(ConnectionCommandError::Closed);
+        }
+
+        let request = self.next_request;
+        self.next_request += 1;
+        self.link.send(Command::OpenStream {
+            conn: self.conn,
+            dir,
+            request,
+        });
+        Ok(OpenRequest::new(self.link.clone(), self.conn, request))
+    }
+
+    /// Closes the connection, sending `code` to the peer. Data queued on its
+    /// streams that hasn't been sent yet is lost: close or finish the streams
+    /// and wait for them to close first to deliver it.
     pub fn close(&self, code: AppErrorCode) {
         if !self.is_open() {
             return;
         }
 
-        let res = self
-            .conn_command_channel
-            .try_send(ConnectionCommand::Close(code));
-
-        let Err(err) = res else {
-            return;
-        };
-
-        match err {
-            mpsc::error::TrySendError::Full(_) => {
-                error!(
-                    "Unable to normally close connection due to full communication channel. Forcefully closing connection..."
-                );
-            }
-            mpsc::error::TrySendError::Closed(_) => error!(
-                "Connection command channel is closed but our connection is still open? Something has gone horribly wrong, this is a bug. Forcefully closing connection..."
-            ),
-        }
-
-        self.conn_handle.close(to_s2n_code(code));
+        self.closing.store(true, Ordering::Relaxed);
+        self.link.send(Command::Close {
+            conn: self.conn,
+            code,
+            reason: Bytes::new(),
+        });
     }
 
     /// Returns true if the connection is still open.
     pub fn is_open(&self) -> bool {
-        !self.task_state.is_finished() && self.is_open.get()
+        self.lost.is_none() && !self.closing.load(Ordering::Relaxed)
     }
 
-    /// Returns true if calling [accept_stream][Self::accept_stream()] will return something different.
-    /// This doesn't necessarily mean there's a pending connection, just that
-    /// calling accept() will return something different.
-    ///
-    /// This flag will always return true, if [accept_stream][Self::accept_stream()]
-    /// hasn't been called yet. This is because the waker isn't registered until accept
-    /// is called.
-    ///
-    /// This also doesn't necessarily mean the [accept_bidirectional_stream][Self::accept_bidirectional_stream()]
-    /// and [accept_receive_stream][Self::accept_receive_stream()] will both return something new.
-    ///
-    /// This flag is set when any stream arrives, so the specific variants *could* be
-    /// a receive stream, bidirectional stream, or it could be an error.
+    /// Returns true if [accept_stream][Self::accept_stream()] has a stream to
+    /// return.
     #[deprecated(
         since = "0.18.3",
         note = "Unnecessary since now all accept functions do this check internally and do so with atomic correctness. Resolves a bug and gets rid of unnecessary API."
     )]
     pub fn should_poll_accept(&self) -> bool {
-        self.pending_stream.get() && self.is_open()
+        !self.accepted.is_empty() && self.is_open()
     }
 
-    /// Gets the disconnect reason if the stream has closed.
-    /// Returns `None` if the stream is still open.
+    /// Gets the disconnect reason if the connection has closed.
+    /// Returns `None` if the connection is still open.
     pub fn get_disconnect_reason(&mut self) -> Option<ConnectionDisconnectReason> {
-        self.task_state.get_disconnect_reason()
+        self.lost
+            .clone()
+            .map(ConnectionDisconnectReason::ConnectionError)
+    }
+
+    /// The peer's address.
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    /// The connection's statistics.
+    pub fn stats(&self) -> ConnectionStats {
+        self.stats
+    }
+
+    /// The current estimate of the round-trip time.
+    pub fn rtt(&self) -> Duration {
+        self.stats.rtt
+    }
+
+    /// The largest UDP payload the path currently supports. Grows as path MTU
+    /// discovery finds larger sizes.
+    pub fn current_mtu(&self) -> u16 {
+        self.stats.current_mtu
     }
 
     /// Gets the ID information for the parent client or server for this connection
@@ -338,4 +315,28 @@ impl QuicConnection {
     pub fn id(&self) -> ConnectionId {
         self.connection_id
     }
+}
+
+impl Drop for QuicConnection {
+    fn drop(&mut self) {
+        if self.is_open() {
+            self.link.send(Command::Close {
+                conn: self.conn,
+                code: AppErrorCode::UNKNOWN,
+                reason: Bytes::new(),
+            });
+        }
+        self.link.notify(Notice::ConnReleased { conn: self.conn });
+    }
+}
+
+/// Errors from asking a connection to do something.
+#[derive(Debug, Error, Clone, Copy)]
+pub enum ConnectionCommandError {
+    /// No longer returned: commands aren't limited.
+    #[error("The connection's command queue is full.")]
+    Full,
+    /// The connection is closed.
+    #[error("The connection is closed.")]
+    Closed,
 }

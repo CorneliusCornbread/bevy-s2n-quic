@@ -12,13 +12,13 @@ use std::{
         Arc,
         mpsc::{Receiver, Sender, TryRecvError},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
-    self as proto, ConnectionHandle, DatagramEvent, Incoming, ReadError, StreamEvent, VarInt,
-    WriteError,
+    self as proto, ConnectionHandle, DatagramEvent, Incoming, ReadError, StreamEvent,
+    VarInt, WriteError,
 };
 use quinn_udp::{BATCH_SIZE, RecvMeta};
 use slab::Slab;
@@ -29,11 +29,13 @@ use crate::{
 };
 
 use super::{
-    config::{EndpointSetup, Role, connection_error, from_varint, to_varint},
+    config::{
+        EndpointSetup, Role, connection_error, connection_stats, from_varint, to_varint,
+    },
     io::{Io, Socket},
     protocol::{
-        Command, ConnId, Dir, EndpointId, Event, IdAllocator, RecvBudget, SendBudget, StreamId,
-        StreamInfo,
+        Command, ConnId, Dir, EndpointId, Event, IdAllocator, RecvBudget, SendBudget,
+        StreamId, StreamInfo,
     },
 };
 
@@ -50,6 +52,9 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 64;
 /// refusals) kept while a socket is blocked. Past this they're dropped; the
 /// peer retries.
 const MAX_QUEUED_RESPONSES: usize = 1024;
+
+/// How often an active connection reports [`Event::Stats`].
+pub(super) const STATS_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) struct Core<I: Io> {
     io: I,
@@ -68,6 +73,10 @@ pub(crate) struct Core<I: Io> {
     next_generation: u64,
     /// Connections to drive this turn.
     dirty: Vec<usize>,
+    /// Connections driven since stats were last reported, and when to report
+    /// them next.
+    stats_due: Vec<usize>,
+    next_stats: Option<Instant>,
     /// `BATCH_SIZE` receive buffers of `recv_stride` bytes each.
     recv_buf: Vec<u8>,
     recv_stride: usize,
@@ -101,6 +110,8 @@ struct Conn {
     dirty: bool,
     /// `ConnectionLost` has been sent; nothing else will be.
     lost: bool,
+    /// In `Core::stats_due`.
+    stats_due: bool,
     streams: HashMap<proto::StreamId, StreamState>,
     /// `OpenStream` requests waiting for the peer's stream limit, by [`Dir`].
     pending_opens: [VecDeque<u64>; 2],
@@ -165,6 +176,8 @@ impl<I: Io> Core<I> {
             timers: BinaryHeap::new(),
             next_generation: 0,
             dirty: Vec::new(),
+            stats_due: Vec::new(),
+            next_stats: None,
             recv_buf: Vec::new(),
             recv_stride: 0,
             send_buf: Vec::new(),
@@ -182,6 +195,7 @@ impl<I: Io> Core<I> {
         self.receive();
         self.expire_timers();
         self.drive_dirty();
+        self.report_stats();
         self.reap_endpoints();
         true
     }
@@ -194,7 +208,11 @@ impl<I: Io> Core<I> {
     /// When the earliest timer fires. May be earlier than needed; a turn
     /// then finds nothing to do.
     pub fn next_timeout(&self) -> Option<Instant> {
-        self.timers.peek().map(|Reverse((at, _, _))| *at)
+        let timer = self.timers.peek().map(|Reverse((at, _, _))| *at);
+        match (timer, self.next_stats) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Records readiness reported for an endpoint's socket.
@@ -269,6 +287,11 @@ impl<I: Io> Core<I> {
                 setup,
             } => self.open_endpoint(endpoint, socket, *setup),
             Command::CloseEndpoint { endpoint } => self.close_endpoint(endpoint, now),
+            Command::ReleaseEndpoint { endpoint } => {
+                if let Some(&key) = self.endpoint_keys.get(&endpoint) {
+                    self.endpoints[key].closing = true;
+                }
+            }
             Command::Connect {
                 endpoint,
                 conn,
@@ -296,7 +319,8 @@ impl<I: Io> Core<I> {
                 };
                 let c = &mut self.conns[key];
                 let id = to_proto_stream(stream);
-                let Some(send) = c.streams.get_mut(&id).and_then(|s| s.send.as_mut()) else {
+                let Some(send) = c.streams.get_mut(&id).and_then(|s| s.send.as_mut())
+                else {
                     return;
                 };
                 if data.is_empty() {
@@ -315,7 +339,8 @@ impl<I: Io> Core<I> {
                 };
                 let c = &mut self.conns[key];
                 let id = to_proto_stream(stream);
-                let Some(send) = c.streams.get_mut(&id).and_then(|s| s.send.as_mut()) else {
+                let Some(send) = c.streams.get_mut(&id).and_then(|s| s.send.as_mut())
+                else {
                     return;
                 };
 
@@ -420,7 +445,13 @@ impl<I: Io> Core<I> {
         }
     }
 
-    fn connect(&mut self, endpoint: EndpointId, conn: ConnId, connect: &Connect, now: Instant) {
+    fn connect(
+        &mut self,
+        endpoint: EndpointId,
+        conn: ConnId,
+        connect: &Connect,
+        now: Instant,
+    ) {
         let fail = |core: &Self, reason: &str| {
             core.emit(Event::ConnectionLost {
                 conn,
@@ -475,6 +506,7 @@ impl<I: Io> Core<I> {
             timer: None,
             dirty: false,
             lost: false,
+            stats_due: false,
             streams: HashMap::new(),
             pending_opens: Default::default(),
             pending_reads: Vec::new(),
@@ -487,7 +519,13 @@ impl<I: Io> Core<I> {
         key
     }
 
-    fn close_conn(&mut self, key: usize, code: AppErrorCode, reason: Bytes, now: Instant) {
+    fn close_conn(
+        &mut self,
+        key: usize,
+        code: AppErrorCode,
+        reason: Bytes,
+        now: Instant,
+    ) {
         let c = &mut self.conns[key];
         c.inner.close(now, to_varint(code), reason);
         c.streams.clear();
@@ -536,7 +574,8 @@ impl<I: Io> Core<I> {
                 Ok(count) => {
                     for (i, meta) in meta.iter().take(count).enumerate() {
                         let start = i * self.recv_stride;
-                        let mut data = BytesMut::from(&self.recv_buf[start..start + meta.len]);
+                        let mut data =
+                            BytesMut::from(&self.recv_buf[start..start + meta.len]);
                         while !data.is_empty() {
                             let datagram = data.split_to(meta.stride.min(data.len()));
                             self.handle_datagram(key, meta, datagram);
@@ -552,7 +591,10 @@ impl<I: Io> Core<I> {
                 // receive. It says nothing about the socket itself.
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
                 Err(e) => {
-                    tracing::warn!("receive failed on endpoint {}: {e}", self.endpoints[key].id.0);
+                    tracing::warn!(
+                        "receive failed on endpoint {}: {e}",
+                        self.endpoints[key].id.0
+                    );
                     self.endpoints[key].readable = false;
                     return;
                 }
@@ -578,7 +620,9 @@ impl<I: Io> Core<I> {
                     self.mark_dirty(key);
                 }
             }
-            Some(DatagramEvent::NewConnection(incoming)) => self.accept(ep_key, incoming, now),
+            Some(DatagramEvent::NewConnection(incoming)) => {
+                self.accept(ep_key, incoming, now)
+            }
             Some(DatagramEvent::Response(transmit)) => {
                 let buf = mem::take(&mut self.send_buf);
                 self.send_response(ep_key, &transmit, &buf);
@@ -691,6 +735,35 @@ impl<I: Io> Core<I> {
                 self.timers.push(Reverse((at, key, c.generation)));
             }
         }
+
+        if !c.lost && !c.stats_due {
+            c.stats_due = true;
+            self.stats_due.push(key);
+            self.next_stats.get_or_insert(now + STATS_INTERVAL);
+        }
+    }
+
+    fn report_stats(&mut self) {
+        let now = self.io.now();
+        if !self.next_stats.is_some_and(|at| at <= now) {
+            return;
+        }
+        self.next_stats = None;
+
+        for key in self.stats_due.drain(..) {
+            // The key may have been reused by a newer connection, which is
+            // reported if it's due too.
+            let Some(c) = self.conns.get_mut(key).filter(|c| c.stats_due) else {
+                continue;
+            };
+            c.stats_due = false;
+            if !c.lost {
+                let _ = self.events.send(Event::Stats {
+                    conn: c.id,
+                    stats: connection_stats(&c.inner),
+                });
+            }
+        }
     }
 
     fn poll_conn_events(&mut self, key: usize) {
@@ -704,7 +777,13 @@ impl<I: Io> Core<I> {
         while let Some(event) = c.inner.poll() {
             match event {
                 proto::Event::HandshakeDataReady => {}
-                proto::Event::Connected => emit(Event::Connected { conn }),
+                proto::Event::Connected => {
+                    emit(Event::Stats {
+                        conn,
+                        stats: connection_stats(&c.inner),
+                    });
+                    emit(Event::Connected { conn });
+                }
                 proto::Event::ConnectionLost { reason } => {
                     c.streams.clear();
                     c.pending_opens = Default::default();
@@ -723,9 +802,13 @@ impl<I: Io> Core<I> {
                         emit(Event::StreamAccepted { conn, stream });
                     }
                 }
-                proto::Event::Stream(StreamEvent::Readable { id }) => c.pending_reads.push(id),
+                proto::Event::Stream(StreamEvent::Readable { id }) => {
+                    c.pending_reads.push(id)
+                }
                 proto::Event::Stream(StreamEvent::Writable { id }) => {
-                    if let Some(send) = c.streams.get_mut(&id).and_then(|s| s.send.as_mut()) {
+                    if let Some(send) =
+                        c.streams.get_mut(&id).and_then(|s| s.send.as_mut())
+                    {
                         send.blocked = false;
                         write_queue(&mut c.inner, id, send);
                     }
@@ -825,7 +908,8 @@ impl<I: Io> Core<I> {
             }
 
             self.send_buf.clear();
-            let Some(transmit) = c.inner.poll_transmit(now, max_segments, &mut self.send_buf)
+            let Some(transmit) =
+                c.inner.poll_transmit(now, max_segments, &mut self.send_buf)
             else {
                 return;
             };
@@ -1090,7 +1174,10 @@ fn read_stream(events: &Sender<Event>, c: &mut Conn, id: proto::StreamId) {
     let _ = events.send(event);
 }
 
-fn udp_transmit<'a>(transmit: &proto::Transmit, contents: &'a [u8]) -> quinn_udp::Transmit<'a> {
+fn udp_transmit<'a>(
+    transmit: &proto::Transmit,
+    contents: &'a [u8],
+) -> quinn_udp::Transmit<'a> {
     quinn_udp::Transmit {
         destination: transmit.destination,
         ecn: transmit

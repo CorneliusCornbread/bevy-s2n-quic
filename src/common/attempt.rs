@@ -1,121 +1,192 @@
 use bevy::ecs::component::Component;
-use std::{error::Error, sync::Arc, time::SystemTime};
+use std::{sync::Arc, time::SystemTime};
 use thiserror::Error as ThisError;
-use tokio::{
-    runtime::Handle,
-    sync::oneshot::{self, error::TryRecvError},
-    task::JoinHandle,
-};
 
 use crate::{
-    backend::s2n::from_s2n_connection_error,
-    common::{QuicParentId, error::ConnectionError},
+    common::{
+        QuicParentId,
+        connection::QuicConnection,
+        error::ConnectionError,
+        router::{ConnDelivery, Notice, OpenResult, StreamObjects},
+        runtime::Link,
+    },
+    driver::ConnId,
 };
 
-/// This is a the trait which allows us to implement
-/// async attempt behaviour on any provider (e.g.)
-/// a [oneshot::Receiver] or [JoinHandle] have default
-/// implementations.
+/// An action that completes on the network thread, such as connecting or
+/// opening a stream. Check it with
+/// [attempt_result][QuicActionAttempt::attempt_result()].
 ///
-/// See [QuicActionAttempt] for more details.
-pub(crate) trait TaskResult<T> {
-    fn resolve_result(&mut self, handle: &Handle) -> Option<Result<T, TaskError>>;
-}
-
-impl<T> TaskResult<T> for oneshot::Receiver<Result<T, TaskError>> {
-    fn resolve_result(&mut self, _handle: &Handle) -> Option<Result<T, TaskError>> {
-        if self.is_empty() {
-            return None;
-        }
-
-        match self.try_recv() {
-            Ok(res) => Some(res),
-            Err(e) => match e {
-                TryRecvError::Empty => None,
-                TryRecvError::Closed => Some(Err(TaskError::TaskFailed(Arc::new(e)))),
-            },
-        }
-    }
-}
-
-impl<T> TaskResult<T> for JoinHandle<Result<T, TaskError>> {
-    fn resolve_result(&mut self, handle: &Handle) -> Option<Result<T, TaskError>> {
-        if !self.is_finished() {
-            return None;
-        }
-
-        let join = handle.block_on(self);
-
-        match join {
-            Ok(res) => Some(res),
-            Err(e) => Some(Err(TaskError::TaskFailed(Arc::new(e)))),
-        }
-    }
-}
-
-/// This is the structure which represents the async task
-/// being attempted and waited upon via sync polling with
-/// [attempt_result][QuicActionAttempt::attempt_result()]
+/// Attempts are resolved once per frame, in
+/// [IoSystems::Poll](https://docs.rs/aeronet_io/latest/aeronet_io/enum.IoSystems.html).
 pub struct QuicActionAttempt<T, I>
 where
     I: Copy,
 {
-    runtime: Handle,
-    task_res: Box<dyn TaskResult<T> + Send + Sync>,
-    /// A flag checking if the action state has returned a success value already
-    returned_value: Option<QuicActionError>,
+    state: AttemptState<T>,
     id: I,
+}
+
+enum AttemptState<T> {
+    /// A client connection that hasn't finished its handshake.
+    Connecting(Box<QuicConnection>),
+    /// A stream open request the driver hasn't answered.
+    Opening(OpenRequest),
+    Ready(Result<T, QuicActionError>),
+    /// The result was taken. Holds what to return from now on.
+    Done(QuicActionError),
 }
 
 impl<T, I> QuicActionAttempt<T, I>
 where
     I: Copy,
 {
-    pub(crate) fn new(
-        runtime: Handle,
-        task: impl TaskResult<T> + 'static + Send + Sync,
-        id: I,
-    ) -> Self {
+    pub(crate) fn new_ready(value: T, id: I) -> Self {
         Self {
-            runtime,
-            task_res: Box::new(task),
-            returned_value: None,
+            state: AttemptState::Ready(Ok(value)),
+            id,
+        }
+    }
+
+    pub(crate) fn new_open(request: OpenRequest, id: I) -> Self {
+        Self {
+            state: AttemptState::Opening(request),
             id,
         }
     }
 
     /// Attempt to get the result
     pub fn attempt_result(&mut self) -> Result<T, QuicActionError> {
-        if let Some(ret) = &self.returned_value {
-            return Err(ret.clone());
-        }
-
-        let value = self.task_res.resolve_result(&self.runtime);
-
-        let Some(res) = value else {
-            return Err(QuicActionError::Pending);
-        };
-
-        match res {
-            Ok(value) => {
-                self.returned_value = Some(QuicActionError::Consumed);
-                Ok(value)
+        match &self.state {
+            AttemptState::Connecting(_) | AttemptState::Opening(_) => {
+                return Err(QuicActionError::Pending);
             }
-            Err(e) => match e {
-                TaskError::ConnectionFailed(err) => {
-                    self.returned_value = Some(QuicActionError::ConnectionFailed(err));
-                    Err(self.returned_value.as_ref().unwrap().clone())
-                }
-                TaskError::TaskFailed(err) => {
-                    self.returned_value = Some(QuicActionError::Crashed(Arc::new(err)));
-                    Err(self.returned_value.as_ref().unwrap().clone())
-                }
-            },
+            AttemptState::Done(error) => return Err(error.clone()),
+            AttemptState::Ready(_) => {}
         }
+
+        let AttemptState::Ready(result) = std::mem::replace(
+            &mut self.state,
+            AttemptState::Done(QuicActionError::Consumed),
+        ) else {
+            unreachable!("checked above");
+        };
+        if let Err(error) = &result {
+            self.state = AttemptState::Done(error.clone());
+        }
+        result
     }
 
     pub fn id(&self) -> I {
         self.id
+    }
+
+    /// The open request this attempt is waiting on, if any.
+    pub(crate) fn opening(&self) -> Option<(ConnId, u64)> {
+        match &self.state {
+            AttemptState::Opening(request) => Some((request.conn, request.request)),
+            _ => None,
+        }
+    }
+
+    fn resolve(&mut self, result: Result<T, QuicActionError>) {
+        if let AttemptState::Opening(request) = &mut self.state {
+            request.armed = false;
+        }
+        self.state = AttemptState::Ready(result);
+    }
+}
+
+impl<I: Copy> QuicActionAttempt<QuicConnection, I> {
+    pub(crate) fn new_connect(conn: QuicConnection, id: I) -> Self {
+        Self {
+            state: AttemptState::Connecting(Box::new(conn)),
+            id,
+        }
+    }
+
+    /// The connection this attempt is waiting on, if any.
+    pub(crate) fn connecting(&self) -> Option<ConnId> {
+        match &self.state {
+            AttemptState::Connecting(conn) => Some(conn.conn()),
+            _ => None,
+        }
+    }
+
+    /// Applies what arrived for the connection, and resolves the attempt
+    /// once it has connected or failed.
+    pub(crate) fn deliver(&mut self, deliveries: Vec<ConnDelivery>) {
+        let AttemptState::Connecting(conn) = &mut self.state else {
+            return;
+        };
+        for delivery in deliveries {
+            conn.deliver(delivery);
+        }
+
+        if let Some(reason) = conn.lost_reason() {
+            let error = QuicActionError::ConnectionFailed(reason.clone());
+            self.resolve(Err(error));
+        } else if conn.is_connected() {
+            let AttemptState::Connecting(conn) = std::mem::replace(
+                &mut self.state,
+                AttemptState::Done(QuicActionError::Consumed),
+            ) else {
+                unreachable!("checked above");
+            };
+            self.resolve(Ok(*conn));
+        }
+    }
+}
+
+impl<S, I: Copy> QuicActionAttempt<Option<S>, I> {
+    /// Resolves an open attempt. `take` picks this attempt's stream out of
+    /// the opened objects; any it doesn't take are dropped, which releases
+    /// them.
+    pub(crate) fn resolve_open(
+        &mut self,
+        result: OpenResult,
+        take: impl FnOnce(StreamObjects) -> Option<S>,
+    ) {
+        let result = match result {
+            OpenResult::Opened(objects) => take(*objects).map(Some).ok_or_else(|| {
+                QuicActionError::ConnectionFailed(ConnectionError::Transport(
+                    "the stream opened in the wrong direction".to_owned(),
+                ))
+            }),
+            OpenResult::Failed(reason) => Err(QuicActionError::ConnectionFailed(reason)),
+        };
+        self.resolve(result);
+    }
+}
+
+/// A stream open request sent to the driver. Dropping it before the stream
+/// opens tells the router to release the stream when it does.
+pub(crate) struct OpenRequest {
+    link: Link,
+    conn: ConnId,
+    request: u64,
+    armed: bool,
+}
+
+impl OpenRequest {
+    pub(crate) fn new(link: Link, conn: ConnId, request: u64) -> Self {
+        Self {
+            link,
+            conn,
+            request,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for OpenRequest {
+    fn drop(&mut self) {
+        if self.armed {
+            self.link.notify(Notice::OpenCancelled {
+                conn: self.conn,
+                request: self.request,
+            });
+        }
     }
 }
 
@@ -132,22 +203,6 @@ pub enum QuicActionError {
     ConnectionFailed(ConnectionError),
     #[error("Crashed: {0}")]
     Crashed(Arc<dyn std::error::Error + Send + Sync>),
-}
-
-/// An enum representing all the ways a [TaskResult] can fail.
-#[derive(Clone, Debug, ThisError)]
-#[error("Quic task failed")]
-pub(crate) enum TaskError {
-    #[error("ConnectionFailed: {0}")]
-    ConnectionFailed(ConnectionError),
-    #[error("Crashed: {0}")]
-    TaskFailed(Arc<dyn Error + Send + Sync>),
-}
-
-impl From<s2n_quic::connection::Error> for TaskError {
-    fn from(value: s2n_quic::connection::Error) -> Self {
-        Self::ConnectionFailed(from_s2n_connection_error(value))
-    }
 }
 
 /// This is a Bevy component which is added to an entity

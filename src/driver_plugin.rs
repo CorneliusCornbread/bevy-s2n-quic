@@ -1,17 +1,30 @@
 use std::sync::Arc;
 
-use bevy::app::Plugin;
+use aeronet_io::IoSystems;
+use bevy::{
+    app::{Last, Plugin, PreUpdate},
+    ecs::schedule::IntoScheduleConfigs,
+};
 
-use crate::common::runtime::{QuicRuntime, RuntimeOptions, ThreadStartHook};
+use crate::common::{
+    router::{DriverRouter, flush_driver_commands, poll_driver_events},
+    runtime::{QuicRuntime, RuntimeOptions, ThreadStartHook},
+};
 
-/// Plugin which inserts the [QuicRuntime] resource.
+/// Plugin which inserts the [QuicRuntime] resource and moves data between it
+/// and the QUIC components.
 ///
-/// This will default to using 25% of the available logical processors for
-/// network threads, with no limit on the number of connections and streams.
+/// Events from the network threads are applied to components once per frame,
+/// in [IoSystems::Poll] in `PreUpdate`. Commands from components (data to
+/// send, closes, new streams) are handed to the network threads at the end of
+/// the frame, in `Last`, with at most one wake per thread.
+///
+/// This will default to [QuicRuntime::default_thread_count] network threads,
+/// with no limit on the number of connections.
 #[derive(Default)]
 pub struct QuicDriverPlugin {
     threads: Option<usize>,
-    max_tasks: Option<usize>,
+    max_connections: Option<usize>,
     thread_name: Option<String>,
     on_thread_start: Option<ThreadStartHook>,
 }
@@ -20,10 +33,13 @@ impl Plugin for QuicDriverPlugin {
     fn build(&self, app: &mut bevy::prelude::App) {
         app.insert_resource(QuicRuntime::with_options(RuntimeOptions {
             threads: self.threads,
-            max_tasks: self.max_tasks,
+            max_connections: self.max_connections,
             thread_name: self.thread_name.clone(),
             on_thread_start: self.on_thread_start.clone(),
-        }));
+        }))
+        .init_resource::<DriverRouter>()
+        .add_systems(PreUpdate, poll_driver_events.in_set(IoSystems::Poll))
+        .add_systems(Last, flush_driver_commands);
     }
 }
 
@@ -36,14 +52,12 @@ impl QuicDriverPlugin {
         self
     }
 
-    /// Limits how many connections and streams can be open at once.
-    ///
-    /// Once the limit is reached, new connections and streams are closed with
-    /// [StatusCode::ServiceUnavailable][crate::common::status_code::StatusCode::ServiceUnavailable]
-    /// and report
-    /// [ConnectionDisconnectReason::OrchestratorError][crate::common::connection::disconnect::ConnectionDisconnectReason::OrchestratorError].
-    pub fn with_max_tasks(mut self, max_tasks: usize) -> Self {
-        self.max_tasks = Some(max_tasks);
+    /// Limits how many connections each server has open at once. Past the
+    /// limit, new connections are refused, and the client's
+    /// [QuicConnectionAttempt][crate::common::connection::QuicConnectionAttempt]
+    /// fails.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections);
         self
     }
 
@@ -82,54 +96,66 @@ impl QuicDriverPlugin {
 mod tests {
     use super::*;
     use bevy::app::App;
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::Mutex,
+        time::{Duration, Instant},
     };
 
-    fn thread_name(runtime: &QuicRuntime) -> Option<String> {
-        let handle = runtime.handle();
-        let task =
-            handle.spawn(async { std::thread::current().name().map(str::to_owned) });
-        handle.block_on(task).unwrap()
+    /// Waits until `count` network threads have recorded something.
+    fn wait_for<T: Clone>(records: &Mutex<Vec<T>>, count: usize) -> Vec<T> {
+        let start = Instant::now();
+        loop {
+            let records = records.lock().unwrap();
+            if records.len() >= count {
+                return records.clone();
+            }
+            drop(records);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "threads didn't start"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
     fn sets_thread_count_and_name() {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let record = names.clone();
+
         let mut app = App::new();
         app.add_plugins(
             QuicDriverPlugin::default()
                 .with_threads(3)
-                .with_thread_name("net"),
+                .with_thread_name("net")
+                .on_thread_start(move || {
+                    let name = std::thread::current().name().map(str::to_owned);
+                    record.lock().unwrap().push(name);
+                }),
         );
 
         let runtime = app.world().resource::<QuicRuntime>();
-        assert_eq!(runtime.handle().metrics().num_workers(), 3);
-        assert_eq!(thread_name(runtime).as_deref(), Some("net"));
+        assert_eq!(runtime.thread_count(), 3);
+        assert_eq!(wait_for(&names, 3), vec![Some("net".to_owned()); 3]);
     }
 
     #[test]
     fn thread_start_hooks_run_in_order() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let (first, second) = (order.clone(), order.clone());
-        let started = Arc::new(AtomicUsize::new(0));
-        let counter = started.clone();
 
         let mut app = App::new();
         app.add_plugins(
             QuicDriverPlugin::default()
                 .with_threads(1)
-                .on_thread_start(move || first.lock().unwrap().push(1))
+                .on_thread_start(move || first.lock().unwrap().push("first".to_owned()))
                 .on_thread_start(move || {
-                    second.lock().unwrap().push(2);
-                    counter.fetch_add(1, Ordering::Relaxed);
+                    let name =
+                        std::thread::current().name().unwrap_or_default().to_owned();
+                    second.lock().unwrap().push(name);
                 }),
         );
 
-        let runtime = app.world().resource::<QuicRuntime>();
-        assert_eq!(thread_name(runtime).as_deref(), Some("bevy-s2n-quic"));
-        // The worker that ran the task has started.
-        assert!(started.load(Ordering::Relaxed) >= 1);
-        assert_eq!(order.lock().unwrap()[..2], [1, 2]);
+        assert_eq!(wait_for(&order, 2), ["first", "bevy-s2n-quic"]);
     }
 }

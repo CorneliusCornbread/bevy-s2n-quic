@@ -1,16 +1,16 @@
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{collections::VecDeque, io, net::SocketAddr};
 
 use bevy::ecs::component::Component;
-use s2n_quic::Server;
-use tokio::runtime::Handle;
 
 use crate::{
-    backend::s2n::server_tls,
     common::{
-        QuicParentId, QuicParentType, connection::QuicConnection, runtime::QuicRuntime,
-        spawner::TaskSpawner,
+        QuicParentId, QuicParentType,
+        connection::QuicConnection,
+        router::Notice,
+        runtime::{Link, QuicRuntime},
     },
     config::{ConfigError, QuicServerConfig},
+    driver::{Command, EndpointId, EndpointSetup},
     server::marker::QuicServerMarker,
 };
 
@@ -20,13 +20,18 @@ pub mod marker;
 /// The component which manages an instance of a QuicServer.
 ///
 /// It is recommended you parent any [QuicConnection] to their related QuicServer entity.
+///
+/// Dropping the server stops it accepting connections. Connections it
+/// already accepted stay open.
 #[derive(Component)]
 #[require(QuicServerMarker)]
 pub struct QuicServer {
-    runtime: Handle,
-    server: Server,
+    link: Link,
+    endpoint: EndpointId,
+    local_addr: SocketAddr,
     id: QuicParentId,
-    spawner: TaskSpawner,
+    accepted: VecDeque<QuicConnection>,
+    closed: bool,
 }
 
 impl QuicServer {
@@ -40,76 +45,84 @@ impl QuicServer {
         bind_addr: SocketAddr,
         config: &QuicServerConfig,
     ) -> Result<Self, ConfigError> {
-        let handle = runtime.handle().clone();
-        let tls = server_tls(config)?;
-        let server = handle.block_on(build_server(bind_addr, tls))?;
-        let spawner = runtime.spawner().clone();
+        let setup = EndpointSetup::server(config, runtime.endpoint_options())?;
+        let link = runtime.link(runtime.pick_driver());
+        let id = QuicParentId::generate_unique(QuicParentType::Server);
+
+        // Registered first, so the router knows the server before any
+        // connection arrives.
+        let endpoint = link.driver.ids().endpoint();
+        link.notify(Notice::Endpoint {
+            endpoint,
+            parent: id,
+        });
+        let local_addr = match link.driver.open_endpoint(endpoint, bind_addr, setup) {
+            Ok(addr) => addr,
+            Err(e) => {
+                link.notify(Notice::EndpointReleased { endpoint });
+                return Err(e);
+            }
+        };
 
         Ok(Self {
-            runtime: handle,
-            server,
-            id: QuicParentId::generate_unique(QuicParentType::Server),
-            spawner,
+            link,
+            endpoint,
+            local_addr,
+            id,
+            accepted: VecDeque::new(),
+            closed: false,
         })
     }
 
-    /// Polls to receive any new pending connections
+    /// Takes the oldest connection that finished its handshake, if any.
     pub fn accept_connection(&mut self) -> ConnectionPoll {
-        let waker = Arc::new(futures::task::noop_waker_ref());
-        let mut cx = std::task::Context::from_waker(&waker);
-
-        let poll = self.server.poll_accept(&mut cx);
-
-        match poll {
-            std::task::Poll::Ready(conn_opt) => {
-                if let Some(conn) = conn_opt {
-                    ConnectionPoll::NewConnection(QuicConnection::new(
-                        self.runtime.clone(),
-                        self.spawner.clone(),
-                        conn,
-                        self.id,
-                    ))
-                } else {
-                    bevy::log::info!(
-                        "Server connection poll returned none, is our server not running?"
-                    );
-                    ConnectionPoll::ServerClosed
-                }
-            }
-            std::task::Poll::Pending => ConnectionPoll::None,
+        match self.accepted.pop_front() {
+            Some(connection) => ConnectionPoll::NewConnection(connection),
+            None if self.closed => ConnectionPoll::ServerClosed,
+            None => ConnectionPoll::None,
         }
     }
 
     /// The local address the server is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.server.local_addr()
+        Ok(self.local_addr)
     }
 
     pub fn id(&self) -> QuicParentId {
         self.id
     }
+
+    pub(crate) fn endpoint(&self) -> EndpointId {
+        self.endpoint
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    pub(crate) fn receive(&mut self, accepted: Vec<QuicConnection>, closed: bool) {
+        self.accepted.extend(accepted);
+        self.closed = closed;
+    }
+}
+
+impl Drop for QuicServer {
+    fn drop(&mut self) {
+        self.link.send(Command::ReleaseEndpoint {
+            endpoint: self.endpoint,
+        });
+        self.link.notify(Notice::EndpointReleased {
+            endpoint: self.endpoint,
+        });
+    }
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConnectionPoll {
     None,
     ServerClosed,
     NewConnection(QuicConnection),
-}
-
-async fn build_server(
-    addr: SocketAddr,
-    tls: s2n_quic_tls::Server,
-) -> Result<Server, ConfigError> {
-    let endpoint_error = |reason: String| ConfigError::Endpoint { addr, reason };
-
-    Server::builder()
-        .with_tls(tls)
-        .map_err(|e| ConfigError::Tls(e.to_string()))?
-        .with_io(addr)
-        .map_err(|e| endpoint_error(e.to_string()))?
-        .start()
-        .map_err(|e| endpoint_error(e.to_string()))
 }
 
 pub enum QuitReason {

@@ -758,7 +758,7 @@ fn loopback_transfer(total: usize, budget: usize) -> Transfer {
     let spawn = |name: &str| {
         Driver::spawn(DriverOptions {
             thread_name: Some(name.to_owned()),
-            on_thread_start: None,
+            ..DriverOptions::default()
         })
         .unwrap()
     };
@@ -767,11 +767,11 @@ fn loopback_transfer(total: usize, budget: usize) -> Transfer {
 
     let (_, addr) = server
         .handle()
-        .open_endpoint("127.0.0.1:0".parse().unwrap(), server_setup(&options))
+        .open_endpoint_new("127.0.0.1:0".parse().unwrap(), server_setup(&options))
         .unwrap();
     let (endpoint, _) = client
         .handle()
-        .open_endpoint("127.0.0.1:0".parse().unwrap(), client_setup(&options))
+        .open_endpoint_new("127.0.0.1:0".parse().unwrap(), client_setup(&options))
         .unwrap();
 
     let handle = client.handle();

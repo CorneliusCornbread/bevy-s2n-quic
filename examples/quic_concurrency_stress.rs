@@ -60,9 +60,10 @@
 /// - `interval p99` – wall-clock frame interval (`Time::delta`).
 /// - `cpu` – process CPU time (user + sys) during the measure window,
 ///   shown as cores used.
-/// - `tokio busy` – summed `worker_total_busy_duration` over all Tokio
-///   workers, shown as a fraction of `workers × wall time`.
-/// - `max gq` – maximum Tokio `global_queue_depth` sampled each frame.
+/// - `driver busy` – time the network threads spent handling work, summed
+///   over all of them, shown as a fraction of `threads × wall time`.
+/// - `wakes` – times the network threads were woken by the Bevy thread, per
+///   frame. At most one per thread.
 /// - `lost` – cumulative bytes sent minus bytes received after the drain.
 ///   Must be 0.
 ///
@@ -871,7 +872,6 @@ struct StressBench {
     window: Option<WindowStart>,
     frame_work_ms: Vec<f64>,
     frame_interval_ms: Vec<f64>,
-    max_global_queue: usize,
     streams_ready: usize,
     pending: Option<PhaseResult>,
 
@@ -911,7 +911,6 @@ impl StressBench {
             window: None,
             frame_work_ms: Vec::new(),
             frame_interval_ms: Vec::new(),
-            max_global_queue: 0,
             streams_ready: 0,
             pending: None,
             control: None,
@@ -947,12 +946,11 @@ impl StressBench {
     fn start_window(&mut self, runtime: &QuicRuntime) {
         self.frame_work_ms.clear();
         self.frame_interval_ms.clear();
-        self.max_global_queue = 0;
         self.window = Some(WindowStart {
             at: Instant::now(),
             cpu: process_cpu_time(),
-            tokio_busy: tokio_busy(runtime),
-            remote_schedules: remote_schedules(runtime),
+            driver_busy: driver_busy(runtime),
+            wakes: driver_wakes(runtime),
             bytes_sent: self.bytes_sent,
             bytes_received: self.bytes_received,
             send_full: self.send_full,
@@ -977,12 +975,9 @@ impl StressBench {
             frame_max_ms: percentile(&mut work, 1.0),
             interval_p99_ms: percentile(&mut interval, 0.99),
             cpu: process_cpu_time().saturating_sub(start.cpu),
-            tokio_busy: tokio_busy(runtime).saturating_sub(start.tokio_busy),
-            tokio_workers: backend::tokio_handle(runtime).metrics().num_workers(),
-            remote_schedules: remote_schedules(runtime)
-                .zip(start.remote_schedules)
-                .map(|(end, start)| end - start),
-            max_global_queue: self.max_global_queue,
+            driver_busy: driver_busy(runtime).saturating_sub(start.driver_busy),
+            drivers: runtime.thread_count(),
+            wakes: driver_wakes(runtime) - start.wakes,
             sent: self.bytes_sent - start.bytes_sent,
             received: self.bytes_received.saturating_sub(start.bytes_received),
             send_full: self.send_full - start.send_full,
@@ -1011,8 +1006,8 @@ impl StressBench {
 struct WindowStart {
     at: Instant,
     cpu: Duration,
-    tokio_busy: Duration,
-    remote_schedules: Option<u64>,
+    driver_busy: Duration,
+    wakes: u64,
     bytes_sent: u64,
     bytes_received: u64,
     send_full: u64,
@@ -1030,12 +1025,10 @@ struct PhaseResult {
     frame_max_ms: f64,
     interval_p99_ms: f64,
     cpu: Duration,
-    tokio_busy: Duration,
-    tokio_workers: usize,
-    /// Tasks scheduled from outside the Tokio workers during the window.
-    /// Only available with `--cfg tokio_unstable`.
-    remote_schedules: Option<u64>,
-    max_global_queue: usize,
+    driver_busy: Duration,
+    drivers: usize,
+    /// Times the network threads were woken during the window.
+    wakes: u64,
     sent: u64,
     received: u64,
     send_full: u64,
@@ -1198,7 +1191,7 @@ fn frame_begin(mut bench: ResMut<StressBench>) {
     bench.frame_start = Instant::now();
 }
 
-fn frame_end(time: Res<Time>, runtime: Res<QuicRuntime>, mut bench: ResMut<StressBench>) {
+fn frame_end(time: Res<Time>, mut bench: ResMut<StressBench>) {
     if bench.stage != Stage::Measure {
         return;
     }
@@ -1206,11 +1199,6 @@ fn frame_end(time: Res<Time>, runtime: Res<QuicRuntime>, mut bench: ResMut<Stres
     let work = bench.frame_start.elapsed().as_secs_f64() * 1000.0;
     bench.frame_work_ms.push(work);
     bench.frame_interval_ms.push(time.delta_secs_f64() * 1000.0);
-
-    let depth = backend::tokio_handle(&runtime)
-        .metrics()
-        .global_queue_depth();
-    bench.max_global_queue = bench.max_global_queue.max(depth);
 }
 
 // ─── Stage machine (--role both|clients) ─────────────────────────────────────
@@ -1664,29 +1652,20 @@ fn process_cpu_time() -> Duration {
     Duration::ZERO
 }
 
-/// Busy time summed over all Tokio workers.
-fn tokio_busy(runtime: &QuicRuntime) -> Duration {
-    let metrics = backend::tokio_handle(runtime).metrics();
-    (0..metrics.num_workers())
-        .map(|w| metrics.worker_total_busy_duration(w))
+/// Busy time summed over all network threads.
+fn driver_busy(runtime: &QuicRuntime) -> Duration {
+    backend::driver_metrics(runtime)
+        .iter()
+        .map(|m| m.busy)
         .sum()
 }
 
-/// Tasks scheduled onto the runtime from outside its worker threads, mostly
-/// wakes from the Bevy thread. Needs `RUSTFLAGS="--cfg tokio_unstable"`.
-fn remote_schedules(runtime: &QuicRuntime) -> Option<u64> {
-    #[cfg(tokio_unstable)]
-    return Some(
-        backend::tokio_handle(runtime)
-            .metrics()
-            .remote_schedule_count(),
-    );
-
-    #[cfg(not(tokio_unstable))]
-    {
-        let _ = runtime;
-        None
-    }
+/// Times the network threads were woken, summed over all of them.
+fn driver_wakes(runtime: &QuicRuntime) -> u64 {
+    backend::driver_metrics(runtime)
+        .iter()
+        .map(|m| m.wakes)
+        .sum()
 }
 
 fn mean(samples: &[f64]) -> f64 {
@@ -1712,7 +1691,7 @@ fn summary_line(r: &PhaseResult) -> String {
     let wall = r.wall.as_secs_f64();
     format!(
         "{:>4} clients {:<6} ({:>4} sending): frame avg {:.2}ms p99 {:.2}ms | \
-         cpu {:.2} cores | tokio busy {:.0}% | max gq {} | rx {}/s | lost {} B{}{}",
+         cpu {:.2} cores | driver busy {:.0}% | wakes {:.1}/frame | rx {}/s | lost {} B{}",
         r.phase.clients,
         r.phase.scenario.name(),
         r.senders,
@@ -1720,25 +1699,23 @@ fn summary_line(r: &PhaseResult) -> String {
         r.frame_p99_ms,
         r.cpu.as_secs_f64() / wall,
         busy_pct(r),
-        r.max_global_queue,
+        wakes_per_frame(r),
         fmt_bytes((r.received as f64 / wall) as u64),
         r.lost,
-        r.remote_schedules
-            .map(|n| format!(
-                " | remote wakes {:.0}/frame",
-                n as f64 / r.frames.max(1) as f64
-            ))
-            .unwrap_or_default(),
         if r.ok() { "" } else { "  [FAIL]" },
     )
 }
 
 fn busy_pct(r: &PhaseResult) -> f64 {
-    let capacity = r.wall.as_secs_f64() * r.tokio_workers as f64;
+    let capacity = r.wall.as_secs_f64() * r.drivers as f64;
     if capacity == 0.0 {
         return 0.0;
     }
-    100.0 * r.tokio_busy.as_secs_f64() / capacity
+    100.0 * r.driver_busy.as_secs_f64() / capacity
+}
+
+fn wakes_per_frame(r: &PhaseResult) -> f64 {
+    r.wakes as f64 / r.frames.max(1) as f64
 }
 
 /// Prints the markdown report to stdout (and `--out`). Returns `true` if
@@ -1783,8 +1760,8 @@ fn report(bench: &StressBench) -> bool {
     let _ = writeln!(
         md,
         "| clients | scenario | senders | ready | frames | frame avg ms | frame p99 ms \
-         | frame max ms | interval p99 ms | cpu cores | tokio busy (worker-s) | tokio busy % \
-         | max gq | sent | received | send full | lost B | ok |"
+         | frame max ms | interval p99 ms | cpu cores | driver busy (thread-s) | driver busy % \
+         | wakes/frame | sent | received | send full | lost B | ok |"
     );
     let _ = writeln!(
         md,
@@ -1796,7 +1773,7 @@ fn report(bench: &StressBench) -> bool {
         let _ = writeln!(
             md,
             "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} \
-             | {} | {} | {} | {} | {} | {} |",
+             | {:.1} | {} | {} | {} | {} | {} |",
             r.phase.clients,
             r.phase.scenario.name(),
             r.senders,
@@ -1807,9 +1784,9 @@ fn report(bench: &StressBench) -> bool {
             r.frame_max_ms,
             r.interval_p99_ms,
             r.cpu.as_secs_f64() / wall,
-            r.tokio_busy.as_secs_f64(),
+            r.driver_busy.as_secs_f64(),
             busy_pct(r),
-            r.max_global_queue,
+            wakes_per_frame(r),
             fmt_bytes(r.sent),
             fmt_bytes(r.received),
             r.send_full,
@@ -1820,23 +1797,6 @@ fn report(bench: &StressBench) -> bool {
 
     let ok = !bench.results.is_empty() && bench.results.iter().all(PhaseResult::ok);
     let _ = writeln!(md);
-
-    if bench.results.iter().any(|r| r.remote_schedules.is_some()) {
-        let _ = writeln!(md);
-        let _ = writeln!(md, "| clients | scenario | remote schedules | per frame |");
-        let _ = writeln!(md, "|---:|---|---:|---:|");
-        for r in &bench.results {
-            let n = r.remote_schedules.unwrap_or(0);
-            let _ = writeln!(
-                md,
-                "| {} | {} | {} | {:.0} |",
-                r.phase.clients,
-                r.phase.scenario.name(),
-                n,
-                n as f64 / r.frames.max(1) as f64,
-            );
-        }
-    }
 
     println!("\n{md}");
     let _ = std::io::stdout().flush();

@@ -25,7 +25,6 @@ use bevy_s2n_quic::{
         stream::{receive::QuicReceiveStream, send::QuicSendStream},
     },
     config::{QuicClientConfig, QuicServerConfig},
-    driver_plugin::QuicDriverPlugin,
     server::{QuicServer, marker::QuicServerMarker},
 };
 use bytes::Bytes;
@@ -41,7 +40,7 @@ const WORDS_PER_CHUNK: u64 = (CHUNK_SIZE / 8) as u64;
 const RECV_LIMIT: usize = 7;
 
 const TIMEOUT: Duration = Duration::from_secs(120);
-/// How long `send` must keep reporting a full channel to count as stalled.
+/// How long `send` must keep reporting a full buffer to count as stalled.
 const STALL_TIME: Duration = Duration::from_millis(500);
 
 /// Chunk `index` holds the little-endian u64 word indices it covers, so any
@@ -96,14 +95,9 @@ fn stream_delivers_all_data_in_order_under_backpressure() {
     let mut app = App::new();
     // Disconnected streams would be despawned, but this test reads their
     // disconnect reasons.
-    //
-    // Backpressure counts messages, not bytes. With more threads the receive
-    // channel and flow control window can absorb all 32 MiB, so the sender
-    // never stalls and the test fails.
     let plugins = QuicDefaultPlugins
         .build()
-        .disable::<DisconnectHandlerPlugin>()
-        .set(QuicDriverPlugin::default().with_threads(2));
+        .disable::<DisconnectHandlerPlugin>();
     app.add_plugins((MinimalPlugins, plugins));
     app.finish();
     app.cleanup();
@@ -154,8 +148,8 @@ fn stream_delivers_all_data_in_order_under_backpressure() {
         find::<(With<QuicReceiveStream>, With<QuicServerMarker>)>(world)
     });
 
-    // Send without reading until the whole pipeline stalls: the outbound
-    // channel, QUIC flow control and the inbound channel are all full. If the
+    // Send without reading until the whole pipeline stalls: the send buffer,
+    // QUIC flow control and the receive buffer are all full. If the
     // receiver dropped data instead of pushing back, this would never stall.
     let mut next = 1;
     let mut pending = Some(chunk(next));
@@ -237,8 +231,8 @@ fn stream_delivers_all_data_in_order_under_backpressure() {
             "received more bytes than were sent"
         );
 
-        // All data is in the channel before the task reports closed, so a
-        // drain after seeing it closed gets everything.
+        // A receive stream reports closed only once its data has all been
+        // read.
         if !open && count == 0 {
             break;
         }

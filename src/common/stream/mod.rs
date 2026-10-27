@@ -3,13 +3,10 @@ use bevy::{
     ecs::component::Component,
     prelude::{Deref, DerefMut},
 };
-use s2n_quic::stream::PeerStream;
-use tokio::runtime::Handle;
 
 use crate::common::{
-    attempt::{QuicActionAttempt, TaskResult},
+    attempt::{OpenRequest, QuicActionAttempt},
     connection::id::ConnectionId,
-    spawner::TaskSpawner,
     stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
 
@@ -19,9 +16,8 @@ pub mod receive;
 pub mod send;
 pub mod session;
 
-/// This is a structure which represents an in progress receive stream.
-/// Any pending streams this attempt may hold will be closed
-/// if this structure is dropped without being handled.
+/// This is a structure which represents an accepted receive stream that
+/// hasn't been spawned yet.
 ///
 /// Attempts are all handled internally. Put them on an entity
 /// and they will be replaced with a full [QuicReceiveStream].
@@ -37,18 +33,13 @@ pub struct QuicReceiveStreamAttempt(
 );
 
 impl QuicReceiveStreamAttempt {
-    pub(crate) fn new(
-        handle: Handle,
-        task: impl TaskResult<Option<QuicReceiveStream>> + 'static + Send + Sync,
-        id: ConnectionId,
-    ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, id))
+    pub(crate) fn new_ready(stream: Option<QuicReceiveStream>, id: ConnectionId) -> Self {
+        Self(QuicActionAttempt::new_ready(stream, id))
     }
 }
 
 /// This is a structure which represents an in progress send stream.
-/// Any pending streams this attempt may hold will be closed
-/// if this structure is dropped without being handled.
+/// The stream is closed if this is dropped before it opens.
 ///
 /// Attempts are all handled internally. Put them on an entity
 /// and they will be replaced with a full [QuicSendStream].
@@ -62,18 +53,13 @@ impl QuicReceiveStreamAttempt {
 pub struct QuicSendStreamAttempt(QuicActionAttempt<Option<QuicSendStream>, ConnectionId>);
 
 impl QuicSendStreamAttempt {
-    pub(crate) fn new(
-        handle: Handle,
-        task: impl TaskResult<Option<QuicSendStream>> + 'static + Send + Sync,
-        id: ConnectionId,
-    ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, id))
+    pub(crate) fn new_open(request: OpenRequest, id: ConnectionId) -> Self {
+        Self(QuicActionAttempt::new_open(request, id))
     }
 }
 
 /// This is a structure which represents an in progress bidirectional stream.
-/// Any pending streams this attempt may hold will be closed
-/// if this structure is dropped without being handled.
+/// The stream is closed if this is dropped before it opens.
 ///
 /// Attempts are all handled internally. Put them on an entity
 /// and they will be replaced with a [QuicSendStream] and a
@@ -90,21 +76,20 @@ pub struct QuicBidirectionalStreamAttempt(
 );
 
 impl QuicBidirectionalStreamAttempt {
-    pub(crate) fn new(
-        handle: Handle,
-        task: impl TaskResult<Option<(QuicReceiveStream, QuicSendStream)>>
-        + 'static
-        + Send
-        + Sync,
+    pub(crate) fn new_open(request: OpenRequest, id: ConnectionId) -> Self {
+        Self(QuicActionAttempt::new_open(request, id))
+    }
+
+    pub(crate) fn new_ready(
+        streams: Option<(QuicReceiveStream, QuicSendStream)>,
         id: ConnectionId,
     ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, id))
+        Self(QuicActionAttempt::new_ready(streams, id))
     }
 }
 
-/// This is a structure which represents an in progress peer stream.
-/// Any pending streams this attempt may hold will be closed
-/// if this structure is dropped without being handled.
+/// This is a structure which represents an accepted stream that hasn't been
+/// spawned yet.
 ///
 /// Attempts are all handled internally. Put them on an entity
 /// and they will be replaced with a either a [QuicSendStream],
@@ -119,39 +104,16 @@ impl QuicBidirectionalStreamAttempt {
 pub struct QuicPeerStreamAttempt(QuicActionAttempt<Option<QuicPeerStream>, ConnectionId>);
 
 impl QuicPeerStreamAttempt {
-    pub(crate) fn new(
-        handle: Handle,
-        task: impl TaskResult<Option<QuicPeerStream>> + 'static + Send + Sync,
+    pub(crate) fn new_ready(
+        stream: Option<QuicPeerStream>,
         conn_id: ConnectionId,
     ) -> Self {
-        Self(QuicActionAttempt::new(handle, task, conn_id))
+        Self(QuicActionAttempt::new_ready(stream, conn_id))
     }
 }
 
+/// A stream the peer opened.
 pub enum QuicPeerStream {
     Bidirectional(QuicReceiveStream, QuicSendStream),
     Receive(QuicReceiveStream),
-}
-
-impl QuicPeerStream {
-    pub(crate) fn new(
-        spawner: TaskSpawner,
-        peer_stream: PeerStream,
-        conn_id: ConnectionId,
-    ) -> Self {
-        match peer_stream {
-            PeerStream::Bidirectional(bidirectional_stream) => {
-                let (rec, send) = bidirectional_stream.split();
-                let quic_rec = QuicReceiveStream::new(spawner.clone(), rec, conn_id);
-                let quic_send = QuicSendStream::new(spawner, send, conn_id);
-
-                QuicPeerStream::Bidirectional(quic_rec, quic_send)
-            }
-            PeerStream::Receive(rec) => {
-                let quic_rec = QuicReceiveStream::new(spawner, rec, conn_id);
-
-                QuicPeerStream::Receive(quic_rec)
-            }
-        }
-    }
 }

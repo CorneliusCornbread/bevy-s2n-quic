@@ -14,7 +14,10 @@ use bytes::Bytes;
 
 use crate::{
     client::Connect,
-    common::error::{AppErrorCode, ConnectionError},
+    common::{
+        connection::stats::ConnectionStats,
+        error::{AppErrorCode, ConnectionError},
+    },
 };
 
 use super::config::EndpointSetup;
@@ -146,7 +149,8 @@ impl RecvBudget {
 
     /// How many more bytes the driver may deliver.
     pub(super) fn room(&self) -> usize {
-        self.limit.saturating_sub(self.unread.load(Ordering::SeqCst))
+        self.limit
+            .saturating_sub(self.unread.load(Ordering::SeqCst))
     }
 
     pub(super) fn deliver(&self, len: usize) {
@@ -186,6 +190,10 @@ pub(crate) enum Command<S> {
     /// Closes every connection on the endpoint and removes it once they've
     /// drained. A server refuses new connections meanwhile.
     CloseEndpoint { endpoint: EndpointId },
+    /// Stops a server endpoint accepting connections, or a client endpoint
+    /// making them, and removes it once its existing connections have closed
+    /// on their own.
+    ReleaseEndpoint { endpoint: EndpointId },
     /// Starts a connection from a client endpoint. `conn` comes from the
     /// driver's [`IdAllocator`].
     Connect {
@@ -202,7 +210,11 @@ pub(crate) enum Command<S> {
     },
     /// Opens a stream, waiting for the peer's stream limit if needed. Answered
     /// with [`Event::StreamOpened`] carrying the same `request`.
-    OpenStream { conn: ConnId, dir: Dir, request: u64 },
+    OpenStream {
+        conn: ConnId,
+        dir: Dir,
+        request: u64,
+    },
     /// Queues data on a send stream. The bytes must already be reserved in
     /// the stream's [`SendBudget`].
     Write {
@@ -286,6 +298,13 @@ pub(crate) enum Event {
     SendFinished { conn: ConnId, stream: StreamId },
     /// An unreliable datagram arrived.
     Datagram { conn: ConnId, data: Bytes },
+    /// The connection's latest statistics. Sent with [`Event::Connected`],
+    /// then at most every [`STATS_INTERVAL`](super::core::STATS_INTERVAL)
+    /// while the connection is active.
+    Stats {
+        conn: ConnId,
+        stats: ConnectionStats,
+    },
 }
 
 #[cfg(test)]

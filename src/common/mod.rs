@@ -1,6 +1,4 @@
-use bevy::log::error;
 use std::fmt;
-use tokio::sync::mpsc::error::TrySendError;
 
 use crate::common::id::IdGenerator;
 
@@ -9,11 +7,10 @@ pub mod connection;
 pub mod error;
 pub(crate) mod id;
 pub mod plugin;
+pub(crate) mod router;
 pub mod runtime;
-pub(crate) mod spawner;
 pub mod status_code;
 pub mod stream;
-pub(crate) mod task_state;
 
 /// Enum determining the type (server or client) of the parent
 /// which is responsible for any given QUIC network resource.
@@ -74,19 +71,5 @@ impl QuicParentId {
 impl fmt::Display for QuicParentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} Id: {}", self.parent_type, self.parent_id)
-    }
-}
-
-pub(crate) trait HandleChannelError {
-    fn handle_err(&self);
-}
-
-impl<T> HandleChannelError for Result<(), TrySendError<T>> {
-    fn handle_err(&self) {
-        if let Err(send_err) = self {
-            error!(
-                "Error buffer for async task is full or closed, the following error will be dropped: {send_err}"
-            );
-        }
     }
 }

@@ -1,7 +1,7 @@
 //! # bevy-s2n-quic
 //!
 //! An Aeronet compatible Bevy plugin providing network IO with QUIC based on
-//! [s2n-quic](https://github.com/aws/s2n-quic).
+//! [quinn-proto](https://github.com/quinn-rs/quinn).
 //!
 //! ## Getting Started
 //!
@@ -29,8 +29,8 @@ pub mod backend;
 pub mod client;
 pub mod common;
 pub mod config;
-// Not used by the Bevy layer until the backend is swapped.
-#[allow(dead_code, unused_imports)]
+// Datagrams, stream resets and a few accessors aren't exposed yet.
+#[allow(dead_code)]
 pub(crate) mod driver;
 pub mod driver_plugin;
 pub mod server;

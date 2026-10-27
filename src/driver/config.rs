@@ -11,7 +11,10 @@ use rustls::crypto::CryptoProvider;
 use rustls_platform_verifier::Verifier;
 
 use crate::{
-    common::error::{AppErrorCode, ConnectionError},
+    common::{
+        connection::stats::ConnectionStats,
+        error::{AppErrorCode, ConnectionError},
+    },
     config::{ConfigError, QuicClientConfig, QuicServerConfig},
 };
 
@@ -92,16 +95,17 @@ impl EndpointSetup {
         options: &EndpointOptions,
     ) -> Result<Self, ConfigError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = Verifier::new_with_extra_roots(config.roots().to_vec(), provider.clone())
-            .map_err(|e| ConfigError::Tls(e.to_string()))?;
+        let verifier =
+            Verifier::new_with_extra_roots(config.roots().to_vec(), provider.clone())
+                .map_err(|e| ConfigError::Tls(e.to_string()))?;
         let mut tls = rustls_client_builder(provider)?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
         tls.enable_early_data = true;
 
-        let crypto =
-            RustlsClientConfig::try_from(tls).map_err(|e| ConfigError::Tls(e.to_string()))?;
+        let crypto = RustlsClientConfig::try_from(tls)
+            .map_err(|e| ConfigError::Tls(e.to_string()))?;
         let mut client = ClientConfig::new(Arc::new(crypto));
         client.transport_config(transport_config(options));
 
@@ -124,7 +128,8 @@ impl EndpointSetup {
 
 fn rustls_client_builder(
     provider: Arc<CryptoProvider>,
-) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ConfigError> {
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ConfigError>
+{
     rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ConfigError::Tls(e.to_string()))
@@ -170,6 +175,19 @@ pub(super) fn connection_error(err: quinn_proto::ConnectionError) -> ConnectionE
         Quinn::TimedOut => ConnectionError::TimedOut,
         Quinn::LocallyClosed => ConnectionError::LocallyClosed,
         other @ Quinn::CidsExhausted => ConnectionError::Transport(other.to_string()),
+    }
+}
+
+pub(super) fn connection_stats(conn: &quinn_proto::Connection) -> ConnectionStats {
+    let stats = conn.stats();
+    ConnectionStats {
+        rtt: stats.path.rtt,
+        congestion_window: stats.path.cwnd,
+        sent_packets: stats.path.sent_packets,
+        lost_packets: stats.path.lost_packets,
+        current_mtu: stats.path.current_mtu,
+        bytes_sent: stats.udp_tx.bytes,
+        bytes_received: stats.udp_rx.bytes,
     }
 }
 

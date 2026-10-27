@@ -20,6 +20,7 @@ use std::time::Instant;
 use crate::common::{
     connection::disconnect::ConnectionDisconnectReason,
     error::AppErrorCode,
+    router::poll_driver_events,
     stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
 
@@ -57,8 +58,13 @@ pub struct QuicAeronetPacketPlugin;
 
 impl Plugin for QuicAeronetPacketPlugin {
     fn build(&self, app: &mut bevy::app::App) {
-        app.add_systems(PreUpdate, aeronet_session_recv.in_set(IoSystems::Poll))
-            .add_systems(PostUpdate, aeronet_session_send.in_set(IoSystems::Flush));
+        app.add_systems(
+            PreUpdate,
+            aeronet_session_recv
+                .in_set(IoSystems::Poll)
+                .after(poll_driver_events),
+        )
+        .add_systems(PostUpdate, aeronet_session_send.in_set(IoSystems::Flush));
     }
 }
 

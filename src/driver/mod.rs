@@ -23,7 +23,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
@@ -34,16 +34,17 @@ use mio::{Events, Poll, Token, Waker};
 
 use crate::{common::runtime::ThreadStartHook, config::ConfigError};
 
+pub(crate) use self::io::UdpSocket;
 pub(crate) use self::{
     config::{EndpointOptions, EndpointSetup},
     protocol::{
-        Command, ConnId, Dir, EndpointId, Event, IdAllocator, RecvBudget, SendBudget, StreamId,
-        StreamInfo,
+        Command, ConnId, Dir, EndpointId, Event, IdAllocator, RecvBudget, SendBudget,
+        StreamId, StreamInfo,
     },
 };
 use self::{
     core::Core,
-    io::{MioIo, Socket, UdpSocket},
+    io::{MioIo, Socket},
 };
 
 const WAKER: Token = Token(usize::MAX);
@@ -53,6 +54,18 @@ const WAKER: Token = Token(usize::MAX);
 pub(crate) struct DriverOptions {
     pub thread_name: Option<String>,
     pub on_thread_start: Option<ThreadStartHook>,
+    /// Shares endpoint and connection IDs with other drivers, so they're
+    /// unique across all of them. Each driver has its own by default.
+    pub ids: Option<Arc<IdAllocator>>,
+}
+
+/// Counters for one driver, readable from any thread.
+#[derive(Debug, Default)]
+pub(crate) struct DriverMetrics {
+    /// Times [`DriverHandle::flush`] woke the driver.
+    pub wakes: AtomicU64,
+    /// Nanoseconds spent handling work, not counting time waiting for it.
+    pub busy_nanos: AtomicU64,
 }
 
 /// A running driver thread. Dropping it stops the thread without closing
@@ -74,8 +87,10 @@ impl Driver {
 
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
-        let ids = Arc::new(IdAllocator::default());
+        let ids = options.ids.unwrap_or_default();
         let core = Core::new(io, command_rx, event_tx, ids.clone());
+        let metrics = Arc::new(DriverMetrics::default());
+        let thread_metrics = metrics.clone();
 
         let mut builder = thread::Builder::new();
         if let Some(name) = options.thread_name {
@@ -86,7 +101,7 @@ impl Driver {
             if let Some(hook) = on_thread_start {
                 hook();
             }
-            run(poll, core);
+            run(poll, core, &thread_metrics);
         })?;
 
         let handle = DriverHandle {
@@ -96,6 +111,7 @@ impl Driver {
                 registry,
                 pending: AtomicBool::new(false),
                 ids,
+                metrics,
             }),
         };
 
@@ -136,6 +152,7 @@ struct Shared {
     /// Commands were sent since the last wake.
     pending: AtomicBool,
     ids: Arc<IdAllocator>,
+    metrics: Arc<DriverMetrics>,
 }
 
 impl DriverHandle {
@@ -143,13 +160,31 @@ impl DriverHandle {
         &self.shared.ids
     }
 
-    /// Binds a UDP socket on this thread, so errors and the bound address
-    /// are known right away, then hands it to the driver.
-    pub fn open_endpoint(
+    pub fn metrics(&self) -> &DriverMetrics {
+        &self.shared.metrics
+    }
+
+    /// [`Self::open_endpoint`] with a new ID.
+    #[cfg(test)]
+    pub fn open_endpoint_new(
         &self,
         bind: SocketAddr,
         setup: EndpointSetup,
     ) -> Result<(EndpointId, SocketAddr), ConfigError> {
+        let endpoint = self.ids().endpoint();
+        let local_addr = self.open_endpoint(endpoint, bind, setup)?;
+        Ok((endpoint, local_addr))
+    }
+
+    /// Binds a UDP socket on this thread, so errors and the bound address
+    /// are known right away, then hands it to the driver as `endpoint`, an
+    /// ID from [`Self::ids`]. Returns the bound address.
+    pub fn open_endpoint(
+        &self,
+        endpoint: EndpointId,
+        bind: SocketAddr,
+        setup: EndpointSetup,
+    ) -> Result<SocketAddr, ConfigError> {
         let error = |e: std::io::Error| ConfigError::Endpoint {
             addr: bind,
             reason: e.to_string(),
@@ -157,7 +192,6 @@ impl DriverHandle {
 
         let mut socket = UdpSocket::bind(bind).map_err(error)?;
         let local_addr = socket.local_addr().map_err(error)?;
-        let endpoint = self.ids().endpoint();
         socket
             .register(&self.shared.registry, endpoint)
             .map_err(error)?;
@@ -167,7 +201,7 @@ impl DriverHandle {
             socket,
             setup: Box::new(setup),
         });
-        Ok((endpoint, local_addr))
+        Ok(local_addr)
     }
 
     /// Queues a command without waking the driver. Call [`Self::flush`] to
@@ -181,15 +215,18 @@ impl DriverHandle {
 
     /// Wakes the driver if commands were sent since the last flush.
     pub fn flush(&self) {
-        if self.shared.pending.swap(false, Ordering::AcqRel)
-            && let Err(e) = self.shared.waker.wake()
-        {
+        if !self.shared.pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        self.shared.metrics.wakes.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = self.shared.waker.wake() {
             tracing::warn!("can't wake the QUIC driver: {e}");
         }
     }
 }
 
-fn run(mut poll: Poll, mut core: Core<MioIo>) {
+fn run(mut poll: Poll, mut core: Core<MioIo>, metrics: &DriverMetrics) {
     let mut events = Events::with_capacity(1024);
 
     loop {
@@ -219,7 +256,12 @@ fn run(mut poll: Poll, mut core: Core<MioIo>) {
             );
         }
 
-        if !core.turn() {
+        let start = Instant::now();
+        let running = core.turn();
+        metrics
+            .busy_nanos
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if !running {
             return;
         }
     }
