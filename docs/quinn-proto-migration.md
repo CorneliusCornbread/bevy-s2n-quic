@@ -216,6 +216,24 @@ runs.
   - one-way latency p50/p99, using a timestamp in the payload
   - a datagram scenario
   - a per-driver wake counter (replaces `remote_schedule_count`)
+- **Investigate the bulk throughput gap found in Phase C.** The 64 KB,
+  600-client run (`--payload 65536 --warmup 1 --duration 2`) received
+  425 MB/s, against s2n's 626 MB/s (3,130 MB in 5 s). It lost 0 bytes, but
+  `send full` was 65,284 and driver busy was 78% across 2 drivers. This was
+  a single run with a 2 s window, so first repeat it with s2n's 5 s window.
+  Then check, in order:
+  - **Driver saturation:** the server endpoint and all its connections share
+    one driver. Record per-driver busy time. If the server's driver is near
+    100%, this is the Phase G trigger.
+  - **Byte budgets:** the send and receive budgets are 1 MiB per stream.
+    The high `send full` count suggests senders are waiting on them. Rerun
+    with larger budgets, and consider exposing them on `QuicDriverPlugin`.
+  - **The I/O loop:** run the ignored `bulk_throughput` driver test against
+    quinn's `perf` tool. This Phase B gate was never run. A large gap there
+    points at GSO, GRO, pacing or the per-turn send and receive limits
+    (`MAX_TRANSMIT_DATAGRAMS`, `MAX_RECV_DATAGRAMS`).
+  - **Flow control:** quinn's default stream and connection receive windows,
+    compared with s2n's.
 
 **Gate** (same machine as [`perf-baseline.md`](perf-baseline.md), with the
 `perf` branch's s2n backend run alongside for comparison):
