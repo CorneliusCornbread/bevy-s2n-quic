@@ -482,6 +482,40 @@ Before the GSO fix, 4.5% of the sender's packets were lost, in bursts of
 about one GSO batch, with a congestion event every ~1,000 packets. That
 capped cwnd at ~67 KB, although the kernel dropped nothing.
 
+### Single stream through the Bevy API
+
+`--clients 1 --scenarios download,upload --payload 65536 --duration 5
+--stream-budget <B> [--hz <N>]`, added after Phase E. One stream is filled
+until its send budget is full every tick, and drained every tick. `download`
+is server → client, `upload` client → server. One run each, quinn only. The
+s2n backend is gone from the tree, and its benchmark port was lost. The
+benchmark's "MB" is 2^20 bytes. 0 bytes lost in every run, and peak RSS was
+70–100 MB.
+
+| budget  | frames/s | rx/s (download / upload) | frame avg ms | busy % per driver | latency p50 / p99 ms |
+| ------: | -------: | ------------------------ | ------------ | ----------------- | -------------------- |
+|   1 MiB |       60 | 59.8 / 59.8 MB/s         | 0.16         | 9/8               | 16.7 / 16.8          |
+|   4 MiB |       60 | 239.2 / 239.2 MB/s       | 0.21–0.25    | 33/30             | 16.7 / 16.8          |
+|  16 MiB |       60 | 762.7 / 750.0 MB/s       | 0.47–0.48    | 99/90             | 16.6 / 33.5          |
+|  64 MiB |       60 | 763.4 / 765.4 MB/s       | 0.46–0.49    | 99/90             | 83.5 / 100.4         |
+|   1 MiB |      240 | 236.8 / 236.8 MB/s       | 0.15         | 36/31             | 4.2 / 4.3            |
+|   4 MiB |      240 | 741.2 / 744.0 MB/s       | 0.22         | 99/89             | 8.4 / 8.5            |
+
+At 60 Hz the fixed tick is Bevy's default 64 Hz; with `--hz` both run at
+that rate.
+
+- **Throughput is one budget per frame** until the network thread is the
+  limit: 1 MiB × 60 frames/s = 60 MB/s, and 4 MiB gives exactly 4× that.
+- **The ceiling is the sender's driver thread at 99%**, at 740–765 MB/s.
+  That's the driver's own single-connection speed (757 MiB/s above), so the
+  Bevy layer adds no limit beyond the per-frame handover.
+- **Budgets past the ceiling only add latency.** 64 MiB moves no more than
+  16 MiB, but data waits 5–6 frames (p50 84 ms) in the budget.
+- **Frame rate counts as much as budget.** 1 MiB at 240 Hz matches 4 MiB at
+  60 Hz, with a quarter of the latency.
+- Phase G won't raise this, because quinn-proto runs a connection on one
+  thread.
+
 ### Data-loss reproducer
 
 `--clients 600 --payload 65536 --warmup 1 --duration 2 --drain 90 --scenarios active`:

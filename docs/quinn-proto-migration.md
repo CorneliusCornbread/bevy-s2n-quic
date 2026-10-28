@@ -264,14 +264,52 @@ runs.
   ACK frequency and the crypto provider made no difference. The server's
   driver is at 100% in every bulk run, so **Phase G is triggered**.
 
+### Single-stream throughput
+
+Added after Phase E. The bulk run above is a total over 600 streams, so it
+says nothing about one large download. One stream moves at most about one
+send budget and one receive budget per frame, because the app hands data
+over once per frame. Its throughput is then roughly `budget × frame rate`,
+until the network thread becomes the limit.
+
+How to run it:
+
+```sh
+# Through the Bevy API: one connection, one stream, filled every tick.
+# `download` is server → client, `upload` is client → server.
+cargo run --release --example quic_concurrency_stress -- \
+    --clients 1 --scenarios download,upload --payload 65536 --duration 5 \
+    --stream-budget 4194304 [--hz 240] [--out results.md]
+
+# The driver alone, without Bevy: 2 GiB on one stream.
+cargo test --release --lib driver::tests::bulk_throughput -- --ignored --nocapture
+
+# quinn's own tool, for a ceiling on the same machine, from a quinn
+# checkout at the `quinn-proto-0.11.19` tag:
+cargo run --release -p bench --bin bulk -- --upload-size 2G --download-size 0
+```
+
+`--stream-budget` sets both the send and receive budget, and the default is
+1 MiB. `--hz` sets the frame rate and the fixed tick together (headless
+only). The `rx/s` column is the throughput.
+
+Results are in
+[`perf-baseline.md`](perf-baseline.md#single-stream-through-the-bevy-api).
+The default 1 MiB budget gives 60 MB/s at 60 Hz. 16 MiB at 60 Hz, or 4 MiB at
+240 Hz, reaches 740–765 MB/s, which is the driver's own single-connection
+speed. Phase G doesn't change this: quinn-proto runs a connection on one
+thread, so spreading connections over cores only helps many-client totals.
+The s2n backend wasn't measured, because its benchmark port is gone.
+
 ## Phase F: remove s2n and release
 
 - **Dependencies:** remove `s2n-quic`, `s2n-quic-tls`, `tokio` and
   `futures`, and add a feature for the TLS provider.
 - **Release:** write a migration guide, and update the CHANGELOG and README
   under the new crate name.
-- **CI:** add `cargo test` (CI only runs clippy today) and a short benchmark
-  smoke run (`--clients 50 --duration 3`) that fails on lost bytes.
+- **CI:** add `cargo test` (CI only runs clippy today) and short benchmark
+  smoke runs that fail on lost bytes: `--clients 50 --duration 3`, and
+  `--clients 1 --scenarios download,upload --payload 65536 --duration 3`.
 
 ## Phase G: multi-core server (only if Phase E shows one server thread saturating)
 

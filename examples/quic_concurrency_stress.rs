@@ -31,6 +31,15 @@
 ///   - `broadcast` – the server sends to every client's stream, and the
 ///     clients only receive. `senders` is then the number of streams the
 ///     server sends to. Only with `--role both`.
+///   - `download` – single-stream throughput: the server sends to one
+///     client's stream, queueing `--payload`-sized chunks until its send
+///     budget is full every tick. Only with `--role both`.
+///   - `upload` – the same from one client to the server.
+///
+///   Other clients stay connected and silent in `download` and `upload`, so
+///   run them with `--clients 1`. One stream moves at most about a budget
+///   per tick in each direction, so its throughput depends on
+///   `--stream-budget` and `--hz`.
 /// - At the end a markdown table is printed to stdout, and optionally
 ///   appended to `--out <file>`. The process exits with an error if any
 ///   phase lost data or failed to open all of its streams.
@@ -87,6 +96,11 @@
 /// ```ignore
 /// cargo run --example quic_concurrency_stress --release -- \
 ///     --clients 100,300,600 --duration 10 --scenarios active,idle
+///
+/// # Single-stream throughput
+/// cargo run --example quic_concurrency_stress --release -- \
+///     --clients 1 --scenarios download,upload --payload 65536 --duration 5 \
+///     --stream-budget 4194304
 /// ```
 ///
 /// Run with `--help` for all options.
@@ -112,7 +126,7 @@ use bevy::{
         settings::{PowerPreference, WgpuSettings},
     },
     tasks::available_parallelism,
-    time::Time,
+    time::{Fixed, Time},
     utils::default,
 };
 use bevy_s2n_quic::{
@@ -184,6 +198,8 @@ enum Scenario {
     Idle,
     Datagram,
     Broadcast,
+    Download,
+    Upload,
 }
 
 impl Scenario {
@@ -193,6 +209,8 @@ impl Scenario {
             Scenario::Idle => "idle",
             Scenario::Datagram => "datagram",
             Scenario::Broadcast => "broadcast",
+            Scenario::Download => "download",
+            Scenario::Upload => "upload",
         }
     }
 
@@ -202,8 +220,15 @@ impl Scenario {
             "idle" => Some(Scenario::Idle),
             "datagram" => Some(Scenario::Datagram),
             "broadcast" => Some(Scenario::Broadcast),
+            "download" => Some(Scenario::Download),
+            "upload" => Some(Scenario::Upload),
             _ => None,
         }
+    }
+
+    /// Whether the server sends, which the control link can't drive.
+    fn server_sends(self) -> bool {
+        matches!(self, Scenario::Broadcast | Scenario::Download)
     }
 }
 
@@ -243,6 +268,9 @@ struct Config {
     burst: usize,
     tokio_threads: Option<usize>,
     stream_budget: Option<usize>,
+    /// Frame and fixed-tick rate of the headless runner. `None` keeps Bevy's
+    /// 64 Hz fixed tick under a [RUNNER_HZ] runner.
+    hz: Option<f64>,
     pin: bool,
     tokio_nice: Option<i32>,
     windowed: bool,
@@ -266,6 +294,7 @@ impl Default for Config {
             burst: 1,
             tokio_threads: None,
             stream_budget: None,
+            hz: None,
             pin: false,
             tokio_nice: None,
             windowed: false,
@@ -282,7 +311,8 @@ Options:
   --addr <IP:PORT>        QUIC server address [default: 127.0.0.1:17779]
   --control <IP:PORT>     Control address for --role server|clients [default: 127.0.0.1:17780]
   --clients <N,N,..>      Client counts to run, ascending [default: 100,300,600]
-  --scenarios <S,S,..>    Scenarios per client count: active, idle, datagram, broadcast [default: active,idle]
+  --scenarios <S,S,..>    Scenarios per client count: active, idle, datagram, broadcast,
+                          download, upload [default: active,idle]
   --duration <SECS>       Measure window per phase [default: 10]
   --warmup <SECS>         Warmup per phase before measuring [default: 2]
   --drain <SECS>          Max time to wait for in-flight data after a phase [default: 5]
@@ -292,6 +322,7 @@ Options:
   --burst <N>             Messages sent per sender per fixed tick [default: 1]
   --tokio-threads <N>     Network threads [default: library default]
   --stream-budget <BYTES> Send and receive byte budget per stream [default: library default]
+  --hz <N>                Frame and fixed-tick rate, headless only [default: 60 Hz frames, 64 Hz ticks]
   --pin                   Pin network threads and Bevy threads to separate cores (Linux)
   --tokio-nice <N>        Nice value for the network threads (Linux)
   --windowed              Use DefaultPlugins with a window instead of headless
@@ -403,6 +434,15 @@ impl Config {
                             .ok_or_else(|| format!("invalid --stream-budget: {v}"))?,
                     );
                 }
+                "--hz" => {
+                    let v = value()?;
+                    cfg.hz = Some(
+                        v.parse::<f64>()
+                            .ok()
+                            .filter(|hz| hz.is_finite() && *hz > 0.0)
+                            .ok_or_else(|| format!("invalid --hz: {v}"))?,
+                    );
+                }
                 "--pin" => cfg.pin = true,
                 "--tokio-nice" => {
                     let v = value()?;
@@ -428,8 +468,13 @@ impl Config {
         }
         // The control link only tells the server when phases measure, not
         // when they warm up, so it can't drive a sending server.
-        if cfg.role != Role::Both && cfg.scenarios.contains(&Scenario::Broadcast) {
-            return Err("the broadcast scenario needs --role both".into());
+        if cfg.role != Role::Both
+            && let Some(s) = cfg.scenarios.iter().find(|s| s.server_sends())
+        {
+            return Err(format!("the {} scenario needs --role both", s.name()));
+        }
+        if cfg.windowed && cfg.hz.is_some() {
+            return Err("--hz is headless only: the window sets the frame rate".into());
         }
 
         Ok(cfg)
@@ -458,11 +503,12 @@ struct Phase {
 }
 
 impl Phase {
-    /// Number of streams that send during this phase. For `broadcast`, the
-    /// number of streams the server sends to.
+    /// Number of streams that send during this phase. For `broadcast` and
+    /// `download`, the number of streams the server sends to.
     fn senders(&self, idle_fraction: f64) -> usize {
         match self.scenario {
             Scenario::Active | Scenario::Datagram | Scenario::Broadcast => self.clients,
+            Scenario::Download | Scenario::Upload => 1,
             Scenario::Idle => ((self.clients as f64) * idle_fraction).ceil() as usize,
         }
     }
@@ -1019,8 +1065,10 @@ impl StressBench {
     fn totals(&self, scenario: Scenario) -> (u64, u64) {
         match scenario {
             Scenario::Datagram => (self.dgram_sent, self.dgram_received),
-            Scenario::Broadcast => (self.bcast_sent, self.bcast_received),
-            Scenario::Active | Scenario::Idle => (self.bytes_sent, self.bytes_received),
+            Scenario::Broadcast | Scenario::Download => (self.bcast_sent, self.bcast_received),
+            Scenario::Active | Scenario::Idle | Scenario::Upload => {
+                (self.bytes_sent, self.bytes_received)
+            }
         }
     }
 
@@ -1200,11 +1248,15 @@ fn main() -> AppExit {
         app.add_plugins((
             MinimalPlugins
                 .set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
-                    1.0 / RUNNER_HZ,
+                    1.0 / cfg.hz.unwrap_or(RUNNER_HZ),
                 )))
                 .set(threads.task_pool_plugin()),
             log,
         ));
+    }
+    if let Some(hz) = cfg.hz {
+        // One fixed tick per frame, so the systems below run at `hz` too.
+        app.insert_resource(Time::<Fixed>::from_hz(hz));
     }
 
     let role = cfg.role;
@@ -1419,7 +1471,11 @@ fn drive(
             let drained = received >= sent;
             let limit = match scenario {
                 Scenario::Datagram => bench.cfg.drain.min(DATAGRAM_DRAIN),
-                Scenario::Active | Scenario::Idle | Scenario::Broadcast => bench.cfg.drain,
+                Scenario::Active
+                | Scenario::Idle
+                | Scenario::Broadcast
+                | Scenario::Download
+                | Scenario::Upload => bench.cfg.drain,
             };
 
             if drained || elapsed >= limit {
@@ -1726,7 +1782,7 @@ fn client_send(
     sent = 0;
 
     let scenario = bench.phase().scenario;
-    if !bench.sending() || scenario == Scenario::Broadcast {
+    if !bench.sending() || scenario.server_sends() {
         return;
     }
 
@@ -1762,6 +1818,10 @@ fn client_send(
 
     for (mut stream, meta) in &mut streams {
         if meta.index >= senders || !stream.is_open() {
+            continue;
+        }
+        if scenario == Scenario::Upload {
+            sent += fill(&mut stream, &payload, &mut full);
             continue;
         }
         for _ in 0..burst {
@@ -1816,12 +1876,15 @@ fn server_recv(
     bench.bytes_received += received;
 }
 
-/// `broadcast`: the server sends to every client's stream.
+/// `broadcast`: the server sends to every client's stream. `download`: it
+/// fills one stream.
 fn server_send(
-    mut streams: Query<&mut QuicSendStream, With<QuicServerMarker>>,
+    mut streams: Query<(Entity, &mut QuicSendStream), With<QuicServerMarker>>,
     mut bench: ResMut<StressBench>,
+    mut download: Local<Option<Entity>>,
 ) {
-    if !bench.sending() || bench.phase().scenario != Scenario::Broadcast {
+    let scenario = bench.phase().scenario;
+    if !bench.sending() || !scenario.server_sends() {
         return;
     }
 
@@ -1830,7 +1893,21 @@ fn server_send(
     let mut sent = 0u64;
     let mut full = 0u64;
 
-    for mut stream in &mut streams {
+    if scenario == Scenario::Download {
+        // The same stream for the whole phase, so its budget is the limit.
+        let open = |(_, stream): &(Entity, &QuicSendStream)| stream.is_open();
+        if !download.is_some_and(|e| streams.get(e).is_ok_and(|s| open(&s))) {
+            *download = streams.iter().find(open).map(|(entity, _)| entity);
+        }
+        if let Some((_, mut stream)) = download.and_then(|e| streams.get_mut(e).ok()) {
+            sent += fill(&mut stream, &payload, &mut full);
+        }
+        bench.bcast_sent += sent;
+        bench.send_full += full;
+        return;
+    }
+
+    for (_, mut stream) in &mut streams {
         if !stream.is_open() {
             continue;
         }
@@ -1846,7 +1923,26 @@ fn server_send(
     bench.send_full += full;
 }
 
-/// `broadcast`: the clients receive what the server sends.
+/// Most bytes [fill] queues per tick. The network thread frees budget while
+/// the stream is being filled, so without a limit filling might not stop.
+const MAX_FILL_PER_TICK: u64 = 256 << 20;
+
+/// `download` and `upload`: queues copies of `payload` until the stream's
+/// send budget is full. Returns the bytes queued, and counts the refusal
+/// that ends it in `full`.
+fn fill(stream: &mut QuicSendStream, payload: &Bytes, full: &mut u64) -> u64 {
+    let mut sent = 0;
+    while sent < MAX_FILL_PER_TICK {
+        if stream.send(payload.clone()).is_err() {
+            *full += 1;
+            break;
+        }
+        sent += payload.len() as u64;
+    }
+    sent
+}
+
+/// `broadcast` and `download`: the clients receive what the server sends.
 fn client_recv(
     mut streams: Query<(Entity, &mut QuicReceiveStream), With<StressClientStream>>,
     mut bench: ResMut<StressBench>,
@@ -2108,10 +2204,14 @@ fn report(bench: &StressBench) -> bool {
     let _ = writeln!(md);
     let _ = writeln!(
         md,
-        "- Mode: {} | role: {} | logical CPUs: {} | runner: {RUNNER_HZ} Hz",
+        "- Mode: {} | role: {} | logical CPUs: {} | runner: {}",
         if cfg.windowed { "windowed" } else { "headless" },
         cfg.role.name(),
         bench.threads.cpus,
+        cfg.hz.map_or_else(
+            || format!("{RUNNER_HZ} Hz, fixed tick 64 Hz"),
+            |hz| format!("{hz} Hz, fixed tick {hz} Hz")
+        ),
     );
     let _ = writeln!(md, "- Threads: {}", bench.threads.describe());
     if cfg.role != Role::Server {
@@ -2139,11 +2239,11 @@ fn report(bench: &StressBench) -> bool {
         "| clients | scenario | senders | ready | frames | frame avg ms | frame p99 ms \
          | frame max ms | interval p99 ms | cpu cores | driver busy (thread-s) | driver busy % \
          | busy % per driver | wakes/frame | latency p50 ms | latency p99 ms | sent | received \
-         | send full | dgram dropped | lost B | ok |"
+         | rx/s | send full | dgram dropped | lost B | ok |"
     );
     let _ = writeln!(
         md,
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
     );
 
     for r in &bench.results {
@@ -2151,7 +2251,7 @@ fn report(bench: &StressBench) -> bool {
         let _ = writeln!(
             md,
             "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} \
-             | {} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} |",
+             | {} | {:.1} | {} | {} | {} | {} | {}/s | {} | {} | {} | {} |",
             r.phase.clients,
             r.phase.scenario.name(),
             r.senders,
@@ -2170,6 +2270,7 @@ fn report(bench: &StressBench) -> bool {
             fmt_ms(r.latency_p99_ms),
             fmt_bytes(r.sent),
             fmt_bytes(r.received),
+            fmt_bytes((r.received as f64 / wall) as u64),
             r.send_full,
             r.dgram_dropped,
             r.lost,
