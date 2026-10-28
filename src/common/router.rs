@@ -88,10 +88,16 @@ pub(crate) enum Half {
 }
 
 pub(crate) enum ConnDelivery {
-    Connected,
+    Connected {
+        min_datagram_size: Option<usize>,
+    },
     Lost(ConnectionError),
     Accepted(Box<QuicPeerStream>),
-    Stats(ConnectionStats),
+    Stats {
+        stats: ConnectionStats,
+        max_datagram_size: Option<usize>,
+    },
+    Datagrams(Vec<Bytes>, Instant),
 }
 
 pub(crate) enum SendDelivery {
@@ -254,6 +260,10 @@ impl ConnRoute {
         query: &mut Query<&mut QuicConnection>,
         delivery: ConnDelivery,
     ) {
+        // Nothing is left to deliver to, and the slot would only grow.
+        if self.released {
+            return;
+        }
         match &mut self.handshaking {
             Some((_, conn)) => conn.deliver(delivery),
             None => self.slot.deliver(query, delivery),
@@ -467,21 +477,26 @@ impl DriverRouter {
 
                 let id = ConnectionId::new(conn.0, server.parent);
                 let mut route = ConnRoute::new(id, driver);
-                route.handshaking =
-                    Some((endpoint, QuicConnection::new(link, conn, id, remote)));
+                let datagram_buffer = runtime.endpoint_options().datagram_receive_buffer;
+                route.handshaking = Some((
+                    endpoint,
+                    QuicConnection::new(link, conn, id, remote, datagram_buffer),
+                ));
                 self.conns.insert(conn, route);
             }
-            Event::Connected { conn } => {
+            Event::Connected {
+                conn,
+                min_datagram_size,
+            } => {
                 let Some(route) = self.conn_route(conn, runtime) else {
                     return;
                 };
+                let delivery = ConnDelivery::Connected { min_datagram_size };
                 let Some((endpoint, mut connection)) = route.handshaking.take() else {
-                    route
-                        .slot
-                        .deliver(&mut targets.conns, ConnDelivery::Connected);
+                    route.deliver(&mut targets.conns, delivery);
                     return;
                 };
-                connection.deliver(ConnDelivery::Connected);
+                connection.deliver(delivery);
                 // If the server is gone, dropping the connection closes it.
                 if let Some(server) = self.endpoints.get_mut(&endpoint) {
                     server.accepted.push(connection);
@@ -564,11 +579,22 @@ impl DriverRouter {
             Event::SendFinished { conn, stream } => {
                 self.deliver_send(conn, stream, targets, SendDelivery::Finished)
             }
-            // Datagrams are handled from Phase D on.
-            Event::Datagram { .. } => {}
-            Event::Stats { conn, stats } => {
+            Event::Datagrams { conn, data } => {
                 if let Some(route) = self.conns.get_mut(&conn) {
-                    route.deliver(&mut targets.conns, ConnDelivery::Stats(stats));
+                    route.deliver(&mut targets.conns, ConnDelivery::Datagrams(data, now));
+                }
+            }
+            Event::Stats {
+                conn,
+                stats,
+                max_datagram_size,
+            } => {
+                if let Some(route) = self.conns.get_mut(&conn) {
+                    let delivery = ConnDelivery::Stats {
+                        stats,
+                        max_datagram_size,
+                    };
+                    route.deliver(&mut targets.conns, delivery);
                 }
             }
         }

@@ -37,6 +37,15 @@ impl From<ConnectionDisconnectReason> for DisconnectReason {
             ConnectionDisconnectReason::InvalidStream => {
                 DisconnectReason::ByError(anyhow!("Stream is no longer valid"))
             }
+            // The peer's application closed the connection, for example with
+            // aeronet's `Disconnect`, whose reason this carries.
+            ConnectionDisconnectReason::ConnectionError(
+                ConnectionError::ApplicationClosed { code, reason },
+            ) => DisconnectReason::ByPeer(if reason.is_empty() {
+                format!("Connection closed by peer with code {code}.")
+            } else {
+                String::from_utf8_lossy(&reason).into_owned()
+            }),
             ConnectionDisconnectReason::ConnectionError(error) => {
                 DisconnectReason::ByError(anyhow!(
                     "Connection has been closed due to a connection error: {error}"

@@ -67,13 +67,30 @@ impl PluginGroup for QuicDefaultPlugins {
     }
 }
 
-/// The plugin group for Aeronet event handling.
+/// The plugin group for Aeronet sessions and events.
+///
+/// By default each connection is one aeronet session, with packets sent as
+/// QUIC datagrams. To have each stream be a session instead, with packets
+/// sent on the stream, set the mode:
+///
+/// ```no_run
+/// use bevy::prelude::*;
+/// use bevy_s2n_quic::{
+///     QuicAeronetPlugins, QuicDefaultPlugins,
+///     common::stream::session::{QuicAeronetPacketPlugin, QuicSessionMode},
+/// };
+///
+/// App::new().add_plugins((
+///     QuicDefaultPlugins,
+///     QuicAeronetPlugins.set(QuicAeronetPacketPlugin::new(QuicSessionMode::Streams)),
+/// ));
+/// ```
 pub struct QuicAeronetPlugins;
 
 impl PluginGroup for QuicAeronetPlugins {
     fn build(self) -> bevy::app::PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
-            .add(QuicAeronetPacketPlugin)
+            .add(QuicAeronetPacketPlugin::default())
             .add(QuicAeronetEventPlugin)
     }
 }

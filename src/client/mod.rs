@@ -29,6 +29,7 @@ pub struct QuicClient {
     driver: usize,
     endpoint: EndpointId,
     id: QuicParentId,
+    datagram_buffer: usize,
 }
 
 impl QuicClient {
@@ -53,6 +54,7 @@ impl QuicClient {
             driver,
             endpoint,
             id: QuicParentId::generate_unique(QuicParentType::Client),
+            datagram_buffer: runtime.endpoint_options().datagram_receive_buffer,
         })
     }
 
@@ -84,8 +86,13 @@ impl QuicClient {
             connect,
         });
 
-        let connection =
-            QuicConnection::new(self.link.clone(), conn, connection_id, remote_addr);
+        let connection = QuicConnection::new(
+            self.link.clone(),
+            conn,
+            connection_id,
+            remote_addr,
+            self.datagram_buffer,
+        );
         (
             QuicConnectionAttempt::new(connection, self.id),
             QuicClientMarker,

@@ -238,9 +238,10 @@ pub(crate) enum Command<S> {
     },
     /// Resumes reading after [`RecvBudget::consume`] returned `true`.
     ResumeRead { conn: ConnId, stream: StreamId },
-    /// Sends an unreliable datagram, dropping the oldest queued one if the
-    /// send buffer is full.
-    SendDatagram { conn: ConnId, data: Bytes },
+    /// Sends unreliable datagrams, dropping the oldest queued ones if the
+    /// send buffer is full. Drops are counted in
+    /// [`ConnectionStats::datagrams_dropped`].
+    SendDatagrams { conn: ConnId, data: Vec<Bytes> },
     /// Stops the driver without closing anything gracefully.
     Shutdown,
 }
@@ -257,8 +258,13 @@ pub(crate) enum Event {
         conn: ConnId,
         remote: SocketAddr,
     },
-    /// The handshake completed.
-    Connected { conn: ConnId },
+    /// The handshake completed. `min_datagram_size` is the largest datagram
+    /// the connection can always send, whatever the path MTU, or `None` if
+    /// the peer doesn't accept datagrams.
+    Connected {
+        conn: ConnId,
+        min_datagram_size: Option<usize>,
+    },
     /// The connection can no longer be used. This is the last event for the
     /// connection, and it's also sent when connecting fails.
     ConnectionLost {
@@ -296,14 +302,16 @@ pub(crate) enum Event {
     },
     /// Everything written to a finished stream was acknowledged by the peer.
     SendFinished { conn: ConnId, stream: StreamId },
-    /// An unreliable datagram arrived.
-    Datagram { conn: ConnId, data: Bytes },
-    /// The connection's latest statistics. Sent with [`Event::Connected`],
-    /// then at most every [`STATS_INTERVAL`](super::core::STATS_INTERVAL)
-    /// while the connection is active.
+    /// Unreliable datagrams arrived, in the order they were received.
+    Datagrams { conn: ConnId, data: Vec<Bytes> },
+    /// The connection's latest statistics, and the largest datagram it can
+    /// send now. Sent with [`Event::Connected`], then at most every
+    /// [`STATS_INTERVAL`](super::core::STATS_INTERVAL) while the connection
+    /// is active.
     Stats {
         conn: ConnId,
         stats: ConnectionStats,
+        max_datagram_size: Option<usize>,
     },
 }
 

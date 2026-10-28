@@ -1,3 +1,4 @@
+use aeronet_io::packet::RecvPacket;
 use bevy::{
     ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld},
     prelude::{Deref, DerefMut},
@@ -20,7 +21,7 @@ use crate::{
             disconnect::ConnectionDisconnectReason, id::ConnectionId,
             stats::ConnectionStats,
         },
-        error::{AppErrorCode, ConnectionError},
+        error::{AppErrorCode, ConnectionError, DatagramError},
         router::{self, ConnDelivery, Notice},
         runtime::Link,
         stream::{
@@ -56,7 +57,8 @@ impl QuicConnectionAttempt {
     }
 }
 
-/// A QUIC connection to a peer, from which streams are opened and accepted.
+/// A QUIC connection to a peer, from which streams are opened and accepted,
+/// and unreliable datagrams sent and received.
 ///
 /// The connection's state, such as [Self::is_open] and [Self::stats], is
 /// mirrored from the network thread once per frame, in
@@ -78,6 +80,13 @@ pub struct QuicConnection {
     accepted: VecDeque<QuicPeerStream>,
     stats: ConnectionStats,
     next_request: u64,
+    /// Received datagrams that haven't been read, oldest first.
+    datagrams: VecDeque<RecvPacket>,
+    datagram_bytes: usize,
+    /// The most bytes `datagrams` holds before the oldest are dropped.
+    datagram_buffer: usize,
+    min_datagram_size: Option<usize>,
+    max_datagram_size: Option<usize>,
 }
 
 impl fmt::Debug for QuicConnection {
@@ -89,6 +98,7 @@ impl fmt::Debug for QuicConnection {
             .field("closing", &self.closing.load(Ordering::Relaxed))
             .field("lost", &self.lost)
             .field("accepted", &self.accepted.len())
+            .field("unread_datagrams", &self.datagrams.len())
             .finish_non_exhaustive()
     }
 }
@@ -99,6 +109,7 @@ impl QuicConnection {
         conn: ConnId,
         connection_id: ConnectionId,
         remote_addr: SocketAddr,
+        datagram_buffer: usize,
     ) -> Self {
         Self {
             link,
@@ -111,6 +122,11 @@ impl QuicConnection {
             accepted: VecDeque::new(),
             stats: ConnectionStats::default(),
             next_request: 0,
+            datagrams: VecDeque::new(),
+            datagram_bytes: 0,
+            datagram_buffer,
+            min_datagram_size: None,
+            max_datagram_size: None,
         }
     }
 
@@ -136,13 +152,46 @@ impl QuicConnection {
 
     pub(crate) fn deliver(&mut self, delivery: ConnDelivery) {
         match delivery {
-            ConnDelivery::Connected => self.connected = true,
+            ConnDelivery::Connected { min_datagram_size } => {
+                self.connected = true;
+                self.min_datagram_size = min_datagram_size;
+            }
             ConnDelivery::Lost(reason) => {
                 self.lost.get_or_insert(reason);
             }
             ConnDelivery::Accepted(stream) => self.accepted.push_back(*stream),
-            ConnDelivery::Stats(stats) => self.stats = stats,
+            ConnDelivery::Stats {
+                stats,
+                max_datagram_size,
+            } => {
+                self.stats = stats;
+                self.max_datagram_size = max_datagram_size;
+            }
+            ConnDelivery::Datagrams(data, recv_at) => {
+                if self.closing.load(Ordering::Relaxed) {
+                    return;
+                }
+                for payload in data {
+                    self.datagram_bytes += payload.len();
+                    self.datagrams.push_back(RecvPacket { recv_at, payload });
+                }
+                while self.datagram_bytes > self.datagram_buffer
+                    && let Some(old) = self.datagrams.pop_front()
+                {
+                    self.datagram_bytes -= old.payload.len();
+                }
+            }
         }
+    }
+
+    /// The largest datagram the connection can send whatever the path MTU,
+    /// or `None` if the peer doesn't accept datagrams.
+    pub(crate) fn min_datagram_size(&self) -> Option<usize> {
+        self.min_datagram_size
+    }
+
+    pub(crate) fn has_datagrams(&self) -> bool {
+        !self.datagrams.is_empty()
     }
 
     /// Takes the oldest stream the peer opened, if any.
@@ -250,6 +299,13 @@ impl QuicConnection {
     /// streams that hasn't been sent yet is lost: close or finish the streams
     /// and wait for them to close first to deliver it.
     pub fn close(&self, code: AppErrorCode) {
+        self.close_with_reason(code, Bytes::new());
+    }
+
+    /// Like [Self::close], also sending `reason` to the peer, which sees it
+    /// in [ConnectionError::ApplicationClosed]. A reason too long to fit in
+    /// a packet is cut short.
+    pub fn close_with_reason(&self, code: AppErrorCode, reason: impl Into<Bytes>) {
         if !self.is_open() {
             return;
         }
@@ -258,8 +314,78 @@ impl QuicConnection {
         self.link.send(Command::Close {
             conn: self.conn,
             code,
-            reason: Bytes::new(),
+            reason: reason.into(),
         });
+    }
+
+    /// Queues an unreliable datagram to send to the peer.
+    ///
+    /// Datagrams may be lost, duplicated or arrive out of order, and are
+    /// never retransmitted. They are sent as soon as congestion control
+    /// allows. If they're queued faster than that, the oldest queued
+    /// datagrams are dropped to make room, and counted in
+    /// [ConnectionStats::datagrams_dropped].
+    ///
+    /// Returns [DatagramError::TooLarge] if `data` is larger than
+    /// [Self::max_datagram_size], [DatagramError::Unsupported] if the peer
+    /// doesn't accept datagrams, and [DatagramError::Closed] if the
+    /// connection is closed.
+    pub fn send_datagram(&self, data: Bytes) -> Result<(), DatagramError> {
+        if !self.is_open() {
+            return Err(DatagramError::Closed);
+        }
+        let Some(max) = self.max_datagram_size else {
+            return Err(DatagramError::Unsupported);
+        };
+        if data.len() > max {
+            return Err(DatagramError::TooLarge {
+                size: data.len(),
+                max,
+            });
+        }
+
+        self.send_datagrams(vec![data]);
+        Ok(())
+    }
+
+    /// Queues datagrams without checking their size. The network thread
+    /// drops, and counts, the ones that don't fit.
+    pub(crate) fn send_datagrams(&self, data: Vec<Bytes>) {
+        if self.is_open() && !data.is_empty() {
+            self.link.send(Command::SendDatagrams {
+                conn: self.conn,
+                data,
+            });
+        }
+    }
+
+    /// Takes the oldest datagram received from the peer, if any.
+    ///
+    /// Datagrams are delivered once per frame. Up to a fixed number of bytes
+    /// of them are kept until they're read; past that, the oldest are
+    /// dropped.
+    pub fn recv_datagram(&mut self) -> Option<RecvPacket> {
+        let packet = self.datagrams.pop_front()?;
+        self.datagram_bytes -= packet.payload.len();
+        Some(packet)
+    }
+
+    /// Takes up to `limit` received datagrams, oldest first, and pushes them
+    /// to `buffer`. Returns how many were pushed.
+    pub fn recv_datagrams(&mut self, buffer: &mut Vec<RecvPacket>, limit: usize) -> usize {
+        let count = limit.min(self.datagrams.len());
+        let start = buffer.len();
+        buffer.extend(self.datagrams.drain(..count));
+        let bytes: usize = buffer[start..].iter().map(|p| p.payload.len()).sum();
+        self.datagram_bytes -= bytes;
+        count
+    }
+
+    /// The largest datagram [Self::send_datagram] accepts, or `None` if the
+    /// peer doesn't accept datagrams. It grows as path MTU discovery finds
+    /// larger sizes.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.max_datagram_size
     }
 
     /// Returns true if the connection is still open.

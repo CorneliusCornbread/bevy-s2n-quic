@@ -60,6 +60,7 @@ impl UdpSocket {
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
         let state = UdpSocketState::new((&socket).into())?;
+        grow_buffers(&socket, &state);
         socket.set_nonblocking(true)?;
 
         Ok(Self {
@@ -70,6 +71,30 @@ impl UdpSocket {
 
     pub fn register(&mut self, registry: &Registry, endpoint: EndpointId) -> io::Result<()> {
         registry.register(&mut self.io, token(endpoint), Interest::READABLE)
+    }
+}
+
+/// The socket buffer size to ask for. A server's connections all share one
+/// socket, and the usual OS default (about 200 KB on Linux) overflows when
+/// hundreds of clients send at once, so datagrams are dropped before the
+/// driver reads them. The OS may cap the size lower (on Linux,
+/// `net.core.rmem_max` and `net.core.wmem_max`).
+const SOCKET_BUFFER: usize = 4 << 20;
+
+fn grow_buffers(socket: &std::net::UdpSocket, state: &UdpSocketState) {
+    let result = (|| {
+        if state.recv_buffer_size(socket.into())? < SOCKET_BUFFER {
+            state.set_recv_buffer_size(socket.into(), SOCKET_BUFFER)?;
+        }
+        if state.send_buffer_size(socket.into())? < SOCKET_BUFFER {
+            state.set_send_buffer_size(socket.into(), SOCKET_BUFFER)?;
+        }
+        io::Result::Ok(())
+    })();
+
+    // The defaults still work, just with more loss under load.
+    if let Err(e) = result {
+        tracing::debug!("can't grow the socket buffers: {e}");
     }
 }
 

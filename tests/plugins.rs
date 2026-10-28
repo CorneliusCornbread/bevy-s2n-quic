@@ -1,13 +1,16 @@
 //! Bevy-level tests of the plugins: stream attempts, what happens when
-//! streams and connections close, the connection limit, and several network
-//! threads.
+//! streams and connections close, datagrams, aeronet sessions in both
+//! modes, the connection limit, and several network threads.
 
 use std::{
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
-use aeronet_io::{Session, connection::Disconnected};
+use aeronet_io::{
+    Session, SessionEndpoint,
+    connection::{Disconnect, DisconnectReason, Disconnected, PeerAddr},
+};
 use bevy::{
     MinimalPlugins,
     app::{App, PluginGroup, PluginGroupBuilder},
@@ -27,10 +30,14 @@ use bevy_s2n_quic::{
         connection::{
             QuicConnection, QuicConnectionAttempt, disconnect::ConnectionDisconnectReason,
         },
-        error::{AppErrorCode, ConnectionError},
+        error::{AppErrorCode, ConnectionError, DatagramError},
         plugin::DisconnectHandlerPlugin,
         runtime::QuicRuntime,
-        stream::{receive::QuicReceiveStream, send::QuicSendStream},
+        stream::{
+            receive::QuicReceiveStream,
+            send::QuicSendStream,
+            session::{QuicAeronetPacketPlugin, QuicSessionMode},
+        },
     },
     config::{QuicClientConfig, QuicServerConfig},
     driver_plugin::QuicDriverPlugin,
@@ -236,15 +243,85 @@ fn finished_receive_stream_is_kept_until_its_data_is_read() {
     });
 }
 
+/// Packets of several sizes, for checking they arrive whole.
+fn session_packets(large: usize) -> Vec<Bytes> {
+    vec![
+        Bytes::from_static(b"hello"),
+        Bytes::new(),
+        Bytes::from(pattern(0, large)),
+        Bytes::from_static(b"world"),
+    ]
+}
+
+/// Runs frames, collecting the packets `entity`'s session receives, until
+/// `count` have arrived. Packets must be taken every frame, or aeronet
+/// clears them.
+fn receive_session_packets(app: &mut App, entity: Entity, count: usize) -> Vec<Bytes> {
+    let mut received = Vec::new();
+    update_until(app, "receiving the packets", |world| {
+        let mut session = world.get_mut::<Session>(entity)?;
+        received.extend(session.recv.drain(..).map(|packet| packet.payload));
+        (received.len() >= count).then_some(())
+    });
+    received
+}
+
 #[test]
-fn aeronet_session_packets_reach_the_peer() {
+fn datagram_sessions_carry_packets_between_connections() {
     let mut app = app_with(
         |plugins| plugins,
         |app| {
             app.add_plugins(QuicAeronetPlugins);
         },
     );
-    let (client, _) = connect(&mut app);
+    let (client, server) = connect(&mut app);
+    // Sessions are added when the connections are inserted.
+    app.update();
+
+    for entity in [client, server] {
+        let session = app.world().get::<Session>(entity).expect("no session");
+        assert!(session.min_mtu() > 1000);
+        assert!(session.mtu() >= session.min_mtu());
+        assert!(app.world().get::<PeerAddr>(entity).is_some());
+    }
+    let mtu = app.world().get::<Session>(client).unwrap().mtu();
+
+    app.world_mut()
+        .get_mut::<Session>(client)
+        .unwrap()
+        .send
+        .extend(session_packets(mtu));
+    let mut received = receive_session_packets(&mut app, server, 4);
+    // Datagrams may be reordered.
+    received.sort();
+    let mut sent = session_packets(mtu);
+    sent.sort();
+    assert_eq!(received, sent);
+
+    let stats = app.world().get::<Session>(server).unwrap().stats;
+    assert_eq!(stats.packets_recv.0, 4);
+    let stats = app.world().get::<Session>(client).unwrap().stats;
+    assert_eq!(stats.packets_sent.0, 4);
+    let conn = app.world().get::<QuicConnection>(client).unwrap();
+    assert_eq!(conn.stats().datagrams_dropped, 0);
+}
+
+#[test]
+fn stream_sessions_keep_packet_boundaries() {
+    let mut app = app_with(
+        |plugins| plugins,
+        |app| {
+            app.add_plugins(
+                QuicAeronetPlugins
+                    .set(QuicAeronetPacketPlugin::new(QuicSessionMode::Streams)),
+            );
+        },
+    );
+    let (client, server) = connect(&mut app);
+    app.update();
+    // Connections have no session in stream mode.
+    assert!(app.world().get::<Session>(client).is_none());
+    assert!(app.world().get::<Session>(server).is_none());
 
     let attempt = app
         .world_mut()
@@ -253,22 +330,92 @@ fn aeronet_session_packets_reach_the_peer() {
         .open_bidrectional_stream()
         .unwrap();
     let stream = app.world_mut().spawn((attempt, QuicClientMarker)).id();
+    assert!(app.world().get::<SessionEndpoint>(stream).is_some());
     update_until(&mut app, "opening the stream", |world| {
-        world.get::<QuicSendStream>(stream).map(|_| ())
+        world.get::<Session>(stream).map(|_| ())
     });
 
+    // Larger than a QUIC packet, so the stream splits it.
+    let packets = session_packets(20_000);
     app.world_mut()
         .get_mut::<Session>(stream)
         .unwrap()
         .send
-        .push(Bytes::from_static(b"hello"));
+        .extend(packets.clone());
 
-    let packet = update_until(&mut app, "receiving the packet", |world| {
-        let server = find::<(With<QuicReceiveStream>, With<QuicServerMarker>)>(world)?;
-        let mut session = world.get_mut::<Session>(server)?;
-        session.recv.pop()
+    let server_stream = update_until(&mut app, "accepting the stream", |world| {
+        find::<(With<QuicReceiveStream>, With<QuicServerMarker>, With<Session>)>(world)
     });
-    assert_eq!(&packet.payload[..], b"hello");
+    assert_eq!(receive_session_packets(&mut app, server_stream, 4), packets);
+}
+
+#[test]
+fn connection_datagrams_reach_the_peer() {
+    let mut app = app(|plugins| plugins);
+    let (client, server) = connect(&mut app);
+
+    let conn = app.world().get::<QuicConnection>(client).unwrap();
+    let max = conn.max_datagram_size().expect("datagrams unsupported");
+    assert_eq!(
+        conn.send_datagram(Bytes::from(vec![0; max + 1])),
+        Err(DatagramError::TooLarge { size: max + 1, max })
+    );
+    conn.send_datagram(Bytes::from_static(b"ping")).unwrap();
+
+    let packet = update_until(&mut app, "receiving the datagram", |world| {
+        world
+            .get_mut::<QuicConnection>(server)
+            .unwrap()
+            .recv_datagram()
+    });
+    assert_eq!(&packet.payload[..], b"ping");
+
+    let conn = app.world().get::<QuicConnection>(client).unwrap();
+    conn.close(AppErrorCode::UNKNOWN);
+    assert_eq!(
+        conn.send_datagram(Bytes::from_static(b"late")),
+        Err(DatagramError::Closed)
+    );
+}
+
+#[derive(Resource, Default)]
+struct AeronetDisconnects(Vec<(Entity, String)>);
+
+#[test]
+fn aeronet_disconnect_reason_reaches_the_peer() {
+    let mut app = app_with(
+        |plugins| plugins,
+        |app| {
+            app.add_plugins(QuicAeronetPlugins);
+        },
+    );
+    app.init_resource::<AeronetDisconnects>().add_observer(
+        |event: On<Disconnected>, mut disconnects: ResMut<AeronetDisconnects>| {
+            let reason = match &event.reason {
+                DisconnectReason::ByPeer(reason) => format!("peer: {reason}"),
+                DisconnectReason::ByUser(reason) => format!("user: {reason}"),
+                DisconnectReason::ByError(e) => format!("error: {e}"),
+            };
+            disconnects.0.push((event.entity, reason));
+        },
+    );
+    let (client, server) = connect(&mut app);
+
+    app.world_mut()
+        .trigger(Disconnect::new(client, "game over"));
+    app.update();
+    // aeronet despawns the session.
+    assert!(app.world().get_entity(client).is_err());
+
+    update_until(&mut app, "disconnecting the server", |world| {
+        world.get_entity(server).is_err().then_some(())
+    });
+    let disconnects = &app.world().resource::<AeronetDisconnects>().0;
+    assert!(disconnects.contains(&(client, "user: game over".to_owned())));
+    assert!(
+        disconnects.contains(&(server, "peer: game over".to_owned())),
+        "{disconnects:?}"
+    );
 }
 
 #[derive(Resource, Default)]

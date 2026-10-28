@@ -24,6 +24,10 @@
 ///   - `active` – every stream sends.
 ///   - `idle` – every connection stays open, but only `--idle-fraction`
 ///     of the streams send. This exposes per-task polling cost.
+///   - `datagram` – every connection sends its messages as unreliable
+///     datagrams instead of on its stream. Loss is reported but doesn't fail
+///     the phase, and neither do datagrams dropped because the send buffer
+///     was full (`dgram dropped`).
 /// - At the end a markdown table is printed to stdout, and optionally
 ///   appended to `--out <file>`. The process exits with an error if any
 ///   phase lost data or failed to open all of its streams.
@@ -65,7 +69,8 @@
 /// - `wakes` – times the network threads were woken by the Bevy thread, per
 ///   frame. At most one per thread.
 /// - `lost` – cumulative bytes sent minus bytes received after the drain.
-///   Must be 0.
+///   Must be 0, except in the `datagram` scenario, where it's the bytes this
+///   phase lost.
 ///
 /// ## Usage
 ///
@@ -105,6 +110,7 @@ use bevy_s2n_quic::{
     client::{Connect, QuicClient, marker::QuicClientMarker},
     common::{
         connection::QuicConnection,
+        error::DatagramError,
         runtime::QuicRuntime,
         stream::{receive::QuicReceiveStream, send::QuicSendStream},
     },
@@ -146,6 +152,11 @@ const MAX_SPAWNS_PER_FRAME: usize = 50;
 /// parallel, so more threads only add wakeups.
 const MAX_COMPUTE_THREADS: usize = 4;
 
+/// The longest a `datagram` phase waits for in-flight datagrams after
+/// sending stops. Lost ones never arrive, so there's no point waiting for
+/// `--drain`.
+const DATAGRAM_DRAIN: Duration = Duration::from_secs(1);
+
 /// How often `--role clients` retries the control connection.
 const CONTROL_RETRY: Duration = Duration::from_millis(250);
 
@@ -159,6 +170,7 @@ const LOG_FILTER: &str = "info,bevy_s2n_quic=warn,s2n_quic=warn";
 enum Scenario {
     Active,
     Idle,
+    Datagram,
 }
 
 impl Scenario {
@@ -166,6 +178,7 @@ impl Scenario {
         match self {
             Scenario::Active => "active",
             Scenario::Idle => "idle",
+            Scenario::Datagram => "datagram",
         }
     }
 
@@ -173,6 +186,7 @@ impl Scenario {
         match s {
             "active" => Some(Scenario::Active),
             "idle" => Some(Scenario::Idle),
+            "datagram" => Some(Scenario::Datagram),
             _ => None,
         }
     }
@@ -251,7 +265,7 @@ Options:
   --addr <IP:PORT>        QUIC server address [default: 127.0.0.1:17779]
   --control <IP:PORT>     Control address for --role server|clients [default: 127.0.0.1:17780]
   --clients <N,N,..>      Client counts to run, ascending [default: 100,300,600]
-  --scenarios <S,S,..>    Scenarios per client count: active, idle [default: active,idle]
+  --scenarios <S,S,..>    Scenarios per client count: active, idle, datagram [default: active,idle]
   --duration <SECS>       Measure window per phase [default: 10]
   --warmup <SECS>         Warmup per phase before measuring [default: 2]
   --drain <SECS>          Max time to wait for in-flight data after a phase [default: 5]
@@ -415,7 +429,7 @@ impl Phase {
     /// Number of streams that send during this phase.
     fn senders(&self, idle_fraction: f64) -> usize {
         match self.scenario {
-            Scenario::Active => self.clients,
+            Scenario::Active | Scenario::Datagram => self.clients,
             Scenario::Idle => ((self.clients as f64) * idle_fraction).ceil() as usize,
         }
     }
@@ -565,6 +579,7 @@ impl ThreadPlan {
 }
 
 static PIN_WARNED: AtomicBool = AtomicBool::new(false);
+static DATAGRAM_WARNED: AtomicBool = AtomicBool::new(false);
 static NICE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Thread callbacks can run before logging is set up, so use stderr, and
@@ -867,6 +882,13 @@ struct StressBench {
     bytes_sent: u64,
     bytes_received: u64,
     send_full: u64,
+    // The same for the datagrams the `datagram` scenario sends instead.
+    dgram_sent: u64,
+    dgram_received: u64,
+    /// Datagrams the client connections dropped before sending them, summed.
+    dgram_dropped: u64,
+    /// Datagram bytes lost by earlier `datagram` phases.
+    dgram_lost_before: i64,
 
     // Measure window state.
     window: Option<WindowStart>,
@@ -880,8 +902,9 @@ struct StressBench {
     control_listener: Option<TcpListener>,
     /// The phase announced by the last `begin` (`--role server`).
     remote_phase: Option<Phase>,
-    /// Last `bytes_received` sent to the clients (`--role server`).
-    reported_received: Option<u64>,
+    /// Last `(bytes_received, dgram_received)` sent to the clients
+    /// (`--role server`).
+    reported_received: Option<(u64, u64)>,
 
     frame_start: Instant,
     results: Vec<PhaseResult>,
@@ -908,6 +931,10 @@ impl StressBench {
             bytes_sent: 0,
             bytes_received: 0,
             send_full: 0,
+            dgram_sent: 0,
+            dgram_received: 0,
+            dgram_dropped: 0,
+            dgram_lost_before: 0,
             window: None,
             frame_work_ms: Vec::new(),
             frame_interval_ms: Vec::new(),
@@ -942,18 +969,28 @@ impl StressBench {
         }
     }
 
+    /// Cumulative `(sent, received)` bytes of what `scenario` sends.
+    fn totals(&self, scenario: Scenario) -> (u64, u64) {
+        match scenario {
+            Scenario::Datagram => (self.dgram_sent, self.dgram_received),
+            Scenario::Active | Scenario::Idle => (self.bytes_sent, self.bytes_received),
+        }
+    }
+
     /// Starts the measure window.
-    fn start_window(&mut self, runtime: &QuicRuntime) {
+    fn start_window(&mut self, runtime: &QuicRuntime, scenario: Scenario) {
         self.frame_work_ms.clear();
         self.frame_interval_ms.clear();
+        let (bytes_sent, bytes_received) = self.totals(scenario);
         self.window = Some(WindowStart {
             at: Instant::now(),
             cpu: process_cpu_time(),
             driver_busy: driver_busy(runtime),
             wakes: driver_wakes(runtime),
-            bytes_sent: self.bytes_sent,
-            bytes_received: self.bytes_received,
+            bytes_sent,
+            bytes_received,
             send_full: self.send_full,
+            dgram_dropped: self.dgram_dropped,
         });
         self.enter(Stage::Measure);
     }
@@ -963,6 +1000,7 @@ impl StressBench {
         let start = self.window.take().expect("measure window missing");
         let mut work = std::mem::take(&mut self.frame_work_ms);
         let mut interval = std::mem::take(&mut self.frame_interval_ms);
+        let (sent, received) = self.totals(phase.scenario);
 
         self.pending = Some(PhaseResult {
             phase,
@@ -978,9 +1016,11 @@ impl StressBench {
             driver_busy: driver_busy(runtime).saturating_sub(start.driver_busy),
             drivers: runtime.thread_count(),
             wakes: driver_wakes(runtime) - start.wakes,
-            sent: self.bytes_sent - start.bytes_sent,
-            received: self.bytes_received.saturating_sub(start.bytes_received),
+            sent: sent - start.bytes_sent,
+            received: received.saturating_sub(start.bytes_received),
             send_full: self.send_full - start.send_full,
+            // Completed after the drain.
+            dgram_dropped: start.dgram_dropped,
             lost: 0,
         });
         self.enter(Stage::Drain);
@@ -990,12 +1030,11 @@ impl StressBench {
     fn complete_phase(&mut self, lost: i64) {
         let mut result = self.pending.take().expect("pending result missing");
         result.lost = lost;
+        result.dgram_dropped = self.dgram_dropped.saturating_sub(result.dgram_dropped);
 
-        if lost != 0 {
-            warn!(
-                "Byte mismatch after drain: sent {} / received {} (Δ {lost})",
-                self.bytes_sent, self.bytes_received
-            );
+        let (sent, received) = self.totals(result.phase.scenario);
+        if lost != 0 && result.phase.scenario != Scenario::Datagram {
+            warn!("Byte mismatch after drain: sent {sent} / received {received} (Δ {lost})");
         }
         info!("{}", summary_line(&result));
         self.results.push(result);
@@ -1011,6 +1050,7 @@ struct WindowStart {
     bytes_sent: u64,
     bytes_received: u64,
     send_full: u64,
+    dgram_dropped: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1032,13 +1072,19 @@ struct PhaseResult {
     sent: u64,
     received: u64,
     send_full: u64,
-    /// Cumulative sent − received after the drain.
+    /// Datagrams the clients dropped before sending them, from the start of
+    /// the window to the end of the drain.
+    dgram_dropped: u64,
+    /// Cumulative sent − received after the drain. For the `datagram`
+    /// scenario, only what this phase lost.
     lost: i64,
 }
 
 impl PhaseResult {
+    /// Datagrams are unreliable, so losing them doesn't fail a phase.
     fn ok(&self) -> bool {
-        self.lost == 0 && self.streams_ready >= self.phase.clients
+        (self.lost == 0 || self.phase.scenario == Scenario::Datagram)
+            && self.streams_ready >= self.phase.clients
     }
 }
 
@@ -1103,7 +1149,10 @@ fn main() -> AppExit {
 
     match role {
         Role::Both => app
-            .add_systems(Update, (drive, spawn_clients, open_streams).chain())
+            .add_systems(
+                Update,
+                (drive, spawn_clients, open_streams, track_datagram_drops).chain(),
+            )
             .add_systems(FixedPostUpdate, (client_send, server_recv)),
         Role::Server => app
             .add_systems(Update, serve_control)
@@ -1111,7 +1160,14 @@ fn main() -> AppExit {
         Role::Clients => app
             .add_systems(
                 Update,
-                (client_control, drive, spawn_clients, open_streams).chain(),
+                (
+                    client_control,
+                    drive,
+                    spawn_clients,
+                    open_streams,
+                    track_datagram_drops,
+                )
+                    .chain(),
             )
             .add_systems(FixedPostUpdate, client_send),
     };
@@ -1265,9 +1321,9 @@ fn drive(
 
         Stage::Warmup => {
             if elapsed >= bench.cfg.warmup {
-                bench.start_window(&runtime);
-
                 let phase = bench.phase();
+                bench.start_window(&runtime, phase.scenario);
+
                 let (senders, ready) = (bench.senders, bench.streams_ready);
                 bench.send_control(format_args!(
                     "begin {} {} {senders} {ready}",
@@ -1288,10 +1344,22 @@ fn drive(
         }
 
         Stage::Drain => {
-            let drained = bench.bytes_received >= bench.bytes_sent;
+            let scenario = bench.phase().scenario;
+            let (sent, received) = bench.totals(scenario);
+            let drained = received >= sent;
+            let limit = match scenario {
+                Scenario::Datagram => bench.cfg.drain.min(DATAGRAM_DRAIN),
+                Scenario::Active | Scenario::Idle => bench.cfg.drain,
+            };
 
-            if drained || elapsed >= bench.cfg.drain {
-                let lost = bench.bytes_sent as i64 - bench.bytes_received as i64;
+            if drained || elapsed >= limit {
+                let mut lost = sent as i64 - received as i64;
+                if scenario == Scenario::Datagram {
+                    // Datagrams lost by earlier phases never arrive.
+                    let total = lost;
+                    lost -= bench.dgram_lost_before;
+                    bench.dgram_lost_before = total;
+                }
                 bench.complete_phase(lost);
 
                 let sent = bench.bytes_sent;
@@ -1331,17 +1399,23 @@ fn client_control(mut bench: ResMut<StressBench>, mut exit: MessageWriter<AppExi
     let mut received = None;
     for line in link.poll() {
         match line.split_once(' ') {
-            Some(("recv", n)) => match n.parse::<u64>() {
-                Ok(n) => received = Some(n),
-                Err(e) => warn!("Bad control message {line:?}: {e}"),
-            },
+            Some(("recv", counts)) => {
+                let counts: Result<Vec<u64>, _> =
+                    counts.split_whitespace().map(str::parse).collect();
+                match counts.as_deref() {
+                    Ok(&[bytes, dgram]) => received = Some((bytes, dgram)),
+                    Ok(_) => warn!("Bad control message {line:?}"),
+                    Err(e) => warn!("Bad control message {line:?}: {e}"),
+                }
+            }
             _ => warn!("Unknown control message {line:?}"),
         }
     }
     let closed = link.closed.clone();
 
-    if let Some(n) = received {
-        bench.bytes_received = n;
+    if let Some((bytes, dgram)) = received {
+        bench.bytes_received = bytes;
+        bench.dgram_received = dgram;
     }
     if let Some(reason) = closed
         && bench.stage != Stage::Done
@@ -1401,9 +1475,10 @@ fn serve_control(
         return;
     }
 
-    if bench.reported_received != Some(bench.bytes_received) {
-        link.send(format_args!("recv {}", bench.bytes_received));
-        bench.reported_received = Some(bench.bytes_received);
+    let received = (bench.bytes_received, bench.dgram_received);
+    if bench.reported_received != Some(received) {
+        link.send(format_args!("recv {} {}", received.0, received.1));
+        bench.reported_received = Some(received);
     }
 
     if let Some(reason) = &link.closed {
@@ -1443,7 +1518,7 @@ fn handle_control(
                 bench.senders
             );
             bench.remote_phase = Some(phase);
-            bench.start_window(runtime);
+            bench.start_window(runtime, scenario);
         }
         "end" => {
             if bench.stage != Stage::Measure {
@@ -1557,6 +1632,7 @@ fn client_send(
         (&mut QuicSendStream, &StressClientStream),
         With<QuicClientMarker>,
     >,
+    connections: Query<(&QuicConnection, &StressClientIndex), With<QuicClientMarker>>,
     mut bench: ResMut<StressBench>,
 ) {
     if !bench.sending() {
@@ -1568,6 +1644,33 @@ fn client_send(
     let burst = bench.cfg.burst;
     let mut sent = 0u64;
     let mut full = 0u64;
+
+    if bench.phase().scenario == Scenario::Datagram {
+        for (connection, index) in &connections {
+            if index.0 >= senders || !connection.is_open() {
+                continue;
+            }
+            for _ in 0..burst {
+                match connection.send_datagram(payload.clone()) {
+                    Ok(()) => sent += payload.len() as u64,
+                    Err(e) => {
+                        if let DatagramError::TooLarge { max, .. } = e {
+                            warn_once(&DATAGRAM_WARNED, || {
+                                format!(
+                                    "--payload {} is larger than the largest datagram, {max} B",
+                                    payload.len()
+                                )
+                            });
+                        }
+                        full += 1;
+                    }
+                }
+            }
+        }
+        bench.dgram_sent += sent;
+        bench.send_full += full;
+        return;
+    }
 
     for (mut stream, meta) in &mut streams {
         if meta.index >= senders || !stream.is_open() {
@@ -1597,10 +1700,22 @@ const SERVER_RECV_BATCH: usize = 256;
 
 fn server_recv(
     mut streams: Query<&mut QuicReceiveStream, With<QuicServerMarker>>,
+    mut connections: Query<&mut QuicConnection, With<QuicServerMarker>>,
     mut bench: ResMut<StressBench>,
     mut buffer: Local<Vec<aeronet_io::packet::RecvPacket>>,
 ) {
     let mut received = 0u64;
+
+    let mut datagrams = 0u64;
+    for mut connection in &mut connections {
+        while connection.recv_datagrams(&mut buffer, SERVER_RECV_BATCH) > 0 {
+            datagrams += buffer
+                .drain(..)
+                .map(|packet| packet.payload.len() as u64)
+                .sum::<u64>();
+        }
+    }
+    bench.dgram_received += datagrams;
 
     // Closed streams are still drained so buffered data is not miscounted.
     for mut stream in &mut streams {
@@ -1618,6 +1733,17 @@ fn server_recv(
     }
 
     bench.bytes_received += received;
+}
+
+/// Sums the datagrams the client connections have dropped.
+fn track_datagram_drops(
+    connections: Query<&QuicConnection, With<QuicClientMarker>>,
+    mut bench: ResMut<StressBench>,
+) {
+    bench.dgram_dropped = connections
+        .iter()
+        .map(|connection| connection.stats().datagrams_dropped)
+        .sum();
 }
 
 /// A payload of `size` bytes cycling through `A..Z`.
@@ -1691,7 +1817,7 @@ fn summary_line(r: &PhaseResult) -> String {
     let wall = r.wall.as_secs_f64();
     format!(
         "{:>4} clients {:<6} ({:>4} sending): frame avg {:.2}ms p99 {:.2}ms | \
-         cpu {:.2} cores | driver busy {:.0}% | wakes {:.1}/frame | rx {}/s | lost {} B{}",
+         cpu {:.2} cores | driver busy {:.0}% | wakes {:.1}/frame | rx {}/s | lost {} B{}{}",
         r.phase.clients,
         r.phase.scenario.name(),
         r.senders,
@@ -1702,6 +1828,11 @@ fn summary_line(r: &PhaseResult) -> String {
         wakes_per_frame(r),
         fmt_bytes((r.received as f64 / wall) as u64),
         r.lost,
+        if r.phase.scenario == Scenario::Datagram {
+            format!(" | dgram dropped {}", r.dgram_dropped)
+        } else {
+            String::new()
+        },
         if r.ok() { "" } else { "  [FAIL]" },
     )
 }
@@ -1761,11 +1892,11 @@ fn report(bench: &StressBench) -> bool {
         md,
         "| clients | scenario | senders | ready | frames | frame avg ms | frame p99 ms \
          | frame max ms | interval p99 ms | cpu cores | driver busy (thread-s) | driver busy % \
-         | wakes/frame | sent | received | send full | lost B | ok |"
+         | wakes/frame | sent | received | send full | dgram dropped | lost B | ok |"
     );
     let _ = writeln!(
         md,
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
     );
 
     for r in &bench.results {
@@ -1773,7 +1904,7 @@ fn report(bench: &StressBench) -> bool {
         let _ = writeln!(
             md,
             "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} \
-             | {:.1} | {} | {} | {} | {} | {} |",
+             | {:.1} | {} | {} | {} | {} | {} | {} |",
             r.phase.clients,
             r.phase.scenario.name(),
             r.senders,
@@ -1790,6 +1921,7 @@ fn report(bench: &StressBench) -> bool {
             fmt_bytes(r.sent),
             fmt_bytes(r.received),
             r.send_full,
+            r.dgram_dropped,
             r.lost,
             if r.ok() { "✓" } else { "✗" },
         );

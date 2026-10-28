@@ -115,6 +115,10 @@ impl QuicReceiveStream {
         }
     }
 
+    pub(crate) fn has_unread(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     /// Receives a single packet from the QUIC stream.
     pub fn recv(&mut self) -> Option<RecvPacket> {
         let packet = self.queue.pop_front()?;

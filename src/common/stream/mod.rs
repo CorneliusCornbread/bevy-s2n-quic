@@ -1,4 +1,3 @@
-use aeronet_io::SessionEndpoint;
 use bevy::{
     ecs::component::Component,
     prelude::{Deref, DerefMut},
@@ -10,6 +9,7 @@ use crate::common::{
     stream::{receive::QuicReceiveStream, send::QuicSendStream},
 };
 
+pub(crate) mod framing;
 pub mod id;
 pub mod plugin;
 pub mod receive;
@@ -27,7 +27,6 @@ pub mod session;
 /// will be added on the entity.
 #[derive(Deref, DerefMut, Component)]
 #[component(storage = "SparseSet")]
-#[require(SessionEndpoint)]
 pub struct QuicReceiveStreamAttempt(
     QuicActionAttempt<Option<QuicReceiveStream>, ConnectionId>,
 );
@@ -49,7 +48,6 @@ impl QuicReceiveStreamAttempt {
 /// will be added on the entity.
 #[derive(Deref, DerefMut, Component)]
 #[component(storage = "SparseSet")]
-#[require(SessionEndpoint)]
 pub struct QuicSendStreamAttempt(QuicActionAttempt<Option<QuicSendStream>, ConnectionId>);
 
 impl QuicSendStreamAttempt {
@@ -70,7 +68,6 @@ impl QuicSendStreamAttempt {
 /// will be added on the entity.
 #[derive(Deref, DerefMut, Component)]
 #[component(storage = "SparseSet")]
-#[require(SessionEndpoint)]
 pub struct QuicBidirectionalStreamAttempt(
     QuicActionAttempt<Option<(QuicReceiveStream, QuicSendStream)>, ConnectionId>,
 );
@@ -100,7 +97,6 @@ impl QuicBidirectionalStreamAttempt {
 /// will be added on the entity.
 #[derive(Component, Deref, DerefMut)]
 #[component(storage = "SparseSet")]
-#[require(SessionEndpoint)]
 pub struct QuicPeerStreamAttempt(QuicActionAttempt<Option<QuicPeerStream>, ConnectionId>);
 
 impl QuicPeerStreamAttempt {

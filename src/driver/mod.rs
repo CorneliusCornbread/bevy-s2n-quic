@@ -10,6 +10,7 @@
 
 mod config;
 mod core;
+mod datagram;
 mod io;
 mod protocol;
 

@@ -21,4 +21,10 @@ pub struct ConnectionStats {
     pub bytes_sent: u64,
     /// Bytes received in UDP datagrams, including QUIC overhead.
     pub bytes_received: u64,
+    /// Datagrams queued with
+    /// [send_datagram][super::QuicConnection::send_datagram] that were
+    /// never sent. Most are dropped, oldest first, to make room when
+    /// datagrams are queued faster than the connection can send them.
+    /// Datagrams larger than the path allows are dropped too.
+    pub datagrams_dropped: u64,
 }

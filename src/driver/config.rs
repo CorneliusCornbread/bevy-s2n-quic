@@ -39,6 +39,13 @@ pub(crate) struct EndpointOptions {
     /// Bytes each receive stream may have delivered that the owner hasn't
     /// consumed yet.
     pub recv_budget: usize,
+    /// Bytes of datagrams each connection may have queued to send. Past it,
+    /// the oldest queued datagrams are dropped.
+    pub datagram_send_buffer: usize,
+    /// Bytes of received datagrams each connection buffers before the
+    /// oldest are dropped. Also limits the size of one datagram from the
+    /// peer.
+    pub datagram_receive_buffer: usize,
     /// Seeds quinn's random number generator, for reproducible tests.
     pub rng_seed: Option<[u8; 32]>,
 }
@@ -51,6 +58,8 @@ impl Default for EndpointOptions {
             max_connections: usize::MAX,
             send_budget: 1 << 20,
             recv_budget: 1 << 20,
+            datagram_send_buffer: 256 << 10,
+            datagram_receive_buffer: 1 << 20,
             rng_seed: None,
         }
     }
@@ -65,6 +74,7 @@ pub(crate) struct EndpointSetup {
     pub(super) max_connections: usize,
     pub(super) send_budget: usize,
     pub(super) recv_budget: usize,
+    pub(super) datagram_send_buffer: usize,
 }
 
 #[derive(Clone)]
@@ -122,6 +132,7 @@ impl EndpointSetup {
             max_connections: options.max_connections,
             send_budget: options.send_budget,
             recv_budget: options.recv_budget,
+            datagram_send_buffer: options.datagram_send_buffer,
         }
     }
 }
@@ -144,7 +155,9 @@ fn transport_config(options: &EndpointOptions) -> Arc<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport
         .max_idle_timeout(idle_timeout)
-        .keep_alive_interval(options.keep_alive_interval);
+        .keep_alive_interval(options.keep_alive_interval)
+        .datagram_send_buffer_size(options.datagram_send_buffer)
+        .datagram_receive_buffer_size(Some(options.datagram_receive_buffer));
 
     Arc::new(transport)
 }
@@ -178,7 +191,10 @@ pub(super) fn connection_error(err: quinn_proto::ConnectionError) -> ConnectionE
     }
 }
 
-pub(super) fn connection_stats(conn: &quinn_proto::Connection) -> ConnectionStats {
+pub(super) fn connection_stats(
+    conn: &quinn_proto::Connection,
+    datagrams_dropped: u64,
+) -> ConnectionStats {
     let stats = conn.stats();
     ConnectionStats {
         rtt: stats.path.rtt,
@@ -188,6 +204,7 @@ pub(super) fn connection_stats(conn: &quinn_proto::Connection) -> ConnectionStat
         current_mtu: stats.path.current_mtu,
         bytes_sent: stats.udp_tx.bytes,
         bytes_received: stats.udp_rx.bytes,
+        datagrams_dropped,
     }
 }
 

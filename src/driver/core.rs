@@ -32,6 +32,7 @@ use super::{
     config::{
         EndpointSetup, Role, connection_error, connection_stats, from_varint, to_varint,
     },
+    datagram::{DatagramQueue, datagram_sizes},
     io::{Io, Socket},
     protocol::{
         Command, ConnId, Dir, EndpointId, Event, IdAllocator, RecvBudget, SendBudget,
@@ -119,6 +120,7 @@ struct Conn {
     pending_reads: Vec<proto::StreamId>,
     send_budget: usize,
     recv_budget: usize,
+    datagrams: DatagramQueue,
 }
 
 #[derive(Default)]
@@ -380,13 +382,15 @@ impl<I: Io> Core<I> {
                 self.conns[key].pending_reads.push(to_proto_stream(stream));
                 self.mark_dirty(key);
             }
-            Command::SendDatagram { conn, data } => {
+            Command::SendDatagrams { conn, data } => {
                 let Some(key) = self.conn_keys.get(&conn).copied() else {
                     return;
                 };
-                if let Err(e) = self.conns[key].inner.datagrams().send(data, true) {
-                    tracing::debug!("can't send datagram on connection {}: {e}", conn.0);
+                let c = &mut self.conns[key];
+                if c.lost {
+                    return;
                 }
+                c.datagrams.send(&mut c.inner, data);
                 self.mark_dirty(key);
             }
             Command::Shutdown => self.running = false,
@@ -490,13 +494,14 @@ impl<I: Io> Core<I> {
         &mut self,
         ep_key: usize,
         handle: ConnectionHandle,
-        inner: proto::Connection,
+        mut inner: proto::Connection,
         id: ConnId,
     ) -> usize {
         let generation = self.next_generation;
         self.next_generation += 1;
 
         let ep = &mut self.endpoints[ep_key];
+        let datagrams = DatagramQueue::new(&mut inner, ep.setup.datagram_send_buffer);
         let key = self.conns.insert(Conn {
             id,
             endpoint: ep_key,
@@ -512,6 +517,7 @@ impl<I: Io> Core<I> {
             pending_reads: Vec::new(),
             send_budget: ep.setup.send_budget,
             recv_budget: ep.setup.recv_budget,
+            datagrams,
         });
         ep.conns.insert(handle, key);
         self.conn_keys.insert(id, key);
@@ -758,10 +764,7 @@ impl<I: Io> Core<I> {
             };
             c.stats_due = false;
             if !c.lost {
-                let _ = self.events.send(Event::Stats {
-                    conn: c.id,
-                    stats: connection_stats(&c.inner),
-                });
+                let _ = self.events.send(stats_event(c));
             }
         }
     }
@@ -778,11 +781,12 @@ impl<I: Io> Core<I> {
             match event {
                 proto::Event::HandshakeDataReady => {}
                 proto::Event::Connected => {
-                    emit(Event::Stats {
+                    emit(stats_event(c));
+                    let (_, min_datagram_size) = datagram_sizes(&mut c.inner);
+                    emit(Event::Connected {
                         conn,
-                        stats: connection_stats(&c.inner),
+                        min_datagram_size,
                     });
-                    emit(Event::Connected { conn });
                 }
                 proto::Event::ConnectionLost { reason } => {
                     c.streams.clear();
@@ -834,8 +838,10 @@ impl<I: Io> Core<I> {
                     open_pending(events, c, from_proto_dir(dir));
                 }
                 proto::Event::DatagramReceived => {
-                    while let Some(data) = c.inner.datagrams().recv() {
-                        emit(Event::Datagram { conn, data });
+                    let data: Vec<Bytes> =
+                        std::iter::from_fn(|| c.inner.datagrams().recv()).collect();
+                    if !data.is_empty() {
+                        emit(Event::Datagrams { conn, data });
                     }
                 }
                 proto::Event::DatagramsUnblocked => {}
@@ -992,6 +998,15 @@ impl<I: Io> Core<I> {
             self.readable.retain(|&k| k != key);
             self.emit(Event::EndpointClosed { endpoint: ep.id });
         }
+    }
+}
+
+fn stats_event(c: &mut Conn) -> Event {
+    let (max_datagram_size, _) = datagram_sizes(&mut c.inner);
+    Event::Stats {
+        conn: c.id,
+        stats: connection_stats(&c.inner, c.datagrams.dropped()),
+        max_datagram_size,
     }
 }
 

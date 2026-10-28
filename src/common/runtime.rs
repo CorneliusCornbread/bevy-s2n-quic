@@ -30,6 +30,8 @@ pub(crate) type ThreadStartHook = Arc<dyn Fn() + Send + Sync>;
 pub(crate) struct RuntimeOptions {
     pub threads: Option<usize>,
     pub max_connections: Option<usize>,
+    /// `(send, receive)` datagram buffer sizes, in bytes.
+    pub datagram_buffers: Option<(usize, usize)>,
     pub thread_name: Option<String>,
     pub on_thread_start: Option<ThreadStartHook>,
 }
@@ -113,10 +115,14 @@ impl QuicRuntime {
             })
             .collect();
 
-        let endpoint_options = EndpointOptions {
+        let mut endpoint_options = EndpointOptions {
             max_connections: options.max_connections.unwrap_or(usize::MAX),
             ..Default::default()
         };
+        if let Some((send, receive)) = options.datagram_buffers {
+            endpoint_options.datagram_send_buffer = send;
+            endpoint_options.datagram_receive_buffer = receive;
+        }
         let (notices, notice_rx) = mpsc::channel();
 
         Self {

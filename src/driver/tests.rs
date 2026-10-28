@@ -89,10 +89,10 @@ impl Pair {
         let client = self.connect();
         let done = self.sim.run_until(Duration::from_secs(5), |sim| {
             has(&sim.drivers[CLIENT].log, |e| {
-                matches!(e, Event::Connected { conn } if *conn == client)
+                matches!(e, Event::Connected { conn, .. } if *conn == client)
             }) && accepted(&sim.drivers[SERVER].log)
                 .is_some_and(|server| has(&sim.drivers[SERVER].log, |e| {
-                    matches!(e, Event::Connected { conn } if *conn == server)
+                    matches!(e, Event::Connected { conn, .. } if *conn == server)
                 }))
         });
         assert!(done, "handshake didn't complete");
@@ -410,38 +410,165 @@ fn send_budget_is_released_as_quinn_accepts_data() {
     assert!(budget.try_reserve(4096));
 }
 
+fn received_datagrams(log: &[Event], conn: ConnId) -> Vec<Bytes> {
+    log.iter()
+        .filter_map(|e| match e {
+            Event::Datagrams { conn: c, data } if *c == conn => Some(data.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// The datagram sizes from the connection's `Connected` and latest `Stats`
+/// events, and its latest drop count.
+fn datagram_state(log: &[Event], conn: ConnId) -> (Option<usize>, Option<usize>, u64) {
+    let min = log.iter().find_map(|e| match e {
+        Event::Connected {
+            conn: c,
+            min_datagram_size,
+        } if *c == conn => Some(*min_datagram_size),
+        _ => None,
+    });
+    let (max, dropped) = log
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Event::Stats {
+                conn: c,
+                stats,
+                max_datagram_size,
+            } if *c == conn => Some((*max_datagram_size, stats.datagrams_dropped)),
+            _ => None,
+        })
+        .unwrap_or_default();
+    (min.flatten(), max, dropped)
+}
+
+/// A datagram of `len` bytes that starts with `index`.
+fn numbered(index: u16, len: usize) -> Bytes {
+    let mut data = vec![index as u8; len];
+    data[..2].copy_from_slice(&index.to_be_bytes());
+    Bytes::from(data)
+}
+
+fn index_of(datagram: &Bytes) -> u16 {
+    u16::from_be_bytes([datagram[0], datagram[1]])
+}
+
 #[test]
 fn datagrams_are_delivered() {
     let mut pair = Pair::new(seeded(1), seeded(2));
     let (client, server) = pair.connected();
 
-    for i in 0..50u8 {
+    let (min, max, _) = datagram_state(&pair.sim.drivers[CLIENT].log, client);
+    let (min, max) = (min.unwrap(), max.unwrap());
+    assert!(min > 1000 && min <= max, "min {min}, max {max}");
+
+    pair.sim.command(
+        CLIENT,
+        Command::SendDatagrams {
+            conn: client,
+            data: (0..50).map(|i| numbered(i, 100 + i as usize)).collect(),
+        },
+    );
+    assert!(pair.sim.run_until(Duration::from_secs(2), |sim| {
+        received_datagrams(&sim.drivers[SERVER].log, server).len() == 50
+    }));
+    // Long enough for stats to be reported.
+    pair.sim.run_for(Duration::from_millis(200));
+
+    let mut datagrams = received_datagrams(&pair.sim.drivers[SERVER].log, server);
+    datagrams.sort_by_key(index_of);
+    for (i, data) in datagrams.iter().enumerate() {
+        assert_eq!(data, &numbered(i as u16, 100 + i));
+    }
+    assert_eq!(datagram_state(&pair.sim.drivers[CLIENT].log, client).2, 0);
+}
+
+#[test]
+fn datagrams_past_the_send_buffer_drop_the_oldest() {
+    const BUFFER: usize = 16 << 10;
+    const LEN: usize = 1000;
+    const BURST: u16 = 100;
+
+    let options = EndpointOptions {
+        datagram_send_buffer: BUFFER,
+        ..seeded(2)
+    };
+    let mut pair = Pair::new(seeded(1), options);
+    let (client, server) = pair.connected();
+
+    // Queued in one turn, so none are sent before the buffer overflows.
+    pair.sim.command(
+        CLIENT,
+        Command::SendDatagrams {
+            conn: client,
+            data: (0..BURST).map(|i| numbered(i, LEN)).collect(),
+        },
+    );
+    pair.sim.run_for(Duration::from_secs(1));
+
+    let mut received: Vec<u16> = received_datagrams(&pair.sim.drivers[SERVER].log, server)
+        .iter()
+        .map(index_of)
+        .collect();
+    received.sort();
+    let (_, _, dropped) = datagram_state(&pair.sim.drivers[CLIENT].log, client);
+    assert!(dropped > 0 && !received.is_empty());
+    assert_eq!(received.len() as u64 + dropped, BURST as u64);
+    // The newest are the ones kept.
+    let first = BURST - received.len() as u16;
+    assert_eq!(received, (first..BURST).collect::<Vec<_>>());
+
+    // Sending faster than congestion control allows, while earlier
+    // datagrams are still going out, keeps the count exact.
+    const TOTAL: u16 = 5000;
+    let burst_dropped = dropped;
+    // 50 KB every millisecond.
+    for start in (BURST..TOTAL).step_by(50) {
+        let end = (start + 50).min(TOTAL);
         pair.sim.command(
             CLIENT,
-            Command::SendDatagram {
+            Command::SendDatagrams {
                 conn: client,
-                data: Bytes::from(vec![i; 100 + i as usize]),
+                data: (start..end).map(|i| numbered(i, LEN)).collect(),
             },
         );
+        pair.sim.run_for(Duration::from_millis(1));
     }
+    pair.sim.run_for(Duration::from_secs(1));
 
-    let received = |log: &[Event]| -> Vec<Bytes> {
-        log.iter()
-            .filter_map(|e| match e {
-                Event::Datagram { conn, data } if *conn == server => Some(data.clone()),
-                _ => None,
-            })
-            .collect()
-    };
-    assert!(pair.sim.run_until(Duration::from_secs(2), |sim| {
-        received(&sim.drivers[SERVER].log).len() == 50
-    }));
+    let received = received_datagrams(&pair.sim.drivers[SERVER].log, server).len();
+    let (_, _, dropped) = datagram_state(&pair.sim.drivers[CLIENT].log, client);
+    assert!(dropped > burst_dropped, "nothing more was dropped");
+    assert!(received > 15 + 100, "only {received} arrived");
+    assert_eq!(received as u64 + dropped, TOTAL as u64);
+}
 
-    let mut datagrams = received(&pair.sim.drivers[SERVER].log);
-    datagrams.sort_by_key(|d| d[0]);
-    for (i, data) in datagrams.iter().enumerate() {
-        assert_eq!(data[..], vec![i as u8; 100 + i][..]);
-    }
+#[test]
+fn oversized_datagrams_are_dropped_and_counted() {
+    let mut pair = Pair::new(seeded(1), seeded(2));
+    let (client, server) = pair.connected();
+    let (_, max, _) = datagram_state(&pair.sim.drivers[CLIENT].log, client);
+    let max = max.unwrap();
+
+    pair.sim.command(
+        CLIENT,
+        Command::SendDatagrams {
+            conn: client,
+            data: vec![numbered(0, max), numbered(1, max + 1), numbered(2, 10)],
+        },
+    );
+    pair.sim.run_for(Duration::from_millis(500));
+
+    let mut received: Vec<u16> = received_datagrams(&pair.sim.drivers[SERVER].log, server)
+        .iter()
+        .map(index_of)
+        .collect();
+    received.sort();
+    assert_eq!(received, [0, 2]);
+    assert_eq!(datagram_state(&pair.sim.drivers[CLIENT].log, client).2, 1);
 }
 
 #[test]

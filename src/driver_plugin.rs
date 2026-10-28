@@ -25,6 +25,7 @@ use crate::common::{
 pub struct QuicDriverPlugin {
     threads: Option<usize>,
     max_connections: Option<usize>,
+    datagram_buffers: Option<(usize, usize)>,
     thread_name: Option<String>,
     on_thread_start: Option<ThreadStartHook>,
 }
@@ -34,6 +35,7 @@ impl Plugin for QuicDriverPlugin {
         app.insert_resource(QuicRuntime::with_options(RuntimeOptions {
             threads: self.threads,
             max_connections: self.max_connections,
+            datagram_buffers: self.datagram_buffers,
             thread_name: self.thread_name.clone(),
             on_thread_start: self.on_thread_start.clone(),
         }))
@@ -58,6 +60,21 @@ impl QuicDriverPlugin {
     /// fails.
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = Some(max_connections);
+        self
+    }
+
+    /// Sets how many bytes of datagrams each connection buffers.
+    ///
+    /// - `send`: datagrams queued with
+    ///   [QuicConnection::send_datagram][crate::common::connection::QuicConnection::send_datagram]
+    ///   that haven't been sent yet. Past it, the oldest are dropped. A
+    ///   smaller buffer drops more, but what it sends is fresher. Defaults
+    ///   to 256 KiB.
+    /// - `receive`: datagrams received but not yet read. Past it, the oldest
+    ///   are dropped. It also caps the size of a datagram the peer may send.
+    ///   Defaults to 1 MiB.
+    pub fn with_datagram_buffers(mut self, send: usize, receive: usize) -> Self {
+        self.datagram_buffers = Some((send, receive));
         self
     }
 

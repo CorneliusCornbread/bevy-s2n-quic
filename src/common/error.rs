@@ -133,3 +133,23 @@ impl<T> SendError<T> {
         }
     }
 }
+
+/// Why a datagram could not be queued with
+/// [QuicConnection::send_datagram][crate::common::connection::QuicConnection::send_datagram].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DatagramError {
+    /// The connection is closed.
+    #[error("the connection is closed")]
+    Closed,
+    /// The peer doesn't accept datagrams.
+    #[error("the peer doesn't accept datagrams")]
+    Unsupported,
+    /// The datagram is larger than the path currently allows.
+    #[error("the datagram is {size} bytes, but at most {max} fit")]
+    TooLarge {
+        /// The datagram's size.
+        size: usize,
+        /// The largest datagram that fits.
+        max: usize,
+    },
+}
