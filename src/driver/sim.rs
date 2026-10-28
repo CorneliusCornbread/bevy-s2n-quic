@@ -145,8 +145,9 @@ impl Socket for SimSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        // Exercises the GSO path: transmits carry several datagrams.
-        8
+        // What quinn-udp reports on Linux. Exercises the GSO path:
+        // transmits carry several datagrams.
+        64
     }
 
     fn max_receive_segments(&self) -> usize {
@@ -158,6 +159,13 @@ impl Socket for SimSocket {
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        // Linux fails larger GSO sends with EMSGSIZE, losing every datagram
+        // in them.
+        assert!(
+            transmit.contents.len() <= 65_507,
+            "a {}-byte send is larger than a UDP datagram",
+            transmit.contents.len()
+        );
         let mut state = self.net.0.borrow_mut();
         let segment = transmit.segment_size.unwrap_or(transmit.contents.len());
 

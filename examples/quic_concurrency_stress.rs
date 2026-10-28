@@ -28,6 +28,9 @@
 ///     datagrams instead of on its stream. Loss is reported but doesn't fail
 ///     the phase, and neither do datagrams dropped because the send buffer
 ///     was full (`dgram dropped`).
+///   - `broadcast` – the server sends to every client's stream, and the
+///     clients only receive. `senders` is then the number of streams the
+///     server sends to. Only with `--role both`.
 /// - At the end a markdown table is printed to stdout, and optionally
 ///   appended to `--out <file>`. The process exits with an error if any
 ///   phase lost data or failed to open all of its streams.
@@ -65,9 +68,16 @@
 /// - `cpu` – process CPU time (user + sys) during the measure window,
 ///   shown as cores used.
 /// - `driver busy` – time the network threads spent handling work, summed
-///   over all of them, shown as a fraction of `threads × wall time`.
+///   over all of them, shown as a fraction of `threads × wall time`. `busy %
+///   per driver` shows each thread on its own. The server is on the first.
 /// - `wakes` – times the network threads were woken by the Bevy thread, per
 ///   frame. At most one per thread.
+/// - `latency p50/p99` – one-way latency of the messages received during the
+///   window, from the sending system to the receiving system. Every message
+///   starts with the wall-clock time it was sent, so both ends must share a
+///   clock (the same machine). It includes the frames both ends take to hand
+///   messages over, so it's at least a frame. Needs `--payload` of 8 bytes
+///   or more.
 /// - `lost` – cumulative bytes sent minus bytes received after the drain.
 ///   Must be 0, except in the `datagram` scenario, where it's the bytes this
 ///   phase lost.
@@ -118,8 +128,10 @@ use bevy_s2n_quic::{
     driver_plugin::QuicDriverPlugin,
     server::{QuicServer, marker::QuicServerMarker},
 };
-use bytes::Bytes;
+use aeronet_io::packet::RecvPacket;
+use bytes::{Bytes, BytesMut};
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     io::{self, Read as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -128,7 +140,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 // ─── Tuning knobs ────────────────────────────────────────────────────────────
@@ -171,6 +183,7 @@ enum Scenario {
     Active,
     Idle,
     Datagram,
+    Broadcast,
 }
 
 impl Scenario {
@@ -179,6 +192,7 @@ impl Scenario {
             Scenario::Active => "active",
             Scenario::Idle => "idle",
             Scenario::Datagram => "datagram",
+            Scenario::Broadcast => "broadcast",
         }
     }
 
@@ -187,6 +201,7 @@ impl Scenario {
             "active" => Some(Scenario::Active),
             "idle" => Some(Scenario::Idle),
             "datagram" => Some(Scenario::Datagram),
+            "broadcast" => Some(Scenario::Broadcast),
             _ => None,
         }
     }
@@ -227,6 +242,7 @@ struct Config {
     payload: Bytes,
     burst: usize,
     tokio_threads: Option<usize>,
+    stream_budget: Option<usize>,
     pin: bool,
     tokio_nice: Option<i32>,
     windowed: bool,
@@ -249,6 +265,7 @@ impl Default for Config {
             payload: payload_of(DEFAULT_PAYLOAD_BYTES),
             burst: 1,
             tokio_threads: None,
+            stream_budget: None,
             pin: false,
             tokio_nice: None,
             windowed: false,
@@ -265,7 +282,7 @@ Options:
   --addr <IP:PORT>        QUIC server address [default: 127.0.0.1:17779]
   --control <IP:PORT>     Control address for --role server|clients [default: 127.0.0.1:17780]
   --clients <N,N,..>      Client counts to run, ascending [default: 100,300,600]
-  --scenarios <S,S,..>    Scenarios per client count: active, idle, datagram [default: active,idle]
+  --scenarios <S,S,..>    Scenarios per client count: active, idle, datagram, broadcast [default: active,idle]
   --duration <SECS>       Measure window per phase [default: 10]
   --warmup <SECS>         Warmup per phase before measuring [default: 2]
   --drain <SECS>          Max time to wait for in-flight data after a phase [default: 5]
@@ -273,9 +290,10 @@ Options:
   --idle-fraction <F>     Fraction of streams sending in the idle scenario [default: 0.1]
   --payload <BYTES>       Bytes per message [default: 36]
   --burst <N>             Messages sent per sender per fixed tick [default: 1]
-  --tokio-threads <N>     Tokio worker threads [default: library default]
-  --pin                   Pin Tokio workers and Bevy threads to separate cores (Linux)
-  --tokio-nice <N>        Nice value for the Tokio worker threads (Linux)
+  --tokio-threads <N>     Network threads [default: library default]
+  --stream-budget <BYTES> Send and receive byte budget per stream [default: library default]
+  --pin                   Pin network threads and Bevy threads to separate cores (Linux)
+  --tokio-nice <N>        Nice value for the network threads (Linux)
   --windowed              Use DefaultPlugins with a window instead of headless
   --out <FILE>            Append the markdown results to FILE
   -h, --help              Print this help
@@ -376,6 +394,15 @@ impl Config {
                             .ok_or_else(|| format!("invalid --tokio-threads: {v}"))?,
                     );
                 }
+                "--stream-budget" => {
+                    let v = value()?;
+                    cfg.stream_budget = Some(
+                        v.parse::<usize>()
+                            .ok()
+                            .filter(|&n| n > 0)
+                            .ok_or_else(|| format!("invalid --stream-budget: {v}"))?,
+                    );
+                }
                 "--pin" => cfg.pin = true,
                 "--tokio-nice" => {
                     let v = value()?;
@@ -398,6 +425,11 @@ impl Config {
 
         if (cfg.pin || cfg.tokio_nice.is_some()) && !cfg!(target_os = "linux") {
             return Err("--pin and --tokio-nice are only supported on Linux".into());
+        }
+        // The control link only tells the server when phases measure, not
+        // when they warm up, so it can't drive a sending server.
+        if cfg.role != Role::Both && cfg.scenarios.contains(&Scenario::Broadcast) {
+            return Err("the broadcast scenario needs --role both".into());
         }
 
         Ok(cfg)
@@ -426,10 +458,11 @@ struct Phase {
 }
 
 impl Phase {
-    /// Number of streams that send during this phase.
+    /// Number of streams that send during this phase. For `broadcast`, the
+    /// number of streams the server sends to.
     fn senders(&self, idle_fraction: f64) -> usize {
         match self.scenario {
-            Scenario::Active | Scenario::Datagram => self.clients,
+            Scenario::Active | Scenario::Datagram | Scenario::Broadcast => self.clients,
             Scenario::Idle => ((self.clients as f64) * idle_fraction).ceil() as usize,
         }
     }
@@ -523,8 +556,11 @@ impl ThreadPlan {
 
     /// The QUIC runtime, with its threads pinned and niced through the
     /// thread start hook.
-    fn driver_plugin(&self) -> QuicDriverPlugin {
-        let plugin = QuicDriverPlugin::default().with_threads(self.tokio);
+    fn driver_plugin(&self, stream_budget: Option<usize>) -> QuicDriverPlugin {
+        let mut plugin = QuicDriverPlugin::default().with_threads(self.tokio);
+        if let Some(budget) = stream_budget {
+            plugin = plugin.with_stream_budgets(budget, budget);
+        }
         let tokio_cpus = self.pinned.as_ref().map(|(tokio, _)| tokio.clone());
         let nice = self.tokio_nice;
 
@@ -848,6 +884,8 @@ struct StressClientIndex(usize);
 #[derive(Component)]
 struct StressClientStream {
     index: usize,
+    /// The stream sent its first message, so the server knows about it.
+    greeted: bool,
 }
 
 // ─── Resources ───────────────────────────────────────────────────────────────
@@ -889,11 +927,16 @@ struct StressBench {
     dgram_dropped: u64,
     /// Datagram bytes lost by earlier `datagram` phases.
     dgram_lost_before: i64,
+    // The same for what the server sends in the `broadcast` scenario.
+    bcast_sent: u64,
+    bcast_received: u64,
 
     // Measure window state.
     window: Option<WindowStart>,
     frame_work_ms: Vec<f64>,
     frame_interval_ms: Vec<f64>,
+    /// One-way latency of each message received during the window.
+    latency_ms: Vec<f64>,
     streams_ready: usize,
     pending: Option<PhaseResult>,
 
@@ -935,9 +978,12 @@ impl StressBench {
             dgram_received: 0,
             dgram_dropped: 0,
             dgram_lost_before: 0,
+            bcast_sent: 0,
+            bcast_received: 0,
             window: None,
             frame_work_ms: Vec::new(),
             frame_interval_ms: Vec::new(),
+            latency_ms: Vec::new(),
             streams_ready: 0,
             pending: None,
             control: None,
@@ -973,7 +1019,17 @@ impl StressBench {
     fn totals(&self, scenario: Scenario) -> (u64, u64) {
         match scenario {
             Scenario::Datagram => (self.dgram_sent, self.dgram_received),
+            Scenario::Broadcast => (self.bcast_sent, self.bcast_received),
             Scenario::Active | Scenario::Idle => (self.bytes_sent, self.bytes_received),
+        }
+    }
+
+    /// Records the one-way latency of a message stamped with `sent_ns`
+    /// (see [stamp]), if the window is open.
+    fn record_latency(&mut self, now_ns: u64, sent_ns: u64) {
+        if self.stage == Stage::Measure {
+            self.latency_ms
+                .push(now_ns.saturating_sub(sent_ns) as f64 / 1_000_000.0);
         }
     }
 
@@ -981,12 +1037,13 @@ impl StressBench {
     fn start_window(&mut self, runtime: &QuicRuntime, scenario: Scenario) {
         self.frame_work_ms.clear();
         self.frame_interval_ms.clear();
+        self.latency_ms.clear();
         let (bytes_sent, bytes_received) = self.totals(scenario);
         self.window = Some(WindowStart {
             at: Instant::now(),
             cpu: process_cpu_time(),
-            driver_busy: driver_busy(runtime),
-            wakes: driver_wakes(runtime),
+            thread_busy: thread_busy(runtime),
+            wakes: thread_wakes(runtime),
             bytes_sent,
             bytes_received,
             send_full: self.send_full,
@@ -1000,7 +1057,13 @@ impl StressBench {
         let start = self.window.take().expect("measure window missing");
         let mut work = std::mem::take(&mut self.frame_work_ms);
         let mut interval = std::mem::take(&mut self.frame_interval_ms);
+        let mut latency = std::mem::take(&mut self.latency_ms);
         let (sent, received) = self.totals(phase.scenario);
+        let thread_busy = thread_busy(runtime)
+            .iter()
+            .zip(&start.thread_busy)
+            .map(|(end, start)| end.saturating_sub(*start))
+            .collect::<Vec<_>>();
 
         self.pending = Some(PhaseResult {
             phase,
@@ -1013,9 +1076,10 @@ impl StressBench {
             frame_max_ms: percentile(&mut work, 1.0),
             interval_p99_ms: percentile(&mut interval, 0.99),
             cpu: process_cpu_time().saturating_sub(start.cpu),
-            driver_busy: driver_busy(runtime).saturating_sub(start.driver_busy),
-            drivers: runtime.thread_count(),
-            wakes: driver_wakes(runtime) - start.wakes,
+            latency_p50_ms: (!latency.is_empty()).then(|| percentile(&mut latency, 0.50)),
+            latency_p99_ms: (!latency.is_empty()).then(|| percentile(&mut latency, 0.99)),
+            thread_busy,
+            wakes: thread_wakes(runtime) - start.wakes,
             sent: sent - start.bytes_sent,
             received: received.saturating_sub(start.bytes_received),
             send_full: self.send_full - start.send_full,
@@ -1045,7 +1109,7 @@ impl StressBench {
 struct WindowStart {
     at: Instant,
     cpu: Duration,
-    driver_busy: Duration,
+    thread_busy: Vec<Duration>,
     wakes: u64,
     bytes_sent: u64,
     bytes_received: u64,
@@ -1065,8 +1129,11 @@ struct PhaseResult {
     frame_max_ms: f64,
     interval_p99_ms: f64,
     cpu: Duration,
-    driver_busy: Duration,
-    drivers: usize,
+    /// `None` if no stamped message arrived during the window.
+    latency_p50_ms: Option<f64>,
+    latency_p99_ms: Option<f64>,
+    /// Busy time of each network thread during the window.
+    thread_busy: Vec<Duration>,
     /// Times the network threads were woken during the window.
     wakes: u64,
     sent: u64,
@@ -1141,7 +1208,7 @@ fn main() -> AppExit {
     }
 
     let role = cfg.role;
-    app.add_plugins(QuicDefaultPlugins.set(threads.driver_plugin()))
+    app.add_plugins(QuicDefaultPlugins.set(threads.driver_plugin(cfg.stream_budget)))
         .insert_resource(StressBench::new(cfg, threads))
         .add_systems(Startup, setup)
         .add_systems(First, frame_begin)
@@ -1153,7 +1220,10 @@ fn main() -> AppExit {
                 Update,
                 (drive, spawn_clients, open_streams, track_datagram_drops).chain(),
             )
-            .add_systems(FixedPostUpdate, (client_send, server_recv)),
+            .add_systems(
+                FixedPostUpdate,
+                (client_send, server_send, server_recv, client_recv),
+            ),
         Role::Server => app
             .add_systems(Update, serve_control)
             .add_systems(FixedPostUpdate, server_recv),
@@ -1349,7 +1419,7 @@ fn drive(
             let drained = received >= sent;
             let limit = match scenario {
                 Scenario::Datagram => bench.cfg.drain.min(DATAGRAM_DRAIN),
-                Scenario::Active | Scenario::Idle => bench.cfg.drain,
+                Scenario::Active | Scenario::Idle | Scenario::Broadcast => bench.cfg.drain,
             };
 
             if drained || elapsed >= limit {
@@ -1613,7 +1683,10 @@ fn open_streams(
             Ok(bundle) => {
                 commands.spawn((
                     bundle,
-                    StressClientStream { index: index.0 },
+                    StressClientStream {
+                        index: index.0,
+                        greeted: false,
+                    },
                     QuicClientMarker,
                     ChildOf(entity),
                 ));
@@ -1629,23 +1702,38 @@ fn open_streams(
 
 fn client_send(
     mut streams: Query<
-        (&mut QuicSendStream, &StressClientStream),
+        (&mut QuicSendStream, &mut StressClientStream),
         With<QuicClientMarker>,
     >,
     connections: Query<(&QuicConnection, &StressClientIndex), With<QuicClientMarker>>,
     mut bench: ResMut<StressBench>,
 ) {
-    if !bench.sending() {
+    // One stamp per tick: a copy per message would cost more than sending
+    // large payloads.
+    let payload = stamp(&bench.cfg.payload);
+    let mut sent = 0u64;
+    let mut full = 0u64;
+
+    // The server only sees a stream once data arrives on it, so each stream
+    // sends one message when it opens, whatever the scenario.
+    for (mut stream, mut meta) in &mut streams {
+        if !meta.greeted && stream.is_open() && stream.send(payload.clone()).is_ok() {
+            meta.greeted = true;
+            sent += payload.len() as u64;
+        }
+    }
+    bench.bytes_sent += sent;
+    sent = 0;
+
+    let scenario = bench.phase().scenario;
+    if !bench.sending() || scenario == Scenario::Broadcast {
         return;
     }
 
     let senders = bench.senders;
-    let payload = bench.cfg.payload.clone();
     let burst = bench.cfg.burst;
-    let mut sent = 0u64;
-    let mut full = 0u64;
 
-    if bench.phase().scenario == Scenario::Datagram {
+    if scenario == Scenario::Datagram {
         for (connection, index) in &connections {
             if index.0 >= senders || !connection.is_open() {
                 continue;
@@ -1699,40 +1787,171 @@ fn client_send(
 const SERVER_RECV_BATCH: usize = 256;
 
 fn server_recv(
-    mut streams: Query<&mut QuicReceiveStream, With<QuicServerMarker>>,
+    mut streams: Query<(Entity, &mut QuicReceiveStream), With<QuicServerMarker>>,
     mut connections: Query<&mut QuicConnection, With<QuicServerMarker>>,
     mut bench: ResMut<StressBench>,
-    mut buffer: Local<Vec<aeronet_io::packet::RecvPacket>>,
+    mut buffer: Local<Vec<RecvPacket>>,
+    mut cursors: Local<HashMap<Entity, MessageCursor>>,
 ) {
-    let mut received = 0u64;
+    let now = now_ns();
 
     let mut datagrams = 0u64;
     for mut connection in &mut connections {
         while connection.recv_datagrams(&mut buffer, SERVER_RECV_BATCH) > 0 {
-            datagrams += buffer
-                .drain(..)
-                .map(|packet| packet.payload.len() as u64)
-                .sum::<u64>();
+            for packet in buffer.drain(..) {
+                datagrams += packet.payload.len() as u64;
+                if let Some(sent) = read_stamp(&packet.payload) {
+                    bench.record_latency(now, sent);
+                }
+            }
         }
     }
     bench.dgram_received += datagrams;
 
-    // Closed streams are still drained so buffered data is not miscounted.
+    let mut received = 0u64;
+    for (entity, mut stream) in &mut streams {
+        let cursor = cursors.entry(entity).or_default();
+        received += drain_stream(&mut stream, &mut buffer, cursor, &mut bench, now);
+    }
+    bench.bytes_received += received;
+}
+
+/// `broadcast`: the server sends to every client's stream.
+fn server_send(
+    mut streams: Query<&mut QuicSendStream, With<QuicServerMarker>>,
+    mut bench: ResMut<StressBench>,
+) {
+    if !bench.sending() || bench.phase().scenario != Scenario::Broadcast {
+        return;
+    }
+
+    let payload = stamp(&bench.cfg.payload);
+    let burst = bench.cfg.burst;
+    let mut sent = 0u64;
+    let mut full = 0u64;
+
     for mut stream in &mut streams {
-        let mut any = false;
-        while stream.recv_many(&mut buffer, SERVER_RECV_BATCH) > 0 {
-            received += buffer
-                .drain(..)
-                .map(|packet| packet.payload.len() as u64)
-                .sum::<u64>();
-            any = true;
+        if !stream.is_open() {
+            continue;
         }
-        if any {
-            stream.log_outstanding_errors();
+        for _ in 0..burst {
+            match stream.send(payload.clone()) {
+                Ok(()) => sent += payload.len() as u64,
+                Err(_) => full += 1,
+            }
         }
     }
 
-    bench.bytes_received += received;
+    bench.bcast_sent += sent;
+    bench.send_full += full;
+}
+
+/// `broadcast`: the clients receive what the server sends.
+fn client_recv(
+    mut streams: Query<(Entity, &mut QuicReceiveStream), With<StressClientStream>>,
+    mut bench: ResMut<StressBench>,
+    mut buffer: Local<Vec<RecvPacket>>,
+    mut cursors: Local<HashMap<Entity, MessageCursor>>,
+) {
+    let now = now_ns();
+    let mut received = 0u64;
+    for (entity, mut stream) in &mut streams {
+        let cursor = cursors.entry(entity).or_default();
+        received += drain_stream(&mut stream, &mut buffer, cursor, &mut bench, now);
+    }
+    bench.bcast_received += received;
+}
+
+/// Reads everything waiting on `stream`, recording each message's latency.
+/// Returns the bytes read. Closed streams are still drained, so buffered
+/// data isn't miscounted.
+fn drain_stream(
+    stream: &mut QuicReceiveStream,
+    buffer: &mut Vec<RecvPacket>,
+    cursor: &mut MessageCursor,
+    bench: &mut StressBench,
+    now: u64,
+) -> u64 {
+    let message_len = bench.cfg.payload.len();
+    let mut received = 0;
+    let mut any = false;
+
+    while stream.recv_many(buffer, SERVER_RECV_BATCH) > 0 {
+        for packet in buffer.drain(..) {
+            received += packet.payload.len() as u64;
+            cursor.feed(&packet.payload, message_len, |sent| {
+                bench.record_latency(now, sent)
+            });
+        }
+        any = true;
+    }
+    if any {
+        stream.log_outstanding_errors();
+    }
+    received
+}
+
+/// Bytes at the start of each message that hold the time it was sent.
+const STAMP_LEN: usize = 8;
+
+/// Wall-clock nanoseconds since the Unix epoch. Processes on the same
+/// machine agree on it, unlike [Instant].
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// `payload` with its first bytes replaced by the current time, or
+/// unchanged if it's too short to hold it.
+fn stamp(payload: &Bytes) -> Bytes {
+    if payload.len() < STAMP_LEN {
+        return payload.clone();
+    }
+    let mut message = BytesMut::from(&payload[..]);
+    message[..STAMP_LEN].copy_from_slice(&now_ns().to_be_bytes());
+    message.freeze()
+}
+
+/// The send time at the start of a whole message, such as a datagram.
+fn read_stamp(message: &[u8]) -> Option<u64> {
+    let stamp = message.get(..STAMP_LEN)?;
+    Some(u64::from_be_bytes(stamp.try_into().expect("STAMP_LEN bytes")))
+}
+
+/// Finds the messages in a stream of `--payload`-sized messages, whose
+/// chunks needn't line up with them, and reads the stamp of each.
+#[derive(Default)]
+struct MessageCursor {
+    /// Bytes of the current message read so far.
+    offset: usize,
+    stamp: [u8; STAMP_LEN],
+}
+
+impl MessageCursor {
+    fn feed(&mut self, mut chunk: &[u8], message_len: usize, mut on_stamp: impl FnMut(u64)) {
+        if message_len < STAMP_LEN {
+            return;
+        }
+
+        while !chunk.is_empty() {
+            let in_stamp = self.offset < STAMP_LEN;
+            let end = if in_stamp { STAMP_LEN } else { message_len };
+            let take = (end - self.offset).min(chunk.len());
+
+            if in_stamp {
+                self.stamp[self.offset..self.offset + take].copy_from_slice(&chunk[..take]);
+                if self.offset + take == STAMP_LEN {
+                    on_stamp(u64::from_be_bytes(self.stamp));
+                }
+            }
+            self.offset += take;
+            chunk = &chunk[take..];
+            if self.offset == message_len {
+                self.offset = 0;
+            }
+        }
+    }
 }
 
 /// Sums the datagrams the client connections have dropped.
@@ -1778,16 +1997,19 @@ fn process_cpu_time() -> Duration {
     Duration::ZERO
 }
 
-/// Busy time summed over all network threads.
-fn driver_busy(runtime: &QuicRuntime) -> Duration {
+// The two backend-specific metrics. Everything else in the benchmark only
+// uses the public API, so it runs unchanged on other backends.
+
+/// Busy time of each network thread.
+fn thread_busy(runtime: &QuicRuntime) -> Vec<Duration> {
     backend::driver_metrics(runtime)
         .iter()
         .map(|m| m.busy)
-        .sum()
+        .collect()
 }
 
 /// Times the network threads were woken, summed over all of them.
-fn driver_wakes(runtime: &QuicRuntime) -> u64 {
+fn thread_wakes(runtime: &QuicRuntime) -> u64 {
     backend::driver_metrics(runtime)
         .iter()
         .map(|m| m.wakes)
@@ -1817,7 +2039,8 @@ fn summary_line(r: &PhaseResult) -> String {
     let wall = r.wall.as_secs_f64();
     format!(
         "{:>4} clients {:<6} ({:>4} sending): frame avg {:.2}ms p99 {:.2}ms | \
-         cpu {:.2} cores | driver busy {:.0}% | wakes {:.1}/frame | rx {}/s | lost {} B{}{}",
+         cpu {:.2} cores | driver busy {:.0}% ({}) | wakes {:.1}/frame | \
+         latency p50 {} p99 {} | rx {}/s | lost {} B{}{}",
         r.phase.clients,
         r.phase.scenario.name(),
         r.senders,
@@ -1825,7 +2048,10 @@ fn summary_line(r: &PhaseResult) -> String {
         r.frame_p99_ms,
         r.cpu.as_secs_f64() / wall,
         busy_pct(r),
+        busy_per_thread(r),
         wakes_per_frame(r),
+        fmt_ms(r.latency_p50_ms),
+        fmt_ms(r.latency_p99_ms),
         fmt_bytes((r.received as f64 / wall) as u64),
         r.lost,
         if r.phase.scenario == Scenario::Datagram {
@@ -1838,11 +2064,29 @@ fn summary_line(r: &PhaseResult) -> String {
 }
 
 fn busy_pct(r: &PhaseResult) -> f64 {
-    let capacity = r.wall.as_secs_f64() * r.drivers as f64;
+    let capacity = r.wall.as_secs_f64() * r.thread_busy.len() as f64;
     if capacity == 0.0 {
         return 0.0;
     }
-    100.0 * r.driver_busy.as_secs_f64() / capacity
+    100.0 * busy_total(r).as_secs_f64() / capacity
+}
+
+fn busy_total(r: &PhaseResult) -> Duration {
+    r.thread_busy.iter().sum()
+}
+
+/// Each thread's busy %, e.g. `95/61`.
+fn busy_per_thread(r: &PhaseResult) -> String {
+    let wall = r.wall.as_secs_f64();
+    r.thread_busy
+        .iter()
+        .map(|busy| format!("{:.0}", 100.0 * busy.as_secs_f64() / wall))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn fmt_ms(ms: Option<f64>) -> String {
+    ms.map_or_else(|| "-".to_owned(), |ms| format!("{ms:.2}"))
 }
 
 fn wakes_per_frame(r: &PhaseResult) -> f64 {
@@ -1873,13 +2117,15 @@ fn report(bench: &StressBench) -> bool {
     if cfg.role != Role::Server {
         let _ = writeln!(
             md,
-            "- Per phase: warmup {:?}, measure {:?}, drain ≤{:?} | payload {} B × {}/tick | idle fraction {}",
+            "- Per phase: warmup {:?}, measure {:?}, drain ≤{:?} | payload {} B × {}/tick | idle fraction {} | stream budget {}",
             cfg.warmup,
             cfg.duration,
             cfg.drain,
             cfg.payload.len(),
             cfg.burst,
             cfg.idle_fraction,
+            cfg.stream_budget
+                .map_or_else(|| "default".to_owned(), |b| fmt_bytes(b as u64)),
         );
     }
     let _ = writeln!(
@@ -1892,11 +2138,12 @@ fn report(bench: &StressBench) -> bool {
         md,
         "| clients | scenario | senders | ready | frames | frame avg ms | frame p99 ms \
          | frame max ms | interval p99 ms | cpu cores | driver busy (thread-s) | driver busy % \
-         | wakes/frame | sent | received | send full | dgram dropped | lost B | ok |"
+         | busy % per driver | wakes/frame | latency p50 ms | latency p99 ms | sent | received \
+         | send full | dgram dropped | lost B | ok |"
     );
     let _ = writeln!(
         md,
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
     );
 
     for r in &bench.results {
@@ -1904,7 +2151,7 @@ fn report(bench: &StressBench) -> bool {
         let _ = writeln!(
             md,
             "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} \
-             | {:.1} | {} | {} | {} | {} | {} | {} |",
+             | {} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.phase.clients,
             r.phase.scenario.name(),
             r.senders,
@@ -1915,9 +2162,12 @@ fn report(bench: &StressBench) -> bool {
             r.frame_max_ms,
             r.interval_p99_ms,
             r.cpu.as_secs_f64() / wall,
-            r.driver_busy.as_secs_f64(),
+            busy_total(r).as_secs_f64(),
             busy_pct(r),
+            busy_per_thread(r),
             wakes_per_frame(r),
+            fmt_ms(r.latency_p50_ms),
+            fmt_ms(r.latency_p99_ms),
             fmt_bytes(r.sent),
             fmt_bytes(r.received),
             r.send_full,

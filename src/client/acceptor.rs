@@ -37,15 +37,18 @@ fn handle_stream_accept(
     connection_entity: Entity,
     connection: &mut QuicConnection,
 ) {
-    match connection.accept_stream() {
-        Ok(Some(peer_attempt)) => {
-            commands.entity(connection_entity).with_children(|parent| {
-                parent.spawn((peer_attempt, QuicClientMarker));
-            });
+    loop {
+        match connection.accept_stream() {
+            Ok(Some(peer_attempt)) => {
+                commands.entity(connection_entity).with_children(|parent| {
+                    parent.spawn((peer_attempt, QuicClientMarker));
+                });
+            }
+            Ok(None) => return,
+            Err(err) => {
+                error!("Error accepting stream from connection: {}", err);
+                return;
+            }
         }
-        Err(err) => {
-            error!("Error accepting stream from connection: {}", err);
-        }
-        _ => {}
     }
 }

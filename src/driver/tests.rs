@@ -337,6 +337,38 @@ fn stream_delivers_in_order_under_loss_and_reordering() {
     assert_eq!(writer.budget.queued(), 0);
 }
 
+/// Once the congestion window is large, quinn fills a GSO send with as many
+/// datagrams as it's offered. The sim socket rejects sends larger than a UDP
+/// datagram, as Linux does.
+#[test]
+fn bulk_sends_fit_in_a_udp_datagram() {
+    let mut pair = Pair::new(seeded(1), seeded(2));
+    let (client, _) = pair.connected();
+
+    const TOTAL: usize = 8 << 20;
+    let stream = open_stream(&mut pair.sim, CLIENT, client, Dir::Uni);
+    let mut writer = Writer {
+        driver: CLIENT,
+        conn: client,
+        stream: stream.id,
+        budget: stream.send.unwrap(),
+        total: TOTAL,
+        chunk: 64 << 10,
+        offset: 0,
+        finished: false,
+    };
+    let mut reader = Reader::default();
+
+    let done = pair.sim.run_until(Duration::from_secs(60), |sim| {
+        writer.pump(sim);
+        reader.pump(sim, SERVER, true);
+        reader.finished
+    });
+
+    assert!(done, "received {} of {TOTAL} bytes", reader.data.len());
+    assert_eq!(pair.sim.packet_counts().1, 0);
+}
+
 #[test]
 fn receive_budget_applies_backpressure() {
     const BUDGET: usize = 64 << 10;

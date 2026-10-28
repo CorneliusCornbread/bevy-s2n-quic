@@ -381,6 +381,154 @@ taskset -c 4-7,12-15 cargo run --release --example quic_concurrency_stress -- --
   with `finish`. The tables above are from the fixed build. The
   single-process runs don't use the control link.
 
+## Phase E: quinn-proto driver
+
+The quinn-proto driver (`src/driver/`) against the s2n backend at `7ba4f3e`.
+Both builds run the Phase E benchmark, which adds the `broadcast` scenario,
+one-way latency, per-driver busy time and the wake counter. On s2n, busy
+time is per Tokio worker, and wakes are Tokio's `remote_schedule_count`
+(built with `--cfg tokio_unstable`). s2n has no `datagram` scenario.
+
+- Same machine as above. Runs were niced (`nice -n 10`), capped at 6 GB with
+  no swap (`systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0`),
+  and the desktop was in use.
+- s2n's own frame times are about 0.2 ms higher than Phase 2's on this
+  machine, so quinn is compared with s2n from the same session, not with the
+  Phase 2 table.
+- Fixes made during this phase are listed under [Fixes](#fixes). All numbers
+  below include them unless marked "before".
+
+### Default command
+
+`--clients 100,300,600 --scenarios active,idle,broadcast,datagram`. Min–max
+over 3 quinn runs and 2 s2n runs. s2n ran with `--warmup 12`: its build
+still has the one-per-frame acceptor (see [Fixes](#fixes)), and a shorter
+warmup leaves seconds of backlog in its latency.
+
+| clients | scenario  | frame avg ms (s2n) | frame avg ms (quinn) | cpu cores (s2n) | cpu cores (quinn) | wakes/frame (s2n) | wakes/frame (quinn) | latency p99 ms (s2n) | latency p99 ms (quinn) |
+| ------: | --------- | ------------------ | -------------------- | --------------- | ----------------- | ----------------: | ------------------: | -------------------- | ---------------------- |
+|     100 | active    | 0.19–0.20          | 0.19–0.26            | 0.16–0.17       | 0.10–0.12         |               101 |                   2 | 16.73–16.74          | 16.76–17.24            |
+|     100 | idle      | 0.16               | 0.15–0.16            | 0.04            | 0.03              |                10 |                   2 | 16.75                | 16.75–16.77            |
+|     100 | broadcast | 0.19–0.23          | 0.18–0.22            | 0.19–0.21       | 0.11–0.12         |               107 |                   1 | 16.81–16.86          | 16.80–16.83            |
+|     100 | datagram  | –                  | 0.19–0.21            | –               | 0.10–0.11         |                 – |                   2 | –                    | 16.77–16.83            |
+|     300 | active    | 0.30–0.65          | 0.30–0.33            | 0.41–0.57       | 0.25–0.27         |               303 |                   2 | 33.31–33.38          | 16.79–16.83            |
+|     300 | idle      | 0.22–0.25          | 0.18–0.19            | 0.08            | 0.05              |                31 |                   2 | 16.73–16.74          | 16.74–16.75            |
+|     300 | broadcast | 0.31–0.45          | 0.31–0.32            | 0.49–0.59       | 0.29              |               321 |                   1 | 16.88–17.00          | 16.91–16.92            |
+|     300 | datagram  | –                  | 0.28–0.32            | –               | 0.25–0.27         |                 – |                   2 | –                    | 16.77–16.80            |
+|     600 | active    | 0.52–0.64          | 0.49–0.51            | 0.86–0.94       | 0.49–0.50         |               605 |                   2 | 66.73–66.75          | 16.86–16.90            |
+|     600 | idle      | 0.32–0.33          | 0.23–0.27            | 0.12–0.13       | 0.08–0.09         |                62 |                   2 | 16.71                | 16.73–16.80            |
+|     600 | broadcast | 0.53–0.62          | 0.48–0.51            | 0.96–1.02       | 0.55–0.56         |               642 |                   1 | 17.04–17.11          | 16.99–17.10            |
+|     600 | datagram  | –                  | 0.45–0.47            | –               | 0.48–0.50         |                 – |                   2 | –                    | 16.82–16.85            |
+
+Latency p50 was 16.6–16.9 ms everywhere, on both backends. One-way latency
+includes the frames both ends take to hand a message over, so a 60 Hz app
+can't get much below one frame (16.7 ms). Every phase lost 0 bytes. Peak RSS
+was 160 MB for quinn and 1.0 GB for s2n.
+
+### Bulk: `--clients 600 --payload 65536 --duration 5 --drain 90 --scenarios active`
+
+| build                      | threads | received in 5 s | rx MB/s | busy % per driver | cpu cores | sent (API) | send full | peak RSS |
+| -------------------------- | ------: | --------------: | ------: | ----------------- | --------: | ---------: | --------: | -------: |
+| s2n                        |       4 |        5 145 MB |   1 029 | 87/87/87/86       |      3.21 |   12000 MB |         0 |   2.5 GB |
+| quinn, before (2 runs)     |       2 |               – | 411–420 | 100/50            |      1.40 |          – |         – |        – |
+| quinn                      |       2 | 2 533–2 539 MB  | 506–508 | 100/57            |      1.47 | 2221–2260 MB |  ~156 000 |   1.0 GB |
+| quinn                      |       4 |        3 697 MB |     739 | 100/40/39/39      |      2.04 |    3376 MB |   137 989 |   1.1 GB |
+
+quinn's server driver is at 100% in every bulk run. With `--tokio-threads 8`
+(before the fixes) it was still 100%, against 20% for the others, and
+received 582 MB/s. **The gap to s2n is the server's single thread**: s2n
+spreads one server's connections over all its workers, while the driver runs
+an endpoint and all its connections on one. That is the Phase G trigger.
+
+Where the server driver's time goes, from temporary per-turn instrumentation
+(4 threads, one 5 s run, before the GSO fix): about 1.1 µs per received
+datagram in `Endpoint::handle`/`Connection::handle_event` (4.3 s for
+3.85 M datagrams, out of 9.8 s busy), and 2.7 s in `poll_transmit` and
+sends. `perf` can't attach on this machine (`perf_event_paranoid` is 2 and
+SELinux blocks it), so there's no symbol-level profile.
+
+Experiments on the server's bottleneck (4 threads, one run each, before the
+GSO fix):
+
+| change                                                      | rx MB/s | note                                    |
+| ----------------------------------------------------------- | ------: | --------------------------------------- |
+| none (`MAX_RECV_DATAGRAMS` 256)                             | 500–550 |                                         |
+| `MAX_RECV_DATAGRAMS` 1024                                   |     562 |                                         |
+| `MAX_RECV_DATAGRAMS` 4096                                   | 694–748 | kept: fewer turns, fuller send batches |
+| `MAX_RECV_DATAGRAMS` 16384 / unlimited                      | 672–675 |                                         |
+| ACK-eliciting threshold 9 (ack frequency)                   |     576 | no gain on top of 4096 (730)            |
+| aws-lc-rs instead of ring (256 / 4096)                      | 504 / 686 | ring got 510 / 726: crypto isn't the limit |
+| `--stream-budget` 2 MiB / 4 MiB (with 4096)                 | 669 / 622 | more latency, no throughput          |
+| stream receive window 3.75 MB, s2n's (with 4096)            |     580 | no gain                                 |
+
+Bigger budgets and windows only add queueing: the bottleneck is CPU, not
+flow control. The budgets are now configurable anyway, with
+`QuicDriverPlugin::with_stream_budgets` and `--stream-budget`.
+
+### Single connection: driver vs quinn
+
+2 GiB on one stream over loopback. Ours is
+`cargo test --release --lib driver::tests::bulk_throughput -- --ignored --nocapture`.
+quinn's is `bulk --upload-size 2G --download-size 0` from quinn's `bench`
+crate at `quinn-proto-0.11.19`.
+
+| build                 |         MiB/s |
+| --------------------- | ------------: |
+| driver, before        |     44.3–44.6 |
+| driver                |           757 |
+| quinn `bulk` (2 runs) |       785–812 |
+
+Before the GSO fix, 4.5% of the sender's packets were lost, in bursts of
+about one GSO batch, with a congestion event every ~1,000 packets. That
+capped cwnd at ~67 KB, although the kernel dropped nothing.
+
+### Data-loss reproducer
+
+`--clients 600 --payload 65536 --warmup 1 --duration 2 --drain 90 --scenarios active`:
+
+| build | sent (API) | received in window | lost B after drain | send full | peak RSS |
+| ----- | ---------: | -----------------: | -----------------: | --------: | -------: |
+| s2n   |    4838 MB |             730 MB |              **0** |         0 |   2.4 GB |
+| quinn |    1114 MB |            1114 MB |              **0** |    58 981 |   203 MB |
+
+The 2 s window favours quinn, and the 5 s bulk run favours s2n: s2n ramps up
+more slowly, then scales across its workers. quinn pushes back on `send`
+instead of queueing, so its memory stays bounded.
+
+### Fixes
+
+- **GSO sends over 64 KB were lost.** The driver asked `poll_transmit` for
+  up to quinn-udp's `max_gso_segments()` (64 on Linux). At 1,200–1,452 B per
+  datagram, batches over 45–54 segments are larger than a UDP datagram.
+  Linux fails them with `EMSGSIZE`, which the driver logged at `trace`, as it
+  does for failed MTU probes. Batches are now capped at 10 segments (what
+  quinn's own driver uses) and at 65,507 bytes. The sim socket now
+  advertises 64 segments and rejects sends larger than a UDP datagram, and
+  `bulk_sends_fit_in_a_udp_datagram` covers it.
+- **`MAX_RECV_DATAGRAMS` 256 → 4096**, from the experiments above.
+- **The acceptor plugins took one connection per server, and one stream per
+  connection, each frame.** At 60 Hz, 600 connections took 10 s to appear on
+  the server. Clients' data waited in the driver meanwhile, which showed up
+  as multi-second latency p99 in `active` phases that add clients, on both
+  backends. It probably also explains why Phase 2's 300- and 600-client
+  `active` rows received more than they sent (not checked on that build).
+  The acceptors now take everything that's waiting.
+  `acceptors_take_everything_waiting_each_frame` covers it.
+
+### Gate
+
+- **Data-loss reproducer loses 0 bytes:** met.
+- **600 active, frame avg and CPU at or below Phase 2:** CPU met (0.49–0.50
+  cores, against 0.78 in Phase 2 and 0.86–0.94 for s2n today). Frame avg
+  isn't met against Phase 2's 0.31–0.32 ms. quinn's 0.49–0.51 ms is at or
+  below s2n's 0.52–0.64 ms in the same session, but the expected drop from
+  far fewer wakes (2 per frame against 605) didn't show up.
+- **Bulk received at least s2n's:** not met. quinn got 2,533–2,539 MB in 5 s
+  with 2 threads and 3,697 MB with 4, against 5,145 MB for s2n in the same
+  session (3,130 MB in the older baseline). The cause is the server's driver
+  at 100%: Phase G.
+- **Broadcast and latency recorded for both backends:** met.
+
 ## Backpressure and data loss
 
 `--payload <BYTES>` raises the offered load until s2n-quic can't keep up.
@@ -416,3 +564,6 @@ should become non-zero once backpressure reaches the caller.
 - ~~`QuicReceiveStream::recv_many` uses `blocking_recv_many` and **blocks the
   Bevy thread** until data arrives on that stream.~~ Fixed in Phase 1:
   `recv_many` is now a non-blocking `try_recv` loop.
+- ~~`SimpleServerAcceptorPlugin` and `SimpleClientAcceptorPlugin` accept one
+  connection or stream per frame.~~ Fixed in Phase E: they accept everything
+  that's waiting.

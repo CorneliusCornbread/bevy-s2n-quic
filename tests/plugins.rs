@@ -34,6 +34,7 @@ use bevy_s2n_quic::{
         plugin::DisconnectHandlerPlugin,
         runtime::QuicRuntime,
         stream::{
+            QuicPeerStreamAttempt,
             receive::QuicReceiveStream,
             send::QuicSendStream,
             session::{QuicAeronetPacketPlugin, QuicSessionMode},
@@ -564,4 +565,79 @@ fn several_threads_serve_every_client_with_one_wake_per_frame() {
 #[derive(bevy::ecs::component::Component)]
 struct ClientStream {
     sent: bool,
+}
+
+/// Runs `app` for `duration`, so the other app's network thread has time to
+/// handle what it sent.
+fn update_for(app: &mut App, duration: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        app.update();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The acceptor plugins spawn every connection and stream that's waiting,
+/// not one per frame. The server runs in its own app, so it can sit still
+/// while everything arrives.
+#[test]
+fn acceptors_take_everything_waiting_each_frame() {
+    const CLIENTS: usize = 4;
+    const STREAMS: usize = 3;
+
+    let mut server = app(|plugins| plugins);
+    let addr = spawn_server(&mut server);
+    server.update();
+
+    let mut clients = app(|plugins| plugins);
+    let connections: Vec<Entity> = (0..CLIENTS)
+        .map(|_| spawn_client(&mut clients, addr))
+        .collect();
+    update_until(&mut clients, "connecting", |world| {
+        connections
+            .iter()
+            .all(|&c| world.get::<QuicConnection>(c).is_some())
+            .then_some(())
+    });
+    update_for(&mut clients, Duration::from_millis(200));
+
+    server.update();
+    let world = server.world_mut();
+    let accepted = world
+        .query_filtered::<(), (With<QuicConnection>, With<QuicServerMarker>)>()
+        .iter(world)
+        .count();
+    assert_eq!(accepted, CLIENTS, "connections spawned in one frame");
+
+    // The server only learns of a stream once data arrives on it.
+    let streams: Vec<Entity> = (0..STREAMS)
+        .map(|_| {
+            let attempt = clients
+                .world_mut()
+                .get_mut::<QuicConnection>(connections[0])
+                .unwrap()
+                .open_send_stream()
+                .unwrap();
+            clients.world_mut().spawn((attempt, QuicClientMarker)).id()
+        })
+        .collect();
+    update_until(&mut clients, "opening the streams", |world| {
+        streams
+            .iter()
+            .all(|&s| world.get::<QuicSendStream>(s).is_some())
+            .then_some(())
+    });
+    for &stream in &streams {
+        let mut stream = clients.world_mut().get_mut::<QuicSendStream>(stream).unwrap();
+        stream.send(Bytes::from_static(b"x")).unwrap();
+    }
+    update_for(&mut clients, Duration::from_millis(200));
+
+    server.update();
+    let world = server.world_mut();
+    let accepted = world
+        .query_filtered::<(), (With<QuicPeerStreamAttempt>, With<QuicServerMarker>)>()
+        .iter(world)
+        .count();
+    assert_eq!(accepted, STREAMS, "streams spawned in one frame");
 }

@@ -245,6 +245,25 @@ runs.
   5 s), or the gap is recorded.
 - Broadcast and latency numbers are recorded for both backends.
 
+**Outcome** (details in [`perf-baseline.md`](perf-baseline.md#phase-e-quinn-proto-driver)):
+
+- The benchmark has the four additions, plus per-driver busy % and
+  `--stream-budget`. The byte budgets are exposed as
+  `QuicDriverPlugin::with_stream_budgets`.
+- Three fixes: GSO sends are capped at 10 segments and 65,507 bytes (larger
+  ones were silently lost, which cut one connection to 44 MiB/s, against
+  757 MiB/s now and 785–812 for quinn's `bulk`). `MAX_RECV_DATAGRAMS` is now
+  4096. The acceptor plugins now take every waiting connection and stream
+  each frame, not one.
+- Gate: the reproducer loses 0 bytes, and broadcast and latency are recorded.
+  At 600 active, CPU is below Phase 2 (0.50 against 0.78 cores). Frame avg
+  (0.49–0.51 ms) is at or below s2n's in the same session, but not below
+  Phase 2's recorded 0.31 ms.
+- Bulk is **not** at s2n's level: 2,535 MB in 5 s with 2 threads and
+  3,697 MB with 4, against 5,145 MB for s2n. Budgets, flow-control windows,
+  ACK frequency and the crypto provider made no difference. The server's
+  driver is at 100% in every bulk run, so **Phase G is triggered**.
+
 ## Phase F: remove s2n and release
 
 - **Dependencies:** remove `s2n-quic`, `s2n-quic-tls`, `tokio` and

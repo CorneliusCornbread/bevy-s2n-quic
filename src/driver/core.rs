@@ -42,12 +42,23 @@ use super::{
 
 /// Datagrams one endpoint may receive per turn before connections get a
 /// chance to send. Acknowledgements only go out when connections are driven,
-/// so draining a busy socket completely would stall the peer.
-const MAX_RECV_DATAGRAMS: usize = 256;
+/// so draining a busy socket completely would stall the peer. A server
+/// receiving from 600 bulk senders got about 520 MB/s through with 256 and
+/// 720 MB/s with 4096: fewer turns means fewer, fuller send batches.
+const MAX_RECV_DATAGRAMS: usize = 4096;
 
 /// Datagrams one connection may send per turn, so a bulk sender can't starve
 /// the others.
 const MAX_TRANSMIT_DATAGRAMS: usize = 64;
+
+/// Datagrams per GSO send. quinn's own driver uses 10: more costs memory and
+/// gains little.
+const MAX_TRANSMIT_SEGMENTS: usize = 10;
+
+/// The most bytes one GSO send may carry: the largest UDP payload over IPv4.
+/// Linux rejects larger sends with `EMSGSIZE`, which quinn-udp can't tell
+/// apart from a failed MTU probe, so the whole batch is silently lost.
+const MAX_GSO_BYTES: usize = 65_507;
 
 /// Endpoint-generated responses (version negotiation, stateless resets,
 /// refusals) kept while a socket is blocked. Past this they're dropped; the
@@ -904,7 +915,12 @@ impl<I: Io> Core<I> {
             return;
         }
 
-        let max_segments = ep.socket.max_transmit_segments();
+        let max_segments = ep
+            .socket
+            .max_transmit_segments()
+            .min(MAX_TRANSMIT_SEGMENTS)
+            .min(MAX_GSO_BYTES / usize::from(c.inner.current_mtu()))
+            .max(1);
         let mut sent = 0;
         loop {
             if sent >= MAX_TRANSMIT_DATAGRAMS {

@@ -29,13 +29,11 @@ impl Plugin for SimpleServerAcceptorPlugin {
 
 fn accept_connections(mut commands: Commands, servers: Query<(&mut QuicServer, Entity)>) {
     for (mut server, entity) in servers {
-        match server.accept_connection() {
-            super::ConnectionPoll::None => continue,
-            super::ConnectionPoll::ServerClosed => continue,
-            super::ConnectionPoll::NewConnection(quic_connection) => {
-                let bundle = (quic_connection, QuicServerMarker, ChildOf(entity));
-                commands.spawn(bundle);
-            }
+        while let super::ConnectionPoll::NewConnection(quic_connection) =
+            server.accept_connection()
+        {
+            let bundle = (quic_connection, QuicServerMarker, ChildOf(entity));
+            commands.spawn(bundle);
         }
     }
 }
@@ -55,15 +53,18 @@ fn handle_stream_accept(
     connection_entity: Entity,
     connection: &mut QuicConnection,
 ) {
-    match connection.accept_stream() {
-        Ok(Some(peer_attempt)) => {
-            commands.entity(connection_entity).with_children(|parent| {
-                parent.spawn((peer_attempt, QuicServerMarker));
-            });
+    loop {
+        match connection.accept_stream() {
+            Ok(Some(peer_attempt)) => {
+                commands.entity(connection_entity).with_children(|parent| {
+                    parent.spawn((peer_attempt, QuicServerMarker));
+                });
+            }
+            Ok(None) => return,
+            Err(err) => {
+                error!("Error accepting stream from connection: {}", err);
+                return;
+            }
         }
-        Err(err) => {
-            error!("Error accepting stream from connection: {}", err);
-        }
-        _ => {}
     }
 }

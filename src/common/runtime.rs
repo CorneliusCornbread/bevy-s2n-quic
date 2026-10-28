@@ -32,6 +32,8 @@ pub(crate) struct RuntimeOptions {
     pub max_connections: Option<usize>,
     /// `(send, receive)` datagram buffer sizes, in bytes.
     pub datagram_buffers: Option<(usize, usize)>,
+    /// `(send, receive)` byte budgets per stream.
+    pub stream_budgets: Option<(usize, usize)>,
     pub thread_name: Option<String>,
     pub on_thread_start: Option<ThreadStartHook>,
 }
@@ -122,6 +124,10 @@ impl QuicRuntime {
         if let Some((send, receive)) = options.datagram_buffers {
             endpoint_options.datagram_send_buffer = send;
             endpoint_options.datagram_receive_buffer = receive;
+        }
+        if let Some((send, receive)) = options.stream_budgets {
+            endpoint_options.send_budget = send;
+            endpoint_options.recv_budget = receive;
         }
         let (notices, notice_rx) = mpsc::channel();
 

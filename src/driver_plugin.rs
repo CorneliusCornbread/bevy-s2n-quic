@@ -26,6 +26,7 @@ pub struct QuicDriverPlugin {
     threads: Option<usize>,
     max_connections: Option<usize>,
     datagram_buffers: Option<(usize, usize)>,
+    stream_budgets: Option<(usize, usize)>,
     thread_name: Option<String>,
     on_thread_start: Option<ThreadStartHook>,
 }
@@ -36,6 +37,7 @@ impl Plugin for QuicDriverPlugin {
             threads: self.threads,
             max_connections: self.max_connections,
             datagram_buffers: self.datagram_buffers,
+            stream_budgets: self.stream_budgets,
             thread_name: self.thread_name.clone(),
             on_thread_start: self.on_thread_start.clone(),
         }))
@@ -75,6 +77,27 @@ impl QuicDriverPlugin {
     ///   Defaults to 1 MiB.
     pub fn with_datagram_buffers(mut self, send: usize, receive: usize) -> Self {
         self.datagram_buffers = Some((send, receive));
+        self
+    }
+
+    /// Sets how many bytes each stream buffers between the app and the
+    /// network thread.
+    ///
+    /// - `send`: bytes queued with
+    ///   [QuicSendStream::send][crate::common::stream::send::QuicSendStream::send]
+    ///   that the network thread hasn't handed to QUIC yet. Past it, `send`
+    ///   returns [SendError::Full][crate::common::error::SendError::Full].
+    ///   Defaults to 1 MiB.
+    /// - `receive`: bytes received but not yet read with
+    ///   [QuicReceiveStream::recv][crate::common::stream::receive::QuicReceiveStream::recv]
+    ///   or `recv_many`. Past it, the network thread stops reading the
+    ///   stream, and QUIC flow control slows the peer down. Defaults to 1 MiB.
+    ///
+    /// The app moves data at most once per frame, so one stream's throughput
+    /// is capped at about one budget per frame (60 MiB/s at 60 Hz with the
+    /// defaults).
+    pub fn with_stream_budgets(mut self, send: usize, receive: usize) -> Self {
+        self.stream_budgets = Some((send, receive));
         self
     }
 
