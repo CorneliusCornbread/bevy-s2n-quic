@@ -10,6 +10,9 @@ use crate::common::runtime::QuicRuntime;
 pub struct DriverMetrics {
     /// Times the thread was woken to handle commands. At most one per frame.
     pub wakes: u64,
+    /// Times another network thread woke it, to hand over a server's
+    /// connections or the datagrams for them.
+    pub peer_wakes: u64,
     /// Time spent handling work, not counting time waiting for it.
     pub busy: Duration,
 }
@@ -19,6 +22,10 @@ pub struct DriverMetrics {
 pub fn driver_metrics(runtime: &QuicRuntime) -> Vec<DriverMetrics> {
     runtime
         .metrics()
-        .map(|(wakes, busy)| DriverMetrics { wakes, busy })
+        .map(|(wakes, peer_wakes, busy)| DriverMetrics {
+            wakes,
+            peer_wakes,
+            busy,
+        })
         .collect()
 }

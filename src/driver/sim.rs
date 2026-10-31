@@ -5,9 +5,9 @@
 //! covering seconds of protocol time finish instantly.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     io::{self, IoSliceMut},
     net::SocketAddr,
     rc::Rc,
@@ -23,7 +23,7 @@ use quinn_udp::{RecvMeta, Transmit};
 use super::{
     EndpointSetup,
     core::Core,
-    io::{Io, Socket},
+    io::{Io, Socket, SocketSender},
     protocol::{Command, EndpointId, Event, IdAllocator},
 };
 
@@ -57,6 +57,12 @@ struct NetState {
     rng: u64,
     seq: u64,
     inboxes: HashMap<SocketAddr, BinaryHeap<Reverse<Packet>>>,
+    /// Sockets whose sends fail with `WouldBlock`.
+    blocked: HashSet<SocketAddr>,
+    would_block: u64,
+    /// The address peers see for a socket, if it isn't its own, as if it
+    /// were behind a NAT.
+    nat: HashMap<SocketAddr, SocketAddr>,
     sent: u64,
     dropped: u64,
 }
@@ -107,6 +113,9 @@ impl SimNet {
             rng: seed.max(1),
             seq: 0,
             inboxes: HashMap::new(),
+            blocked: HashSet::new(),
+            would_block: 0,
+            nat: HashMap::new(),
             sent: 0,
             dropped: 0,
         })))
@@ -134,28 +143,17 @@ impl SimNet {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct SimSocket {
     addr: SocketAddr,
     net: SimNet,
 }
 
-impl Socket for SimSocket {
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.addr)
-    }
-
+impl SocketSender for SimSocket {
     fn max_transmit_segments(&self) -> usize {
         // What quinn-udp reports on Linux. Exercises the GSO path:
         // transmits carry several datagrams.
         64
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        1
-    }
-
-    fn may_fragment(&self) -> bool {
-        false
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
@@ -167,6 +165,18 @@ impl Socket for SimSocket {
             transmit.contents.len()
         );
         let mut state = self.net.0.borrow_mut();
+        if state.blocked.contains(&self.addr) {
+            state.would_block += 1;
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let from = state.nat.get(&self.addr).copied().unwrap_or(self.addr);
+        let dest = transmit.destination;
+        let to = match state.nat.iter().find(|(_, external)| **external == dest) {
+            Some((internal, _)) => Some(*internal),
+            // A rebound socket no longer gets packets sent to its own address.
+            None if state.nat.contains_key(&dest) => None,
+            None => Some(dest),
+        };
         let segment = transmit.segment_size.unwrap_or(transmit.contents.len());
 
         for datagram in transmit.contents.chunks(segment.max(1)) {
@@ -182,16 +192,36 @@ impl Socket for SimSocket {
             let packet = Packet {
                 at,
                 seq: state.seq,
-                from: self.addr,
+                from,
                 data: datagram.to_vec(),
             };
             // Packets to an address nobody listens on vanish.
-            if let Some(inbox) = state.inboxes.get_mut(&transmit.destination) {
+            if let Some(inbox) = to.and_then(|to| state.inboxes.get_mut(&to)) {
                 inbox.push(Reverse(packet));
             }
         }
 
         Ok(())
+    }
+}
+
+impl Socket for SimSocket {
+    type Sender = SimSocket;
+
+    fn sender(&self) -> &SimSocket {
+        self
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.addr)
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
     }
 
     fn recv(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
@@ -225,8 +255,19 @@ impl Socket for SimSocket {
     }
 }
 
+/// Drivers that may hand connections to each other, all on the test thread.
+struct SimGroup {
+    commands: Vec<Sender<Command<SimSocket>>>,
+    loads: RefCell<Vec<usize>>,
+    /// Set whenever a driver sends another a command, so [`Sim::step`] turns
+    /// them all again.
+    sent: Rc<Cell<bool>>,
+}
+
 pub(super) struct SimIo {
     net: SimNet,
+    group: Rc<SimGroup>,
+    index: usize,
 }
 
 impl Io for SimIo {
@@ -236,7 +277,33 @@ impl Io for SimIo {
         self.net.now()
     }
 
+    // `Sim::step` reports every socket that isn't blocked as writable on
+    // every step.
     fn set_writable_interest(&self, _: &mut SimSocket, _: EndpointId, _: bool) {}
+
+    fn driver_index(&self) -> usize {
+        self.index
+    }
+
+    fn driver_count(&self) -> usize {
+        self.group.commands.len()
+    }
+
+    fn send_to(&self, driver: usize, command: Command<SimSocket>) {
+        self.group.commands[driver].send(command).unwrap();
+        self.group.sent.set(true);
+    }
+
+    fn wake(&self, _: usize) {}
+
+    fn load(&self, driver: usize) -> usize {
+        self.group.loads.borrow()[driver]
+    }
+
+    fn add_load(&self, driver: usize, delta: isize) {
+        let mut loads = self.group.loads.borrow_mut();
+        loads[driver] = loads[driver].checked_add_signed(delta).unwrap();
+    }
 }
 
 pub(super) struct SimDriver {
@@ -252,6 +319,7 @@ pub(super) struct Sim {
     net: SimNet,
     start: Instant,
     pub drivers: Vec<SimDriver>,
+    peer_sent: Rc<Cell<bool>>,
 }
 
 impl Sim {
@@ -262,6 +330,7 @@ impl Sim {
             net,
             start,
             drivers: Vec::new(),
+            peer_sent: Rc::default(),
         }
     }
 
@@ -275,27 +344,67 @@ impl Sim {
         (state.sent, state.dropped)
     }
 
+    /// Makes sends on the socket at `addr` fail with `WouldBlock`, or stops
+    /// them failing.
+    pub fn set_blocked(&mut self, addr: SocketAddr, blocked: bool) {
+        let mut state = self.net.0.borrow_mut();
+        if blocked {
+            state.blocked.insert(addr);
+        } else {
+            state.blocked.remove(&addr);
+        }
+    }
+
+    /// Sends that failed with `WouldBlock` so far.
+    pub fn would_block_count(&self) -> u64 {
+        self.net.0.borrow().would_block
+    }
+
+    /// Makes peers see the socket at `addr` as `external`, as a NAT that
+    /// rebinds it would. Packets to its previous address are lost.
+    pub fn rebind(&mut self, addr: SocketAddr, external: SocketAddr) {
+        self.net.0.borrow_mut().nat.insert(addr, external);
+    }
+
     /// Simulated time since the start.
     pub fn elapsed(&self) -> Duration {
         self.net.now() - self.start
     }
 
+    /// Adds a driver in a group of its own.
     pub fn add_driver(&mut self) -> usize {
-        let (commands, command_rx) = mpsc::channel();
-        let (event_tx, events) = mpsc::channel();
-        let ids = Arc::new(IdAllocator::default());
-        let io = SimIo {
-            net: self.net.clone(),
-        };
+        self.add_group(1)[0]
+    }
 
-        self.drivers.push(SimDriver {
-            core: Core::new(io, command_rx, event_tx, ids.clone()),
-            commands,
-            events,
-            ids,
-            log: Vec::new(),
+    /// Adds `count` drivers that share IDs and may hand connections to each
+    /// other. Returns their indices in [`Self::drivers`].
+    pub fn add_group(&mut self, count: usize) -> Vec<usize> {
+        let ids = Arc::new(IdAllocator::default());
+        let (commands, receivers): (Vec<_>, Vec<_>) =
+            (0..count).map(|_| mpsc::channel()).unzip();
+        let group = Rc::new(SimGroup {
+            commands: commands.clone(),
+            loads: RefCell::new(vec![0; count]),
+            sent: self.peer_sent.clone(),
         });
-        self.drivers.len() - 1
+
+        let first = self.drivers.len();
+        for (index, (commands, command_rx)) in commands.into_iter().zip(receivers).enumerate() {
+            let (event_tx, events) = mpsc::channel();
+            let io = SimIo {
+                net: self.net.clone(),
+                group: group.clone(),
+                index,
+            };
+            self.drivers.push(SimDriver {
+                core: Core::new(io, command_rx, event_tx, ids.clone()),
+                commands,
+                events,
+                ids: ids.clone(),
+                log: Vec::new(),
+            });
+        }
+        (first..self.drivers.len()).collect()
     }
 
     pub fn open_endpoint(
@@ -321,14 +430,22 @@ impl Sim {
         self.drivers[driver].commands.send(command).unwrap();
     }
 
-    /// Turns every driver once, collecting their events.
+    /// Turns every driver once, collecting their events, then again while
+    /// drivers have sent each other commands.
     pub fn step(&mut self) {
-        for driver in &mut self.drivers {
-            for endpoint in driver.core.endpoint_ids() {
-                driver.core.set_ready(endpoint, true, false);
+        loop {
+            self.peer_sent.set(false);
+            for driver in &mut self.drivers {
+                for (endpoint, addr) in driver.core.local_endpoints() {
+                    let writable = !self.net.0.borrow().blocked.contains(&addr);
+                    driver.core.set_ready(endpoint, true, writable);
+                }
+                driver.core.turn();
+                driver.log.extend(driver.events.try_iter());
             }
-            driver.core.turn();
-            driver.log.extend(driver.events.try_iter());
+            if !self.peer_sent.get() {
+                return;
+            }
         }
     }
 

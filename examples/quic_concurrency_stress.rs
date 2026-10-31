@@ -268,6 +268,8 @@ struct Config {
     burst: usize,
     tokio_threads: Option<usize>,
     stream_budget: Option<usize>,
+    /// Keep a server's connections on its own network thread.
+    no_spread: bool,
     /// Frame and fixed-tick rate of the headless runner. `None` keeps Bevy's
     /// 64 Hz fixed tick under a [RUNNER_HZ] runner.
     hz: Option<f64>,
@@ -294,6 +296,7 @@ impl Default for Config {
             burst: 1,
             tokio_threads: None,
             stream_budget: None,
+            no_spread: false,
             hz: None,
             pin: false,
             tokio_nice: None,
@@ -322,6 +325,7 @@ Options:
   --burst <N>             Messages sent per sender per fixed tick [default: 1]
   --tokio-threads <N>     Network threads [default: library default]
   --stream-budget <BYTES> Send and receive byte budget per stream [default: library default]
+  --no-spread             Keep the server's connections on its own network thread
   --hz <N>                Frame and fixed-tick rate, headless only [default: 60 Hz frames, 64 Hz ticks]
   --pin                   Pin network threads and Bevy threads to separate cores (Linux)
   --tokio-nice <N>        Nice value for the network threads (Linux)
@@ -443,6 +447,7 @@ impl Config {
                             .ok_or_else(|| format!("invalid --hz: {v}"))?,
                     );
                 }
+                "--no-spread" => cfg.no_spread = true,
                 "--pin" => cfg.pin = true,
                 "--tokio-nice" => {
                     let v = value()?;
@@ -602,8 +607,10 @@ impl ThreadPlan {
 
     /// The QUIC runtime, with its threads pinned and niced through the
     /// thread start hook.
-    fn driver_plugin(&self, stream_budget: Option<usize>) -> QuicDriverPlugin {
-        let mut plugin = QuicDriverPlugin::default().with_threads(self.tokio);
+    fn driver_plugin(&self, stream_budget: Option<usize>, spread: bool) -> QuicDriverPlugin {
+        let mut plugin = QuicDriverPlugin::default()
+            .with_threads(self.tokio)
+            .with_connection_spreading(spread);
         if let Some(budget) = stream_budget {
             plugin = plugin.with_stream_budgets(budget, budget);
         }
@@ -1260,7 +1267,7 @@ fn main() -> AppExit {
     }
 
     let role = cfg.role;
-    app.add_plugins(QuicDefaultPlugins.set(threads.driver_plugin(cfg.stream_budget)))
+    app.add_plugins(QuicDefaultPlugins.set(threads.driver_plugin(cfg.stream_budget, !cfg.no_spread)))
         .insert_resource(StressBench::new(cfg, threads))
         .add_systems(Startup, setup)
         .add_systems(First, frame_begin)
@@ -2213,7 +2220,12 @@ fn report(bench: &StressBench) -> bool {
             |hz| format!("{hz} Hz, fixed tick {hz} Hz")
         ),
     );
-    let _ = writeln!(md, "- Threads: {}", bench.threads.describe());
+    let _ = writeln!(
+        md,
+        "- Threads: {}{}",
+        bench.threads.describe(),
+        if cfg.no_spread { " | no spread" } else { "" }
+    );
     if cfg.role != Role::Server {
         let _ = writeln!(
             md,

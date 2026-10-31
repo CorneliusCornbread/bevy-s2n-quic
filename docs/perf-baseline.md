@@ -563,6 +563,96 @@ instead of queueing, so its memory stays bounded.
   at 100%: Phase G.
 - **Broadcast and latency recorded for both backends:** met.
 
+## Phase G: multi-core server
+
+A server keeps receiving on its own driver and hands each connection it
+accepts to the driver with the fewest connections (see
+[`phase-g-multicore.md`](phase-g-multicore.md)). With three or more drivers,
+the server's own driver only receives and routes. `--no-spread` (that is,
+`QuicDriverPlugin::with_connection_spreading(false)`) keeps the Phase E
+behaviour, and each comparison below ran both in the same session. One run
+each, with the same machine, nice, memory cap and desktop use as Phase E.
+
+### G0: routing cost
+
+Measured before building, with temporary timers (4 threads, 600 × 64 KB,
+5 s). Over 4.69 M datagrams, `Endpoint::handle` took 0.46 s and
+`Connection::handle_event` 4.92 s, about 0.1 µs against 1.05 µs per
+datagram. So routing, the part that has to stay on the server's driver, is
+under 10% of the per-datagram cost.
+
+### Bulk: `--clients 600 --payload 65536 --duration 5 --drain 90 --scenarios active`
+
+| threads | spread | rx MB/s | busy % per driver | cpu cores | frame avg ms | lost B |
+| ------: | ------ | ------: | ----------------- | --------: | -----------: | -----: |
+|       2 | no     |     520 | 100/74            |      1.60 |         0.90 |      0 |
+|       2 | yes    |     608 | 100/99            |      1.83 |         0.94 |      0 |
+|       4 | no     |     664 | 100/49/48/48      |      2.23 |         1.13 |      0 |
+|       4 | yes    | **1 187** | 100/100/100/100 |      3.67 |         1.99 |      0 |
+
+s2n got 1,029 MB/s with 4 threads (Phase E). In this single process the
+clients' connections share the drivers with the server's, so every driver is
+now at 100%.
+
+### Separate server and clients processes
+
+The server on `taskset -c 0-3,8-11`, the clients on `4-7,12-15` (4 physical
+cores each), both with `--tokio-threads 4`. Same bulk options. Numbers from
+the server's table.
+
+| spread | rx MB/s  | busy % per driver | cpu cores | frames | frame avg ms | lost B |
+| ------ | -------: | ----------------- | --------: | -----: | -----------: | -----: |
+| no     |      692 | 100/0/0/0         |      1.15 |    299 |         4.36 |      0 |
+| yes    | **1 979** | 98/95/87/85      |      4.34 |     41 |       119.12 |      0 |
+
+- With spreading, the server's driver no longer limits it: 2.9× as much
+  arrives.
+- **The server's main thread is the next limit.** It handles every received
+  chunk, about 0.45 µs each in the `no` run (4.36 ms per frame for
+  11.5 MB). At about 2 GB/s that's around 1.7 M chunks a second, on cores
+  whose SMT siblings run the busy drivers. The drivers deliver faster than
+  one Bevy frame can take at 60 Hz, so frames stretch until the two balance,
+  here at 41 frames in 5 s. In-process, frame time tracked throughput
+  (1.13 ms at 664 MB/s, 1.99 ms at 1,187 MB/s). That cost is in the Bevy
+  layer and the benchmark's receive system, not the driver.
+
+### Default command
+
+`--clients 100,300,600 --scenarios active,idle,broadcast,datagram`, default
+2 threads. Rows at 600 clients:
+
+| scenario  | spread | frame avg ms | cpu cores | busy % per driver | wakes/frame |
+| --------- | ------ | -----------: | --------: | ----------------- | ----------: |
+| active    | no     |         0.45 |      0.47 | 35/17             |           2 |
+| active    | yes    |         0.44 |      0.44 | 27/24             |           2 |
+| idle      | no     |         0.22 |      0.07 | 4/2               |           2 |
+| idle      | yes    |         0.22 |      0.07 | 3/3               |           2 |
+| broadcast | no     |         0.42 |      0.51 | 41/15             |           1 |
+| broadcast | yes    |         0.43 |      0.48 | 28/27             |           2 |
+| datagram  | no     |         0.42 |      0.46 | 34/17             |           2 |
+| datagram  | yes    |         0.40 |      0.42 | 26/23             |           2 |
+
+100 and 300 clients were the same with and without spreading, to within
+0.02 ms and 0.02 cores. Latency p50/p99 didn't change (16.6–16.8 /
+16.8–17.0 ms). The extra wakes from routing didn't show up in CPU. Broadcast
+has 2 wakes per frame with spreading because the server's sends now go to
+both drivers.
+
+### Other checks
+
+- **Data-loss reproducer** (`--warmup 1 --duration 2`, 2 threads): 0 bytes
+  lost, 640 MB/s, busy 100/99.
+- **One connection** (`driver::tests::bulk_throughput`): 754.5 MiB/s, against
+  757 in Phase E. Sending on the duplicated socket handle costs nothing.
+
+### Gate
+
+- **Data-loss reproducer loses 0 bytes:** met.
+- **Bulk at least s2n's 1,029 MB/s with 4 threads:** met, 1,187 MB/s
+  in-process and 1,979 MB/s with separate processes.
+- **600 active, CPU and frame avg no worse than Phase E:** met (0.44 cores
+  and 0.44 ms, against 0.49–0.50 and 0.49–0.51).
+
 ## Backpressure and data loss
 
 `--payload <BYTES>` raises the offered load until s2n-quic can't keep up.

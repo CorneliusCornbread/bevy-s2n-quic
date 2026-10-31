@@ -1,6 +1,11 @@
 //! The driver's event loop state: endpoints, connections and timers. One
 //! [`Core::turn`] runs one loop iteration; the thread in `mod.rs` (or a test)
 //! decides when to call it.
+//!
+//! A server endpoint may hand the connections it accepts to other drivers in
+//! its group (see [`PeerCommand`]). A driver that takes one keeps a remote
+//! [`Endpoint`] standing in for the real one, with a handle to its socket for
+//! sending.
 
 use std::{
     cmp::Reverse,
@@ -17,8 +22,8 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
-    self as proto, ConnectionHandle, DatagramEvent, Incoming, ReadError, StreamEvent,
-    VarInt, WriteError,
+    self as proto, ConnectionEvent, ConnectionHandle, DatagramEvent, EndpointEvent,
+    Incoming, ReadError, StreamEvent, VarInt, WriteError,
 };
 use quinn_udp::{BATCH_SIZE, RecvMeta};
 use slab::Slab;
@@ -33,10 +38,10 @@ use super::{
         EndpointSetup, Role, connection_error, connection_stats, from_varint, to_varint,
     },
     datagram::{DatagramQueue, datagram_sizes},
-    io::{Io, Socket},
+    io::{Io, Socket, SocketSender},
     protocol::{
-        Command, ConnId, Dir, EndpointId, Event, IdAllocator, RecvBudget, SendBudget,
-        StreamId, StreamInfo,
+        Adoption, Command, ConnId, Dir, EndpointId, Event, IdAllocator, PeerCommand,
+        RecvBudget, SendBudget, StreamId, StreamInfo,
     },
 };
 
@@ -93,22 +98,71 @@ pub(crate) struct Core<I: Io> {
     recv_buf: Vec<u8>,
     recv_stride: usize,
     send_buf: Vec<u8>,
+    /// Messages for the other drivers in the group, by driver.
+    outboxes: Vec<Outbox>,
     running: bool,
 }
 
-struct Endpoint<S> {
+/// Messages for another driver, batched until the end of a step.
+#[derive(Default)]
+struct Outbox {
+    conn_events: Vec<(ConnId, ConnectionEvent)>,
+    endpoint_events: Vec<(EndpointId, ConnectionHandle, EndpointEvent)>,
+    /// Commands were queued for the driver since it was last woken.
+    wake: bool,
+}
+
+struct Endpoint<S: Socket> {
     id: EndpointId,
-    socket: S,
-    inner: proto::Endpoint,
+    sender: S::Sender,
     setup: EndpointSetup,
-    conns: HashMap<ConnectionHandle, usize>,
-    readable: bool,
+    conns: HashMap<ConnectionHandle, Route>,
     /// Transmits that hit `WouldBlock`, oldest first. While any are queued
-    /// the socket waits for writability and no connection sends.
+    /// no connection on this driver sends on the socket.
     blocked: VecDeque<OwnedTransmit>,
     /// Connections that wanted to send while the socket was blocked.
     waiting: Vec<usize>,
     closing: bool,
+    kind: Kind<S>,
+}
+
+enum Kind<S> {
+    Local(Box<LocalEndpoint<S>>),
+    /// Stands in for an endpoint on another driver, for the connections it
+    /// handed to this one. Removed once they've all drained.
+    Remote {
+        home: usize,
+        /// The home was asked to report when the socket is writable again.
+        watching: bool,
+    },
+}
+
+/// The parts of an endpoint only its own driver has.
+struct LocalEndpoint<S> {
+    socket: S,
+    inner: proto::Endpoint,
+    readable: bool,
+    /// Waiting for the socket to become writable.
+    writable_interest: bool,
+    /// Drivers to tell when the socket is writable again.
+    watchers: Vec<usize>,
+}
+
+impl<S: Socket> Endpoint<S> {
+    fn local(&mut self) -> Option<&mut LocalEndpoint<S>> {
+        match &mut self.kind {
+            Kind::Local(local) => Some(local),
+            Kind::Remote { .. } => None,
+        }
+    }
+}
+
+/// Where an endpoint's connection is driven: on this driver, by key, or on
+/// another.
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    Local(usize),
+    Remote { driver: usize, conn: ConnId },
 }
 
 struct Conn {
@@ -194,6 +248,7 @@ impl<I: Io> Core<I> {
             recv_buf: Vec::new(),
             recv_stride: 0,
             send_buf: Vec::new(),
+            outboxes: Vec::new(),
             running: true,
         }
     }
@@ -206,10 +261,13 @@ impl<I: Io> Core<I> {
         }
 
         self.receive();
+        // Connections on other drivers shouldn't wait for this one's.
+        self.flush_outboxes();
         self.expire_timers();
         self.drive_dirty();
         self.report_stats();
         self.reap_endpoints();
+        self.flush_outboxes();
         true
     }
 
@@ -242,9 +300,29 @@ impl<I: Io> Core<I> {
         }
     }
 
+    /// The endpoints whose sockets are on this driver.
     #[cfg(test)]
     pub fn endpoint_ids(&self) -> Vec<EndpointId> {
-        self.endpoints.iter().map(|(_, ep)| ep.id).collect()
+        self.local_endpoints().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The endpoints whose sockets are on this driver, and their addresses.
+    #[cfg(test)]
+    pub fn local_endpoints(&self) -> Vec<(EndpointId, SocketAddr)> {
+        self.endpoints
+            .iter()
+            .filter_map(|(_, ep)| match &ep.kind {
+                Kind::Local(local) => Some((ep.id, local.socket.local_addr().ok()?)),
+                Kind::Remote { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Endpoints on this driver, counting ones standing in for another
+    /// driver's.
+    #[cfg(test)]
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
     }
 
     #[cfg(test)]
@@ -264,9 +342,10 @@ impl<I: Io> Core<I> {
     }
 
     fn mark_readable(&mut self, key: usize) {
-        let ep = &mut self.endpoints[key];
-        if !ep.readable {
-            ep.readable = true;
+        if let Some(local) = self.endpoints[key].local()
+            && !local.readable
+        {
+            local.readable = true;
             self.readable.push(key);
         }
     }
@@ -404,11 +483,186 @@ impl<I: Io> Core<I> {
                 c.datagrams.send(&mut c.inner, data);
                 self.mark_dirty(key);
             }
+            Command::Peer(command) => self.handle_peer(command),
             Command::Shutdown => self.running = false,
         }
     }
 
+    fn handle_peer(&mut self, command: PeerCommand<I::Socket>) {
+        match command {
+            PeerCommand::Adopt(adoption) => self.adopt(*adoption),
+            PeerCommand::ConnEvents(events) => {
+                for (conn, event) in events {
+                    // The connection may have drained since.
+                    if let Some(&key) = self.conn_keys.get(&conn) {
+                        self.conns[key].inner.handle_event(event);
+                        self.mark_dirty(key);
+                    }
+                }
+            }
+            PeerCommand::EndpointEvents(events) => {
+                for (endpoint, handle, event) in events {
+                    self.handle_remote_endpoint_event(endpoint, handle, event);
+                }
+            }
+            PeerCommand::WatchWritable { endpoint, driver } => {
+                let Some(&key) = self.endpoint_keys.get(&endpoint) else {
+                    // Nothing left to wait for. The driver's handle still
+                    // works, so let it try again.
+                    self.send_writable(driver, endpoint);
+                    return;
+                };
+                let ep = &mut self.endpoints[key];
+                if let Some(local) = ep.local()
+                    && !local.watchers.contains(&driver)
+                {
+                    local.watchers.push(driver);
+                }
+                request_writable(&self.io, ep);
+            }
+            PeerCommand::Writable { endpoint } => {
+                let Some(&key) = self.endpoint_keys.get(&endpoint) else {
+                    return;
+                };
+                if let Kind::Remote { watching, .. } = &mut self.endpoints[key].kind {
+                    *watching = false;
+                }
+                self.flush_blocked(key);
+            }
+        }
+    }
+
+    /// Takes a connection another driver's endpoint accepted.
+    fn adopt(&mut self, adoption: Adoption<I::Socket>) {
+        let Adoption {
+            endpoint,
+            home,
+            conn,
+            handle,
+            inner,
+            sender,
+            setup,
+        } = adoption;
+
+        let ep_key = match self.endpoint_keys.get(&endpoint) {
+            Some(&key) => key,
+            None => {
+                let key = self.endpoints.insert(Endpoint {
+                    id: endpoint,
+                    sender,
+                    setup,
+                    conns: HashMap::new(),
+                    blocked: VecDeque::new(),
+                    waiting: Vec::new(),
+                    closing: false,
+                    kind: Kind::Remote {
+                        home,
+                        watching: false,
+                    },
+                });
+                self.endpoint_keys.insert(endpoint, key);
+                key
+            }
+        };
+
+        let remote = inner.remote_address();
+        self.insert_conn(ep_key, handle, inner, conn);
+        self.emit(Event::ConnectionAccepted {
+            endpoint,
+            conn,
+            remote,
+        });
+    }
+
+    /// Hands an event from a connection on another driver to its endpoint
+    /// here, and routes any reply back.
+    fn handle_remote_endpoint_event(
+        &mut self,
+        endpoint: EndpointId,
+        handle: ConnectionHandle,
+        event: EndpointEvent,
+    ) {
+        let Some(&key) = self.endpoint_keys.get(&endpoint) else {
+            return;
+        };
+        let ep = &mut self.endpoints[key];
+        let Some(local) = ep.local() else {
+            return;
+        };
+
+        let drained = event.is_drained();
+        let reply = local.inner.handle_event(handle, event);
+        let route = if drained {
+            ep.conns.remove(&handle)
+        } else {
+            ep.conns.get(&handle).copied()
+        };
+        if let (Some(reply), Some(Route::Remote { driver, conn })) = (reply, route) {
+            outbox(&mut self.outboxes, driver)
+                .conn_events
+                .push((conn, reply));
+        }
+    }
+
+    /// Queues a command for another driver. It's woken at the end of the
+    /// step.
+    fn send_peer(&mut self, driver: usize, command: Command<I::Socket>) {
+        self.io.send_to(driver, command);
+        outbox(&mut self.outboxes, driver).wake = true;
+    }
+
+    fn send_writable(&self, driver: usize, endpoint: EndpointId) {
+        self.io.send_to(
+            driver,
+            Command::Peer(PeerCommand::Writable { endpoint }),
+        );
+        self.io.wake(driver);
+    }
+
+    /// Sends the batched messages for other drivers, and wakes the drivers
+    /// that have commands.
+    fn flush_outboxes(&mut self) {
+        for (driver, outbox) in self.outboxes.iter_mut().enumerate() {
+            if !outbox.conn_events.is_empty() {
+                let events = mem::take(&mut outbox.conn_events);
+                self.io
+                    .send_to(driver, Command::Peer(PeerCommand::ConnEvents(events)));
+                outbox.wake = true;
+            }
+            if !outbox.endpoint_events.is_empty() {
+                let events = mem::take(&mut outbox.endpoint_events);
+                self.io.send_to(
+                    driver,
+                    Command::Peer(PeerCommand::EndpointEvents(events)),
+                );
+                outbox.wake = true;
+            }
+            if mem::take(&mut outbox.wake) {
+                self.io.wake(driver);
+            }
+        }
+    }
+
+    /// Picks the driver for a connection the endpoint accepted: the one with
+    /// the fewest connections.
+    fn pick_driver(&self, ep_key: usize) -> usize {
+        let me = self.io.driver_index();
+        let count = self.io.driver_count();
+        if count == 1 || !self.endpoints[ep_key].setup.spread_connections {
+            return me;
+        }
+
+        // With three or more drivers, the home only receives and routes, the
+        // part of a server's work that can't be spread.
+        (1..=count)
+            .map(|i| (me + i) % count)
+            .filter(|&driver| count < 3 || driver != me)
+            .min_by_key(|&driver| self.io.load(driver))
+            .unwrap_or(me)
+    }
+
     fn open_endpoint(&mut self, id: EndpointId, socket: I::Socket, setup: EndpointSetup) {
+        let sender = socket.sender().clone();
         let server_config = match &setup.role {
             Role::Server(config) => Some(config.clone()),
             Role::Client(_) => None,
@@ -432,14 +686,19 @@ impl<I: Io> Core<I> {
 
         let key = self.endpoints.insert(Endpoint {
             id,
-            socket,
-            inner,
+            sender,
             setup,
             conns: HashMap::new(),
-            readable: false,
             blocked: VecDeque::new(),
             waiting: Vec::new(),
             closing: false,
+            kind: Kind::Local(Box::new(LocalEndpoint {
+                socket,
+                inner,
+                readable: false,
+                writable_interest: false,
+                watchers: Vec::new(),
+            })),
         });
         self.endpoint_keys.insert(id, key);
         // Datagrams may have arrived before the socket was handed over, and
@@ -454,9 +713,21 @@ impl<I: Io> Core<I> {
         let ep = &mut self.endpoints[key];
         ep.closing = true;
 
-        let conns: Vec<usize> = ep.conns.values().copied().collect();
-        for conn in conns {
-            self.close_conn(conn, AppErrorCode::UNKNOWN, Bytes::new(), now);
+        let routes: Vec<Route> = ep.conns.values().copied().collect();
+        for route in routes {
+            match route {
+                Route::Local(conn) => {
+                    self.close_conn(conn, AppErrorCode::UNKNOWN, Bytes::new(), now)
+                }
+                Route::Remote { driver, conn } => self.send_peer(
+                    driver,
+                    Command::Close {
+                        conn,
+                        code: AppErrorCode::UNKNOWN,
+                        reason: Bytes::new(),
+                    },
+                ),
+            }
         }
     }
 
@@ -478,7 +749,7 @@ impl<I: Io> Core<I> {
             return fail(self, "the endpoint is closed");
         };
         let ep = &mut self.endpoints[ep_key];
-        let Role::Client(config) = &ep.setup.role else {
+        let (Role::Client(config), Kind::Local(local)) = (&ep.setup.role, &mut ep.kind) else {
             return fail(self, "the endpoint can't make connections");
         };
         if ep.closing {
@@ -490,11 +761,12 @@ impl<I: Io> Core<I> {
             .map(str::to_owned)
             .unwrap_or_else(|| connect.addr().ip().to_string());
 
-        match ep
+        match local
             .inner
             .connect(now, config.clone(), connect.addr(), &server_name)
         {
             Ok((handle, inner)) => {
+                self.io.add_load(self.io.driver_index(), 1);
                 self.insert_conn(ep_key, handle, inner, conn);
             }
             Err(e) => fail(self, &e.to_string()),
@@ -530,7 +802,7 @@ impl<I: Io> Core<I> {
             recv_budget: ep.setup.recv_budget,
             datagrams,
         });
-        ep.conns.insert(handle, key);
+        ep.conns.insert(handle, Route::Local(key));
         self.conn_keys.insert(id, key);
         self.mark_dirty(key);
         key
@@ -571,8 +843,11 @@ impl<I: Io> Core<I> {
 
         // Endpoints that hit the per-turn limit are still readable.
         self.readable = readable;
-        self.readable
-            .retain(|&key| self.endpoints.get(key).is_some_and(|ep| ep.readable));
+        self.readable.retain(|&key| {
+            self.endpoints
+                .get(key)
+                .is_some_and(|ep| matches!(&ep.kind, Kind::Local(local) if local.readable))
+        });
     }
 
     fn receive_endpoint(&mut self, key: usize) {
@@ -581,10 +856,13 @@ impl<I: Io> Core<I> {
 
         while received < MAX_RECV_DATAGRAMS {
             let result = {
+                let Kind::Local(local) = &self.endpoints[key].kind else {
+                    return;
+                };
                 let mut chunks = self.recv_buf.chunks_mut(self.recv_stride);
                 let mut bufs: [IoSliceMut<'_>; BATCH_SIZE] =
                     std::array::from_fn(|_| IoSliceMut::new(chunks.next().unwrap()));
-                self.endpoints[key].socket.recv(&mut bufs, &mut meta)
+                local.socket.recv(&mut bufs, &mut meta)
             };
 
             match result {
@@ -601,7 +879,7 @@ impl<I: Io> Core<I> {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.endpoints[key].readable = false;
+                    self.set_unreadable(key);
                     return;
                 }
                 // Windows reports ICMP port unreachable as a reset on the next
@@ -612,10 +890,16 @@ impl<I: Io> Core<I> {
                         "receive failed on endpoint {}: {e}",
                         self.endpoints[key].id.0
                     );
-                    self.endpoints[key].readable = false;
+                    self.set_unreadable(key);
                     return;
                 }
             }
+        }
+    }
+
+    fn set_unreadable(&mut self, key: usize) {
+        if let Some(local) = self.endpoints[key].local() {
+            local.readable = false;
         }
     }
 
@@ -627,14 +911,25 @@ impl<I: Io> Core<I> {
 
         self.send_buf.clear();
         let ep = &mut self.endpoints[ep_key];
-        match ep
+        let Some(local) = ep.local() else {
+            return;
+        };
+        let event = local
             .inner
-            .handle(now, meta.addr, meta.dst_ip, ecn, data, &mut self.send_buf)
-        {
+            .handle(now, meta.addr, meta.dst_ip, ecn, data, &mut self.send_buf);
+        match event {
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                if let Some(&key) = ep.conns.get(&handle) {
-                    self.conns[key].inner.handle_event(event);
-                    self.mark_dirty(key);
+                match ep.conns.get(&handle).copied() {
+                    Some(Route::Local(key)) => {
+                        self.conns[key].inner.handle_event(event);
+                        self.mark_dirty(key);
+                    }
+                    Some(Route::Remote { driver, conn }) => {
+                        outbox(&mut self.outboxes, driver)
+                            .conn_events
+                            .push((conn, event));
+                    }
+                    None => {}
                 }
             }
             Some(DatagramEvent::NewConnection(incoming)) => {
@@ -654,22 +949,17 @@ impl<I: Io> Core<I> {
         buf.clear();
 
         let ep = &mut self.endpoints[ep_key];
-        if ep.closing || ep.conns.len() >= ep.setup.max_connections {
-            let transmit = ep.inner.refuse(incoming, &mut buf);
+        let full = ep.closing || ep.conns.len() >= ep.setup.max_connections;
+        let Some(local) = ep.local() else {
+            self.send_buf = buf;
+            return;
+        };
+        if full {
+            let transmit = local.inner.refuse(incoming, &mut buf);
             self.send_response(ep_key, &transmit, &buf);
         } else {
-            match ep.inner.accept(incoming, now, &mut buf, None) {
-                Ok((handle, inner)) => {
-                    let endpoint = ep.id;
-                    let remote = inner.remote_address();
-                    let conn = self.ids.conn();
-                    self.insert_conn(ep_key, handle, inner, conn);
-                    self.emit(Event::ConnectionAccepted {
-                        endpoint,
-                        conn,
-                        remote,
-                    });
-                }
+            match local.inner.accept(incoming, now, &mut buf, None) {
+                Ok((handle, inner)) => self.place_accepted(ep_key, handle, inner),
                 Err(e) => {
                     tracing::debug!("can't accept a connection: {}", e.cause);
                     if let Some(transmit) = e.response {
@@ -680,6 +970,47 @@ impl<I: Io> Core<I> {
         }
 
         self.send_buf = buf;
+    }
+
+    /// Drives a connection the endpoint accepted here, or hands it to the
+    /// driver [`Self::pick_driver`] chooses.
+    fn place_accepted(
+        &mut self,
+        ep_key: usize,
+        handle: ConnectionHandle,
+        inner: proto::Connection,
+    ) {
+        let conn = self.ids.conn();
+        let driver = self.pick_driver(ep_key);
+        // Counted now, so the connections accepted before the driver takes
+        // this one aren't all placed on it too.
+        self.io.add_load(driver, 1);
+
+        let me = self.io.driver_index();
+        let ep = &mut self.endpoints[ep_key];
+        let endpoint = ep.id;
+        if driver == me {
+            let remote = inner.remote_address();
+            self.insert_conn(ep_key, handle, inner, conn);
+            self.emit(Event::ConnectionAccepted {
+                endpoint,
+                conn,
+                remote,
+            });
+            return;
+        }
+
+        ep.conns.insert(handle, Route::Remote { driver, conn });
+        let adoption = Adoption {
+            endpoint,
+            home: me,
+            conn,
+            handle,
+            inner,
+            sender: ep.sender.clone(),
+            setup: ep.setup.clone(),
+        };
+        self.send_peer(driver, Command::Peer(PeerCommand::Adopt(Box::new(adoption))));
     }
 
     // ---- Timers ----
@@ -881,8 +1212,15 @@ impl<I: Io> Core<I> {
 
         while let Some(event) = c.inner.poll_endpoint_events() {
             let drained = event.is_drained();
-            if let Some(reply) = ep.inner.handle_event(c.handle, event) {
-                c.inner.handle_event(reply);
+            match &mut ep.kind {
+                Kind::Local(local) => {
+                    if let Some(reply) = local.inner.handle_event(c.handle, event) {
+                        c.inner.handle_event(reply);
+                    }
+                }
+                Kind::Remote { home, .. } => outbox(&mut self.outboxes, *home)
+                    .endpoint_events
+                    .push((ep.id, c.handle, event)),
             }
 
             if drained {
@@ -898,6 +1236,7 @@ impl<I: Io> Core<I> {
         let c = self.conns.remove(key);
         self.conn_keys.remove(&c.id);
         self.endpoints[c.endpoint].conns.remove(&c.handle);
+        self.io.add_load(self.io.driver_index(), -1);
 
         if !c.lost {
             self.emit(Event::ConnectionLost {
@@ -916,7 +1255,7 @@ impl<I: Io> Core<I> {
         }
 
         let max_segments = ep
-            .socket
+            .sender
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS)
             .min(MAX_GSO_BYTES / usize::from(c.inner.current_mtu()))
@@ -940,12 +1279,12 @@ impl<I: Io> Core<I> {
                 .map_or(1, |size| transmit.size.div_ceil(size));
 
             let udp = udp_transmit(&transmit, &self.send_buf[..transmit.size]);
-            match ep.socket.try_send(&udp) {
+            match ep.sender.try_send(&udp) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     ep.blocked.push_back(own_transmit(&udp));
                     ep.waiting.push(key);
-                    self.io.set_writable_interest(&mut ep.socket, ep.id, true);
+                    request_writable(&self.io, ep);
                     return;
                 }
                 Err(e) => log_send_error(&e),
@@ -964,34 +1303,45 @@ impl<I: Io> Core<I> {
             return;
         }
 
-        match ep.socket.try_send(&udp) {
+        match ep.sender.try_send(&udp) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 ep.blocked.push_back(own_transmit(&udp));
-                self.io.set_writable_interest(&mut ep.socket, ep.id, true);
+                request_writable(&self.io, ep);
             }
             Err(e) => log_send_error(&e),
         }
     }
 
     /// Sends the transmits queued while the socket was blocked, then lets the
-    /// waiting connections send again.
+    /// waiting connections send again, here and on the drivers watching the
+    /// socket.
     fn flush_blocked(&mut self, key: usize) {
         let ep = &mut self.endpoints[key];
-        if ep.blocked.is_empty() {
-            return;
-        }
-
         while let Some(transmit) = ep.blocked.front() {
-            match ep.socket.try_send(&transmit.as_udp()) {
+            match ep.sender.try_send(&transmit.as_udp()) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    request_writable(&self.io, ep);
+                    return;
+                }
                 Err(e) => log_send_error(&e),
             }
             ep.blocked.pop_front();
         }
 
-        self.io.set_writable_interest(&mut ep.socket, ep.id, false);
+        let id = ep.id;
+        if let Kind::Local(local) = &mut ep.kind {
+            if local.writable_interest {
+                local.writable_interest = false;
+                self.io.set_writable_interest(&mut local.socket, id, false);
+            }
+            for driver in mem::take(&mut local.watchers) {
+                self.io
+                    .send_to(driver, Command::Peer(PeerCommand::Writable { endpoint: id }));
+                self.io.wake(driver);
+            }
+        }
         let waiting = mem::take(&mut ep.waiting);
         for conn in waiting {
             if let Some(c) = self.conns.get_mut(conn) {
@@ -1004,15 +1354,57 @@ impl<I: Io> Core<I> {
         let done: Vec<usize> = self
             .endpoints
             .iter()
-            .filter(|(_, ep)| ep.closing && ep.conns.is_empty() && ep.blocked.is_empty())
+            .filter(|(_, ep)| {
+                ep.conns.is_empty()
+                    && ep.blocked.is_empty()
+                    && match &ep.kind {
+                        Kind::Local(local) => ep.closing && local.watchers.is_empty(),
+                        Kind::Remote { .. } => true,
+                    }
+            })
             .map(|(key, _)| key)
             .collect();
 
         for key in done {
             let ep = self.endpoints.remove(key);
             self.endpoint_keys.remove(&ep.id);
-            self.readable.retain(|&k| k != key);
-            self.emit(Event::EndpointClosed { endpoint: ep.id });
+            if let Kind::Local(_) = ep.kind {
+                self.readable.retain(|&k| k != key);
+                self.emit(Event::EndpointClosed { endpoint: ep.id });
+            }
+        }
+    }
+}
+
+fn outbox(outboxes: &mut Vec<Outbox>, driver: usize) -> &mut Outbox {
+    if outboxes.len() <= driver {
+        outboxes.resize_with(driver + 1, Outbox::default);
+    }
+    &mut outboxes[driver]
+}
+
+/// Arranges to hear when the endpoint's socket is writable again: from the
+/// OS if the socket is on this driver, otherwise from its home driver.
+fn request_writable<I: Io>(io: &I, ep: &mut Endpoint<I::Socket>) {
+    match &mut ep.kind {
+        Kind::Local(local) => {
+            if !local.writable_interest {
+                local.writable_interest = true;
+                io.set_writable_interest(&mut local.socket, ep.id, true);
+            }
+        }
+        Kind::Remote { home, watching } => {
+            if !*watching {
+                *watching = true;
+                io.send_to(
+                    *home,
+                    Command::Peer(PeerCommand::WatchWritable {
+                        endpoint: ep.id,
+                        driver: io.driver_index(),
+                    }),
+                );
+                io.wake(*home);
+            }
         }
     }
 }

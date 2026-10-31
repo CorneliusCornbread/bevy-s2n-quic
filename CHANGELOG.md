@@ -13,6 +13,8 @@
   `QuicDriverPlugin::on_thread_start(hook)` name the network threads and run
   a hook on each one as it starts (for pinning or priority). The
   `quic_concurrency_stress` example uses the hook to pin and nice the threads.
+- `QuicDriverPlugin::with_connection_spreading(bool)` turns off spreading a
+  server's connections over the network threads. It's on by default.
 - `QuicRuntime::default_thread_count()` is public, to help size other thread
   pools around the runtime. `QuicRuntime::thread_count()` returns the number
   of network threads.
@@ -48,7 +50,10 @@
   longer used.**
   - One or more network threads each run an event loop over their sockets,
     connections and timers. Every server and client is assigned to one
-    thread, and its connections run on that thread too.
+    thread. A client's connections run on its thread. A server receives on
+    its thread and hands each connection it accepts to the thread with the
+    fewest connections (with three or more threads, never its own), so one
+    busy server uses every thread.
   - Once per frame, `poll_driver_events` (in `IoSystems::Poll`, `PreUpdate`)
     applies what the network threads reported to the components. Commands
     such as `send`, `close` and opening streams are queued without waking a

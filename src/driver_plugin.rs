@@ -27,6 +27,7 @@ pub struct QuicDriverPlugin {
     max_connections: Option<usize>,
     datagram_buffers: Option<(usize, usize)>,
     stream_budgets: Option<(usize, usize)>,
+    spread_connections: Option<bool>,
     thread_name: Option<String>,
     on_thread_start: Option<ThreadStartHook>,
 }
@@ -38,6 +39,7 @@ impl Plugin for QuicDriverPlugin {
             max_connections: self.max_connections,
             datagram_buffers: self.datagram_buffers,
             stream_budgets: self.stream_budgets,
+            spread_connections: self.spread_connections,
             thread_name: self.thread_name.clone(),
             on_thread_start: self.on_thread_start.clone(),
         }))
@@ -98,6 +100,18 @@ impl QuicDriverPlugin {
     /// defaults).
     pub fn with_stream_budgets(mut self, send: usize, receive: usize) -> Self {
         self.stream_budgets = Some((send, receive));
+        self
+    }
+
+    /// Sets whether a server hands the connections it accepts to the network
+    /// thread with the fewest connections, so they run on every thread.
+    /// Otherwise they all run on the server's own thread.
+    ///
+    /// The server's thread still receives every datagram and routes it to
+    /// the right thread. With three or more threads, it gets no connections
+    /// of its own. Defaults to `true`; it has no effect with one thread.
+    pub fn with_connection_spreading(mut self, spread: bool) -> Self {
+        self.spread_connections = Some(spread);
         self
     }
 

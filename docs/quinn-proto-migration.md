@@ -320,6 +320,15 @@ The s2n backend wasn't measured, because its benchmark port is gone.
   endpoint on its own driver. Simpler, but connection migration breaks it,
   and its behaviour is Linux-specific.
 
+**Outcome:** Option 1, compared with the others in
+[`phase-g-multicore.md`](phase-g-multicore.md). The gate is met (details in
+[`perf-baseline.md`](perf-baseline.md#phase-g-multi-core-server)): 600 × 64 KB
+bulk receives 1,187 MB/s with 4 threads in one process (664 without
+spreading, 1,029 for s2n), and 1,979 MB/s with the server in its own process.
+The reproducer loses 0 bytes, and 600-active CPU and frame avg are slightly
+below Phase E's. The server's Bevy main thread, which handles every received
+chunk, is now the limit in the separate-process run.
+
 ## Risks
 
 - **Bulk throughput may trail s2n** until GSO, GRO and pacing are right. The

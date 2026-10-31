@@ -46,6 +46,9 @@ pub(crate) struct EndpointOptions {
     /// oldest are dropped. Also limits the size of one datagram from the
     /// peer.
     pub datagram_receive_buffer: usize,
+    /// For servers, hands each accepted connection to the least busy driver
+    /// in the endpoint's group, instead of keeping it on the endpoint's.
+    pub spread_connections: bool,
     /// Seeds quinn's random number generator, for reproducible tests.
     pub rng_seed: Option<[u8; 32]>,
 }
@@ -60,6 +63,7 @@ impl Default for EndpointOptions {
             recv_budget: 1 << 20,
             datagram_send_buffer: 256 << 10,
             datagram_receive_buffer: 1 << 20,
+            spread_connections: true,
             rng_seed: None,
         }
     }
@@ -75,6 +79,7 @@ pub(crate) struct EndpointSetup {
     pub(super) send_budget: usize,
     pub(super) recv_budget: usize,
     pub(super) datagram_send_buffer: usize,
+    pub(super) spread_connections: bool,
 }
 
 #[derive(Clone)]
@@ -133,6 +138,7 @@ impl EndpointSetup {
             send_budget: options.send_budget,
             recv_budget: options.recv_budget,
             datagram_send_buffer: options.datagram_send_buffer,
+            spread_connections: options.spread_connections,
         }
     }
 }

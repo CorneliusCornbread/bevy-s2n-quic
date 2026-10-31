@@ -1,5 +1,5 @@
-//! The messages exchanged between the driver thread and its owner, and the
-//! byte budgets they share.
+//! The messages exchanged between the driver thread and its owner, and
+//! between the drivers of a group, and the byte budgets they share.
 
 use std::{
     fmt,
@@ -11,6 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use quinn_proto::{Connection, ConnectionEvent, ConnectionHandle, EndpointEvent};
 
 use crate::{
     client::Connect,
@@ -20,7 +21,7 @@ use crate::{
     },
 };
 
-use super::config::EndpointSetup;
+use super::{config::EndpointSetup, io::Socket};
 
 /// Identifies an endpoint (one socket) on a driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -180,7 +181,7 @@ pub(crate) struct StreamInfo {
 }
 
 /// A request from the owner to the driver.
-pub(crate) enum Command<S> {
+pub(crate) enum Command<S: Socket> {
     /// Starts driving `socket` as a server or client endpoint.
     OpenEndpoint {
         endpoint: EndpointId,
@@ -242,8 +243,44 @@ pub(crate) enum Command<S> {
     /// send buffer is full. Drops are counted in
     /// [`ConnectionStats::datagrams_dropped`].
     SendDatagrams { conn: ConnId, data: Vec<Bytes> },
+    /// From another driver in the group.
+    Peer(PeerCommand<S>),
     /// Stops the driver without closing anything gracefully.
     Shutdown,
+}
+
+/// A message from one driver in a group to another, about connections driven
+/// on a different driver from their endpoint.
+///
+/// The endpoint's driver (its home) receives every datagram on its socket
+/// and routes each one by connection ID. The connection's driver sends on a
+/// shared handle to the same socket, and hands the connection's endpoint
+/// events back to the home.
+pub(crate) enum PeerCommand<S: Socket> {
+    /// Drive a connection the home accepted. Sent before any of its
+    /// [`PeerCommand::ConnEvents`].
+    Adopt(Box<Adoption<S>>),
+    /// Datagrams and endpoint replies for connections on this driver.
+    ConnEvents(Vec<(ConnId, ConnectionEvent)>),
+    /// Events for endpoints on this driver, from their connections on others.
+    EndpointEvents(Vec<(EndpointId, ConnectionHandle, EndpointEvent)>),
+    /// Send [`PeerCommand::Writable`] to `driver` once the endpoint's socket
+    /// is writable again.
+    WatchWritable { endpoint: EndpointId, driver: usize },
+    /// The endpoint's socket is writable again.
+    Writable { endpoint: EndpointId },
+}
+
+/// A connection handed to another driver.
+pub(crate) struct Adoption<S: Socket> {
+    pub(super) endpoint: EndpointId,
+    /// The endpoint's driver.
+    pub(super) home: usize,
+    pub(super) conn: ConnId,
+    pub(super) handle: ConnectionHandle,
+    pub(super) inner: Connection,
+    pub(super) sender: S::Sender,
+    pub(super) setup: EndpointSetup,
 }
 
 /// A notification from the driver to its owner.

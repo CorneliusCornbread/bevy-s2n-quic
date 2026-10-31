@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         Arc, LazyLock,
@@ -871,6 +872,398 @@ fn stream_opens_wait_for_the_peers_limit() {
         .collect();
     assert_eq!(requests, (0..150).collect::<Vec<_>>());
     assert!(lost_reason(&pair.sim.drivers[SERVER].log, server).is_none());
+}
+
+// ---- A server spread over a group of drivers ----
+
+/// A server endpoint on the first of a group of drivers, and a client driver
+/// of its own with one endpoint per client.
+struct Spread {
+    sim: Sim,
+    group: Vec<usize>,
+    client: usize,
+    server: EndpointId,
+    clients: Vec<EndpointId>,
+}
+
+/// A connection the server accepted.
+#[derive(Debug, Clone, Copy)]
+struct Accepted {
+    conn: ConnId,
+    driver: usize,
+    remote: SocketAddr,
+}
+
+impl Spread {
+    fn new(drivers: usize, clients: u16, server: EndpointOptions) -> Self {
+        let mut sim = Sim::new(11);
+        let group = sim.add_group(drivers);
+        let client = sim.add_driver();
+        let server = sim.open_endpoint(group[0], server_addr(), server_setup(&server));
+        let clients = (0..clients)
+            .map(|n| {
+                let setup = client_setup(&seeded(10 + n as u8));
+                sim.open_endpoint(client, client_addr(n), setup)
+            })
+            .collect();
+        Self {
+            sim,
+            group,
+            client,
+            server,
+            clients,
+        }
+    }
+
+    fn connect(&mut self, n: usize) -> ConnId {
+        let conn = self.sim.drivers[self.client].ids.conn();
+        self.sim.command(
+            self.client,
+            Command::Connect {
+                endpoint: self.clients[n],
+                conn,
+                connect: Connect::new(server_addr()).with_server_name("localhost"),
+            },
+        );
+        conn
+    }
+
+    fn accepted(&self) -> Vec<Accepted> {
+        accepted_in(&self.sim, &self.group)
+    }
+
+    /// Connects client `n` and waits for both sides. Returns the client's
+    /// connection and the server's.
+    fn connected(&mut self, n: usize) -> (ConnId, Accepted) {
+        let conn = self.connect(n);
+        let (group, client) = (self.group.clone(), self.client);
+        let remote = client_addr(n as u16);
+        let mut server = None;
+        let done = self.sim.run_until(Duration::from_secs(5), |sim| {
+            server = accepted_in(sim, &group)
+                .into_iter()
+                .rev()
+                .find(|a| a.remote == remote)
+                .filter(|a| connected(&sim.drivers[a.driver].log, a.conn));
+            server.is_some() && connected(&sim.drivers[client].log, conn)
+        });
+        assert!(done, "handshake didn't complete");
+        (conn, server.unwrap())
+    }
+
+    /// Server connections per driver of the group.
+    fn placement(&self) -> Vec<usize> {
+        let mut counts = vec![0; self.group.len()];
+        for a in self.accepted() {
+            counts[self.group.iter().position(|&d| d == a.driver).unwrap()] += 1;
+        }
+        counts
+    }
+}
+
+fn accepted_in(sim: &Sim, group: &[usize]) -> Vec<Accepted> {
+    group
+        .iter()
+        .flat_map(|&driver| {
+            sim.drivers[driver].log.iter().filter_map(move |e| match e {
+                Event::ConnectionAccepted { conn, remote, .. } => Some(Accepted {
+                    conn: *conn,
+                    driver,
+                    remote: *remote,
+                }),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+fn connected(log: &[Event], conn: ConnId) -> bool {
+    has(log, |e| matches!(e, Event::Connected { conn: c, .. } if *c == conn))
+}
+
+/// Collects the data of every stream peers open on a driver's connections.
+#[derive(Default)]
+struct Sink {
+    cursor: usize,
+    streams: HashMap<(ConnId, StreamId), SinkStream>,
+}
+
+struct SinkStream {
+    budget: Arc<RecvBudget>,
+    data: Vec<u8>,
+    finished: bool,
+}
+
+impl Sink {
+    /// Handles new events, consuming whatever arrived.
+    fn pump(&mut self, sim: &mut Sim, driver: usize) {
+        let events = sim.drivers[driver].log[self.cursor..].to_vec();
+        self.cursor += events.len();
+
+        for event in events {
+            match event {
+                Event::StreamAccepted { conn, stream } => {
+                    let sink = SinkStream {
+                        budget: stream.recv.unwrap(),
+                        data: Vec::new(),
+                        finished: false,
+                    };
+                    self.streams.insert((conn, stream.id), sink);
+                }
+                Event::StreamData {
+                    conn,
+                    stream,
+                    chunks,
+                } => {
+                    let sink = self.streams.get_mut(&(conn, stream)).unwrap();
+                    let len: usize = chunks.iter().map(Bytes::len).sum();
+                    for chunk in chunks {
+                        sink.data.extend_from_slice(&chunk);
+                    }
+                    if sink.budget.consume(len) {
+                        sim.command(driver, Command::ResumeRead { conn, stream });
+                    }
+                }
+                Event::StreamFinished { conn, stream } => {
+                    self.streams.get_mut(&(conn, stream)).unwrap().finished = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn finished(&self) -> usize {
+        self.streams.values().filter(|s| s.finished).count()
+    }
+}
+
+/// A writer for `total` bytes on a new uni stream from `driver`'s `conn`.
+fn uni_writer(sim: &mut Sim, driver: usize, conn: ConnId, total: usize) -> Writer {
+    let stream = open_stream(sim, driver, conn, Dir::Uni);
+    Writer {
+        driver,
+        conn,
+        stream: stream.id,
+        budget: stream.send.unwrap(),
+        total,
+        chunk: 16 << 10,
+        offset: 0,
+        finished: false,
+    }
+}
+
+#[test]
+fn spread_connections_run_on_the_other_drivers() {
+    const CLIENTS: u16 = 4;
+    const TOTAL: usize = 256 << 10;
+
+    let mut spread = Spread::new(3, CLIENTS, seeded(1));
+    let conns: Vec<(ConnId, Accepted)> =
+        (0..CLIENTS as usize).map(|n| spread.connected(n)).collect();
+
+    // With three drivers, the home only routes.
+    assert_eq!(spread.placement(), [0, 2, 2]);
+    assert_eq!(spread.sim.drivers[spread.group[0]].core.connection_count(), 0);
+
+    spread.sim.set_link(LinkConfig {
+        latency: Duration::from_millis(10),
+        jitter: Duration::from_millis(5),
+        loss: 0.02,
+    });
+    let client = spread.client;
+    let mut writers: Vec<Writer> = conns
+        .iter()
+        .map(|(conn, _)| uni_writer(&mut spread.sim, client, *conn, TOTAL))
+        .collect();
+    let workers = spread.group[1..].to_vec();
+    let mut sinks: Vec<Sink> = workers.iter().map(|_| Sink::default()).collect();
+
+    let done = spread.sim.run_until(Duration::from_secs(60), |sim| {
+        for writer in &mut writers {
+            writer.pump(sim);
+        }
+        for (sink, &driver) in sinks.iter_mut().zip(&workers) {
+            sink.pump(sim, driver);
+        }
+        sinks.iter().map(Sink::finished).sum::<usize>() == CLIENTS as usize
+    });
+    assert!(done, "not every stream finished");
+
+    for sink in &sinks {
+        for stream in sink.streams.values() {
+            assert!(stream.data == pattern(0, TOTAL), "stream data was corrupted");
+        }
+    }
+    for (_, server) in &conns {
+        let stats = spread.sim.drivers[server.driver]
+            .core
+            .connection_stats(server.conn)
+            .unwrap();
+        // Issuing connection IDs takes a round trip through the home's
+        // endpoint.
+        assert!(stats.frame_tx.new_connection_id > 0);
+    }
+}
+
+#[test]
+fn two_drivers_share_connections_with_the_home() {
+    let mut spread = Spread::new(2, 4, seeded(1));
+    for n in 0..4 {
+        spread.connected(n);
+    }
+    assert_eq!(spread.placement(), [2, 2]);
+}
+
+#[test]
+fn spreading_can_be_turned_off() {
+    let options = EndpointOptions {
+        spread_connections: false,
+        ..seeded(1)
+    };
+    let mut spread = Spread::new(3, 2, options);
+    spread.connected(0);
+    spread.connected(1);
+    assert_eq!(spread.placement(), [2, 0, 0]);
+}
+
+#[test]
+fn closing_an_endpoint_closes_remote_connections() {
+    let mut spread = Spread::new(3, 2, seeded(1));
+    let conns = [spread.connected(0), spread.connected(1)];
+    assert!(conns.iter().all(|(_, a)| a.driver != spread.group[0]));
+
+    let (home, endpoint) = (spread.group[0], spread.server);
+    spread.sim.command(home, Command::CloseEndpoint { endpoint });
+    assert!(spread.sim.run_until(Duration::from_secs(5), |sim| {
+        has(&sim.drivers[home].log, |e| {
+            matches!(e, Event::EndpointClosed { endpoint: id } if *id == endpoint)
+        })
+    }));
+
+    for (client, server) in conns {
+        assert_eq!(
+            lost_reason(&spread.sim.drivers[server.driver].log, server.conn),
+            Some(ConnectionError::LocallyClosed)
+        );
+        assert!(matches!(
+            lost_reason(&spread.sim.drivers[spread.client].log, client),
+            Some(ConnectionError::ApplicationClosed { .. })
+        ));
+    }
+    // The workers' stand-ins for the endpoint are gone too.
+    for &driver in &spread.group {
+        let core = &spread.sim.drivers[driver].core;
+        assert_eq!((core.endpoint_count(), core.connection_count()), (0, 0));
+    }
+}
+
+#[test]
+fn the_connection_limit_counts_remote_connections() {
+    let options = EndpointOptions {
+        max_connections: 1,
+        ..seeded(1)
+    };
+    let mut spread = Spread::new(3, 2, options);
+    let (first, server) = spread.connected(0);
+    assert_ne!(server.driver, spread.group[0]);
+
+    let client = spread.client;
+    let refused = spread.connect(1);
+    assert!(spread.sim.run_until(Duration::from_secs(5), |sim| {
+        lost_reason(&sim.drivers[client].log, refused).is_some()
+    }));
+    assert!(matches!(
+        lost_reason(&spread.sim.drivers[client].log, refused),
+        Some(ConnectionError::ConnectionClosed { code: 2, .. })
+    ));
+
+    // Once the first connection has drained on its driver, the home has room
+    // again.
+    spread.sim.command(
+        client,
+        Command::Close {
+            conn: first,
+            code: AppErrorCode::from(1u32),
+            reason: Bytes::new(),
+        },
+    );
+    let worker = server.driver;
+    assert!(spread.sim.run_until(Duration::from_secs(5), |sim| {
+        sim.drivers[worker].core.connection_count() == 0
+    }));
+    let (_, second) = spread.connected(1);
+    assert_ne!(second.driver, spread.group[0]);
+}
+
+#[test]
+fn a_blocked_socket_holds_remote_transmits() {
+    const TOTAL: usize = 1 << 20;
+
+    let mut spread = Spread::new(3, 1, seeded(1));
+    let (_, server) = spread.connected(0);
+    let mut writer = uni_writer(&mut spread.sim, server.driver, server.conn, TOTAL);
+    let mut reader = Reader::default();
+    let client = spread.client;
+
+    let mut blocked_at = None;
+    let mut unblocked = false;
+    let done = spread.sim.run_until(Duration::from_secs(30), |sim| {
+        writer.pump(sim);
+        reader.pump(sim, client, true);
+        match blocked_at {
+            None if reader.data.len() > TOTAL / 4 => {
+                sim.set_blocked(server_addr(), true);
+                blocked_at = Some(sim.elapsed());
+            }
+            Some(at) if !unblocked && sim.elapsed() - at > Duration::from_millis(100) => {
+                sim.set_blocked(server_addr(), false);
+                unblocked = true;
+            }
+            _ => {}
+        }
+        reader.finished
+    });
+
+    assert!(done, "received {} of {TOTAL} bytes", reader.data.len());
+    assert!(unblocked);
+    assert!(spread.sim.would_block_count() > 0);
+    assert!(reader.data == pattern(0, TOTAL), "stream data was corrupted");
+}
+
+#[test]
+fn a_remote_connection_survives_the_client_rebinding() {
+    const TOTAL: usize = 2 << 20;
+
+    let mut spread = Spread::new(3, 1, seeded(1));
+    let (client_conn, server) = spread.connected(0);
+    let client = spread.client;
+    let mut writer = uni_writer(&mut spread.sim, client, client_conn, TOTAL);
+    let mut sink = Sink::default();
+
+    let rebound: SocketAddr = "10.0.0.3:6000".parse().unwrap();
+    let mut moved = false;
+    let done = spread.sim.run_until(Duration::from_secs(30), |sim| {
+        writer.pump(sim);
+        sink.pump(sim, server.driver);
+        let received: usize = sink.streams.values().map(|s| s.data.len()).sum();
+        if !moved && received > TOTAL / 4 {
+            sim.rebind(client_addr(0), rebound);
+            moved = true;
+        }
+        sink.finished() == 1
+    });
+
+    assert!(done, "the stream didn't finish");
+    let stream = sink.streams.values().next().unwrap();
+    assert!(stream.data == pattern(0, TOTAL), "stream data was corrupted");
+    let log = &spread.sim.drivers[server.driver].log;
+    assert!(lost_reason(log, server.conn).is_none());
+    let stats = spread.sim.drivers[server.driver]
+        .core
+        .connection_stats(server.conn)
+        .unwrap();
+    // The server validated the new path.
+    assert!(stats.frame_tx.path_challenge > 0);
 }
 
 // ---- Real sockets ----

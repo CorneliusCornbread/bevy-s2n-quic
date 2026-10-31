@@ -10,8 +10,8 @@ use std::{
 use bevy::{ecs::resource::Resource, tasks::available_parallelism};
 
 use crate::driver::{
-    Command, Driver, DriverHandle, DriverOptions, EndpointOptions, Event, IdAllocator,
-    UdpSocket,
+    Command, Driver, DriverGroup, DriverHandle, DriverOptions, EndpointOptions, Event,
+    IdAllocator, UdpSocket,
 };
 
 use super::router::Notice;
@@ -34,6 +34,7 @@ pub(crate) struct RuntimeOptions {
     pub datagram_buffers: Option<(usize, usize)>,
     /// `(send, receive)` byte budgets per stream.
     pub stream_budgets: Option<(usize, usize)>,
+    pub spread_connections: Option<bool>,
     pub thread_name: Option<String>,
     pub on_thread_start: Option<ThreadStartHook>,
 }
@@ -41,7 +42,9 @@ pub(crate) struct RuntimeOptions {
 /// The background threads that run all QUIC network IO.
 ///
 /// Each thread runs one event loop. Every server and client is assigned to
-/// one thread, and its connections run on that thread too.
+/// one thread. A client's connections run on its thread. A server receives
+/// on its thread, and hands each connection it accepts to the thread with the
+/// fewest connections, so one busy server can use every thread.
 ///
 /// [QuicDriverPlugin][crate::driver_plugin::QuicDriverPlugin] inserts this
 /// resource. Servers and clients are created with it.
@@ -100,13 +103,15 @@ impl QuicRuntime {
             .thread_name
             .unwrap_or_else(|| DEFAULT_THREAD_NAME.to_owned());
         let ids = Arc::new(IdAllocator::default());
+        let group = Arc::new(DriverGroup::new(threads));
 
-        let drivers = (0..threads)
-            .map(|_| {
+        let drivers: Vec<DriverSlot> = (0..threads)
+            .map(|index| {
                 let (driver, events) = Driver::spawn(DriverOptions {
                     thread_name: Some(thread_name.clone()),
                     on_thread_start: options.on_thread_start.clone(),
                     ids: Some(ids.clone()),
+                    group: Some((group.clone(), index)),
                 })
                 .expect("Unable to start the QUIC network thread.");
 
@@ -116,6 +121,12 @@ impl QuicRuntime {
                 }
             })
             .collect();
+        group.start(
+            drivers
+                .iter()
+                .map(|slot| slot.driver.handle().clone())
+                .collect(),
+        );
 
         let mut endpoint_options = EndpointOptions {
             max_connections: options.max_connections.unwrap_or(usize::MAX),
@@ -128,6 +139,9 @@ impl QuicRuntime {
         if let Some((send, receive)) = options.stream_budgets {
             endpoint_options.send_budget = send;
             endpoint_options.recv_budget = receive;
+        }
+        if let Some(spread) = options.spread_connections {
+            endpoint_options.spread_connections = spread;
         }
         let (notices, notice_rx) = mpsc::channel();
 
@@ -174,11 +188,13 @@ impl QuicRuntime {
         }
     }
 
-    pub(crate) fn metrics(&self) -> impl Iterator<Item = (u64, Duration)> + '_ {
+    /// Each driver's `(wakes, peer wakes, busy time)`.
+    pub(crate) fn metrics(&self) -> impl Iterator<Item = (u64, u64, Duration)> + '_ {
         self.drivers.iter().map(|slot| {
             let metrics = slot.driver.handle().metrics();
             (
                 metrics.wakes.load(Ordering::Relaxed),
+                metrics.peer_wakes.load(Ordering::Relaxed),
                 Duration::from_nanos(metrics.busy_nanos.load(Ordering::Relaxed)),
             )
         })

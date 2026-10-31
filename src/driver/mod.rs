@@ -6,6 +6,11 @@
 //! wakes it at most once per call, so an owner that flushes once per frame
 //! costs one wake per frame however many commands it sent.
 //!
+//! Drivers can form a [`DriverGroup`]. A server endpoint then keeps
+//! receiving on its own driver, but hands each connection it accepts to the
+//! least busy driver in the group, so one server's connections run on every
+//! core.
+//!
 //! All quinn-proto and quinn-udp calls stay inside this module.
 
 mod config;
@@ -23,8 +28,8 @@ use std::{
     io::ErrorKind,
     net::SocketAddr,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
@@ -58,6 +63,59 @@ pub(crate) struct DriverOptions {
     /// Shares endpoint and connection IDs with other drivers, so they're
     /// unique across all of them. Each driver has its own by default.
     pub ids: Option<Arc<IdAllocator>>,
+    /// The group to join, and this driver's number in it. Drivers in a group
+    /// must share `ids`. Each driver is in a group of its own by default.
+    pub group: Option<(Arc<DriverGroup>, usize)>,
+}
+
+/// Drivers that may hand connections to each other.
+///
+/// Create it with the number of drivers, spawn each with its number, then
+/// call [`Self::start`] with their handles. Until then, every driver keeps its
+/// own connections.
+pub(crate) struct DriverGroup {
+    handles: OnceLock<Vec<DriverHandle>>,
+    /// Each driver's connections, counting ones handed to it that it hasn't
+    /// taken yet.
+    loads: Box<[AtomicUsize]>,
+}
+
+impl DriverGroup {
+    pub fn new(drivers: usize) -> Self {
+        Self {
+            handles: OnceLock::new(),
+            loads: (0..drivers.max(1)).map(|_| AtomicUsize::new(0)).collect(),
+        }
+    }
+
+    /// Hands the group its drivers, in order.
+    pub fn start(&self, handles: Vec<DriverHandle>) {
+        assert_eq!(handles.len(), self.loads.len(), "one handle per driver");
+        let _ = self.handles.set(handles);
+    }
+
+    /// The number of drivers, or 1 if the group hasn't started.
+    fn len(&self) -> usize {
+        self.handles.get().map_or(1, Vec::len)
+    }
+
+    fn handle(&self, driver: usize) -> Option<&DriverHandle> {
+        self.handles.get()?.get(driver)
+    }
+
+    fn load(&self, driver: usize) -> usize {
+        self.loads.get(driver).map_or(0, |l| l.load(Ordering::Relaxed))
+    }
+
+    fn add_load(&self, driver: usize, delta: isize) {
+        if let Some(load) = self.loads.get(driver) {
+            if delta >= 0 {
+                load.fetch_add(delta.unsigned_abs(), Ordering::Relaxed);
+            } else {
+                load.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// Counters for one driver, readable from any thread.
@@ -65,6 +123,8 @@ pub(crate) struct DriverOptions {
 pub(crate) struct DriverMetrics {
     /// Times [`DriverHandle::flush`] woke the driver.
     pub wakes: AtomicU64,
+    /// Times another driver in the group woke it.
+    pub peer_wakes: AtomicU64,
     /// Nanoseconds spent handling work, not counting time waiting for it.
     pub busy_nanos: AtomicU64,
 }
@@ -82,8 +142,13 @@ impl Driver {
         let poll = Poll::new()?;
         let waker = Waker::new(poll.registry(), WAKER)?;
         let registry = poll.registry().try_clone()?;
+        let (group, index) = options
+            .group
+            .unwrap_or_else(|| (Arc::new(DriverGroup::new(1)), 0));
         let io = MioIo {
             registry: poll.registry().try_clone()?,
+            group: group.clone(),
+            index,
         };
 
         let (commands, command_rx) = mpsc::channel();
@@ -115,6 +180,9 @@ impl Driver {
                 metrics,
             }),
         };
+        if group.loads.len() == 1 {
+            group.start(vec![handle.clone()]);
+        }
 
         Ok((
             Self {
@@ -221,6 +289,20 @@ impl DriverHandle {
         }
 
         self.shared.metrics.wakes.fetch_add(1, Ordering::Relaxed);
+        self.wake();
+    }
+
+    /// [`Self::flush`] for another driver in the group, counted separately.
+    fn wake_from_peer(&self) {
+        if !self.shared.pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        self.shared.metrics.peer_wakes.fetch_add(1, Ordering::Relaxed);
+        self.wake();
+    }
+
+    fn wake(&self) {
         if let Err(e) = self.shared.waker.wake() {
             tracing::warn!("can't wake the QUIC driver: {e}");
         }
