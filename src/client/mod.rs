@@ -1,61 +1,61 @@
 use bevy::ecs::component::Component;
-use s2n_quic::{
-    Client, Connection,
-    client::{Connect, ConnectionAttempt},
-};
-use s2n_quic_tls::{certificate::IntoCertificate, error::Error as TlsError};
-use tokio::runtime::Handle;
 
 use crate::{
     client::marker::QuicClientMarker,
     common::{
-        QuicParentId, QuicParentType, attempt::TaskError,
-        connection::QuicConnectionAttempt, runtime::TokioRuntime,
+        QuicParentId, QuicParentType,
+        connection::{QuicConnection, QuicConnectionAttempt, id::ConnectionId},
+        router::Notice,
+        runtime::{Link, QuicRuntime},
     },
+    config::{ConfigError, QuicClientConfig},
+    driver::{Command, EndpointId, EndpointSetup},
 };
 
 pub mod acceptor;
+mod connect;
 pub mod marker;
 
+pub use connect::Connect;
+
 /// The component which represents a client.
+///
+/// Dropping the client stops it making connections. Connections it already
+/// made stay open.
 #[derive(Component)]
 #[require(QuicClientMarker)]
 pub struct QuicClient {
-    runtime: Handle,
-    client: Client,
+    link: Link,
+    driver: usize,
+    endpoint: EndpointId,
     id: QuicParentId,
+    datagram_buffer: usize,
 }
 
 impl QuicClient {
-    /// Construct a client with default TLS settings. This will not allow you to connect to
-    /// servers with self-signed certs.
-    pub fn new(tokio_runtime: &TokioRuntime) -> Self {
-        let runtime = tokio_runtime.handle().clone();
-        let client = runtime.block_on(build());
+    /// Creates a client with the given configuration.
+    ///
+    /// The default [QuicClientConfig] only trusts the platform's root
+    /// certificates, so it can't connect to servers with self-signed
+    /// certificates. Add those with [QuicClientConfig::with_root_pem_file].
+    pub fn new(
+        runtime: &QuicRuntime,
+        config: &QuicClientConfig,
+    ) -> Result<Self, ConfigError> {
+        let setup = EndpointSetup::client(config, runtime.endpoint_options())?;
+        let driver = runtime.pick_driver();
+        let link = runtime.link(driver);
+        let endpoint = link.driver.ids().endpoint();
+        link.driver
+            .open_endpoint(endpoint, config.bind_addr(), setup)?;
 
-        Self {
-            runtime,
-            client,
+        Ok(Self {
+            link,
+            driver,
+            endpoint,
             id: QuicParentId::generate_unique(QuicParentType::Client),
-        }
-    }
-
-    /// Construct a client with custom TLS settings. This is commonly used for development purposes
-    /// to allow custom certs.
-    pub fn new_with_tls<C: IntoCertificate>(
-        tokio_runtime: &TokioRuntime,
-        certificate: C,
-    ) -> Result<Self, TlsError> {
-        let runtime = tokio_runtime.handle().clone();
-        let client = runtime.block_on(build_tls(certificate))?;
-
-        let ret = Self {
-            runtime,
-            client,
-            id: QuicParentId::generate_unique(QuicParentType::Client),
-        };
-
-        Ok(ret)
+            datagram_buffer: runtime.endpoint_options().datagram_receive_buffer,
+        })
     }
 
     /// The unique ID for this QUIC session.
@@ -69,42 +69,41 @@ impl QuicClient {
         &mut self,
         connect: Connect,
     ) -> (QuicConnectionAttempt, QuicClientMarker) {
-        let client = &self.client;
-        let attempt = client.connect(connect);
+        let conn = self.link.driver.ids().conn();
+        let connection_id = ConnectionId::new(conn.0, self.id);
+        let remote_addr = connect.addr();
 
-        let conn_task = self.runtime.spawn(create_connection(attempt));
+        // Registered before connecting, so the router knows the connection
+        // before any of its events arrive.
+        self.link.notify(Notice::Conn {
+            conn,
+            id: connection_id,
+            driver: self.driver,
+        });
+        self.link.send(Command::Connect {
+            endpoint: self.endpoint,
+            conn,
+            connect,
+        });
 
+        let connection = QuicConnection::new(
+            self.link.clone(),
+            conn,
+            connection_id,
+            remote_addr,
+            self.datagram_buffer,
+        );
         (
-            QuicConnectionAttempt::new(self.runtime.clone(), conn_task, self.id),
+            QuicConnectionAttempt::new(connection, self.id),
             QuicClientMarker,
         )
     }
 }
 
-async fn create_connection(attempt: ConnectionAttempt) -> Result<Connection, TaskError> {
-    attempt.await.map_err(TaskError::ConnectionFailed)
-}
-
-async fn build() -> Client {
-    Client::builder()
-        .with_io("0.0.0.0:0")
-        .expect("Unable to build client... are we... out of sockets??")
-        .start()
-        .expect("Unable to start client")
-}
-
-async fn build_tls<C: IntoCertificate>(certificate: C) -> Result<Client, TlsError> {
-    let tls = s2n_quic_tls::Client::builder()
-        .with_certificate(certificate)?
-        .build()?;
-
-    let client = Client::builder()
-        .with_io("0.0.0.0:0")
-        .expect("Unable to build client... are we... out of sockets??")
-        .with_tls(tls)
-        .expect("Invalid TLS")
-        .start()
-        .expect("Unable to start client");
-
-    Ok(client)
+impl Drop for QuicClient {
+    fn drop(&mut self) {
+        self.link.send(Command::ReleaseEndpoint {
+            endpoint: self.endpoint,
+        });
+    }
 }

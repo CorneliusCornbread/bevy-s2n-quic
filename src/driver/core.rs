@@ -1,0 +1,1663 @@
+//! The driver's event loop state: endpoints, connections and timers. One
+//! [`Core::turn`] runs one loop iteration; the thread in `mod.rs` (or a test)
+//! decides when to call it.
+//!
+//! A server endpoint may hand the connections it accepts to other drivers in
+//! its group (see [`PeerCommand`]). A driver that takes one keeps a remote
+//! [`Endpoint`] standing in for the real one, with a handle to its socket for
+//! sending.
+
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, VecDeque},
+    io::{self, IoSliceMut},
+    mem,
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender, TryRecvError},
+    },
+    time::{Duration, Instant},
+};
+
+use bytes::{Bytes, BytesMut};
+use quinn_proto::{
+    self as proto, ConnectionEvent, ConnectionHandle, DatagramEvent, EndpointEvent,
+    Incoming, ReadError, StreamEvent, VarInt, WriteError,
+};
+use quinn_udp::{BATCH_SIZE, RecvMeta};
+use slab::Slab;
+
+use crate::{
+    client::Connect,
+    common::error::{AppErrorCode, ConnectionError},
+};
+
+use super::{
+    config::{
+        EndpointSetup, Role, connection_error, connection_stats, from_varint, to_varint,
+    },
+    datagram::{DatagramQueue, datagram_sizes},
+    io::{Io, Socket, SocketSender},
+    protocol::{
+        Adoption, Command, ConnId, Dir, EndpointId, Event, IdAllocator, PeerCommand,
+        RecvBudget, SendBudget, StreamId, StreamInfo,
+    },
+};
+
+/// Datagrams one endpoint may receive per turn before connections get a
+/// chance to send. Acknowledgements only go out when connections are driven,
+/// so draining a busy socket completely would stall the peer. A server
+/// receiving from 600 bulk senders got about 520 MB/s through with 256 and
+/// 720 MB/s with 4096: fewer turns means fewer, fuller send batches.
+const MAX_RECV_DATAGRAMS: usize = 4096;
+
+/// Datagrams one connection may send per turn, so a bulk sender can't starve
+/// the others.
+const MAX_TRANSMIT_DATAGRAMS: usize = 64;
+
+/// Datagrams per GSO send. quinn's own driver uses 10: more costs memory and
+/// gains little.
+const MAX_TRANSMIT_SEGMENTS: usize = 10;
+
+/// The most bytes one GSO send may carry: the largest UDP payload over IPv4.
+/// Linux rejects larger sends with `EMSGSIZE`, which quinn-udp can't tell
+/// apart from a failed MTU probe, so the whole batch is silently lost.
+const MAX_GSO_BYTES: usize = 65_507;
+
+/// Endpoint-generated responses (version negotiation, stateless resets,
+/// refusals) kept while a socket is blocked. Past this they're dropped; the
+/// peer retries.
+const MAX_QUEUED_RESPONSES: usize = 1024;
+
+/// How often an active connection reports [`Event::Stats`].
+pub(super) const STATS_INTERVAL: Duration = Duration::from_millis(50);
+
+pub(crate) struct Core<I: Io> {
+    io: I,
+    commands: Receiver<Command<I::Socket>>,
+    events: Sender<Event>,
+    ids: Arc<IdAllocator>,
+    endpoints: Slab<Endpoint<I::Socket>>,
+    endpoint_keys: HashMap<EndpointId, usize>,
+    /// Endpoints whose sockets may have datagrams waiting.
+    readable: Vec<usize>,
+    conns: Slab<Conn>,
+    conn_keys: HashMap<ConnId, usize>,
+    /// `(deadline, conn key, conn generation)`. An entry is stale, and
+    /// skipped, unless the connection still exists and its `timer` matches.
+    timers: BinaryHeap<Reverse<(Instant, usize, u64)>>,
+    next_generation: u64,
+    /// Connections to drive this turn.
+    dirty: Vec<usize>,
+    /// Connections driven since stats were last reported, and when to report
+    /// them next.
+    stats_due: Vec<usize>,
+    next_stats: Option<Instant>,
+    /// `BATCH_SIZE` receive buffers of `recv_stride` bytes each.
+    recv_buf: Vec<u8>,
+    recv_stride: usize,
+    send_buf: Vec<u8>,
+    /// Messages for the other drivers in the group, by driver.
+    outboxes: Vec<Outbox>,
+    running: bool,
+}
+
+/// Messages for another driver, batched until the end of a step.
+#[derive(Default)]
+struct Outbox {
+    conn_events: Vec<(ConnId, ConnectionEvent)>,
+    endpoint_events: Vec<(EndpointId, ConnectionHandle, EndpointEvent)>,
+    /// Commands were queued for the driver since it was last woken.
+    wake: bool,
+}
+
+struct Endpoint<S: Socket> {
+    id: EndpointId,
+    sender: S::Sender,
+    setup: EndpointSetup,
+    conns: HashMap<ConnectionHandle, Route>,
+    /// Transmits that hit `WouldBlock`, oldest first. While any are queued
+    /// no connection on this driver sends on the socket.
+    blocked: VecDeque<OwnedTransmit>,
+    /// Connections that wanted to send while the socket was blocked.
+    waiting: Vec<usize>,
+    closing: bool,
+    kind: Kind<S>,
+}
+
+enum Kind<S> {
+    Local(Box<LocalEndpoint<S>>),
+    /// Stands in for an endpoint on another driver, for the connections it
+    /// handed to this one. Removed once they've all drained.
+    Remote {
+        home: usize,
+        /// The home was asked to report when the socket is writable again.
+        watching: bool,
+    },
+}
+
+/// The parts of an endpoint only its own driver has.
+struct LocalEndpoint<S> {
+    socket: S,
+    inner: proto::Endpoint,
+    readable: bool,
+    /// Waiting for the socket to become writable.
+    writable_interest: bool,
+    /// Drivers to tell when the socket is writable again.
+    watchers: Vec<usize>,
+}
+
+impl<S: Socket> Endpoint<S> {
+    fn local(&mut self) -> Option<&mut LocalEndpoint<S>> {
+        match &mut self.kind {
+            Kind::Local(local) => Some(local),
+            Kind::Remote { .. } => None,
+        }
+    }
+}
+
+/// Where an endpoint's connection is driven: on this driver, by key, or on
+/// another.
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    Local(usize),
+    Remote { driver: usize, conn: ConnId },
+}
+
+struct Conn {
+    id: ConnId,
+    endpoint: usize,
+    handle: ConnectionHandle,
+    inner: proto::Connection,
+    generation: u64,
+    /// The deadline currently in the timer heap.
+    timer: Option<Instant>,
+    dirty: bool,
+    /// `ConnectionLost` has been sent; nothing else will be.
+    lost: bool,
+    /// In `Core::stats_due`.
+    stats_due: bool,
+    streams: HashMap<proto::StreamId, StreamState>,
+    /// `OpenStream` requests waiting for the peer's stream limit, by [`Dir`].
+    pending_opens: [VecDeque<u64>; 2],
+    /// Streams to try reading on the next drive.
+    pending_reads: Vec<proto::StreamId>,
+    send_budget: usize,
+    recv_budget: usize,
+    datagrams: DatagramQueue,
+}
+
+#[derive(Default)]
+struct StreamState {
+    send: Option<SendHalf>,
+    recv: Option<Arc<RecvBudget>>,
+}
+
+struct SendHalf {
+    budget: Arc<SendBudget>,
+    queue: VecDeque<Bytes>,
+    /// quinn returned `Blocked`; wait for `Writable`.
+    blocked: bool,
+    /// Finish once `queue` is empty.
+    finish: bool,
+}
+
+struct OwnedTransmit {
+    destination: SocketAddr,
+    ecn: Option<quinn_udp::EcnCodepoint>,
+    segment_size: Option<usize>,
+    src_ip: Option<IpAddr>,
+    contents: Vec<u8>,
+}
+
+impl OwnedTransmit {
+    fn as_udp(&self) -> quinn_udp::Transmit<'_> {
+        quinn_udp::Transmit {
+            destination: self.destination,
+            ecn: self.ecn,
+            contents: &self.contents,
+            segment_size: self.segment_size,
+            src_ip: self.src_ip,
+        }
+    }
+}
+
+impl<I: Io> Core<I> {
+    pub fn new(
+        io: I,
+        commands: Receiver<Command<I::Socket>>,
+        events: Sender<Event>,
+        ids: Arc<IdAllocator>,
+    ) -> Self {
+        Self {
+            io,
+            commands,
+            events,
+            ids,
+            endpoints: Slab::new(),
+            endpoint_keys: HashMap::new(),
+            readable: Vec::new(),
+            conns: Slab::new(),
+            conn_keys: HashMap::new(),
+            timers: BinaryHeap::new(),
+            next_generation: 0,
+            dirty: Vec::new(),
+            stats_due: Vec::new(),
+            next_stats: None,
+            recv_buf: Vec::new(),
+            recv_stride: 0,
+            send_buf: Vec::new(),
+            outboxes: Vec::new(),
+            running: true,
+        }
+    }
+
+    /// Runs one loop iteration. Returns `false` once the driver should stop.
+    pub fn turn(&mut self) -> bool {
+        self.drain_commands();
+        if !self.running {
+            return false;
+        }
+
+        self.receive();
+        // Connections on other drivers shouldn't wait for this one's.
+        self.flush_outboxes();
+        self.expire_timers();
+        self.drive_dirty();
+        self.report_stats();
+        self.reap_endpoints();
+        self.flush_outboxes();
+        true
+    }
+
+    /// Whether [`Self::turn`] has work to do right away, without waiting.
+    pub fn has_pending_work(&self) -> bool {
+        !self.dirty.is_empty() || !self.readable.is_empty()
+    }
+
+    /// When the earliest timer fires. May be earlier than needed; a turn
+    /// then finds nothing to do.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        let timer = self.timers.peek().map(|Reverse((at, _, _))| *at);
+        match (timer, self.next_stats) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Records readiness reported for an endpoint's socket.
+    pub fn set_ready(&mut self, endpoint: EndpointId, readable: bool, writable: bool) {
+        let Some(&key) = self.endpoint_keys.get(&endpoint) else {
+            return;
+        };
+
+        if readable {
+            self.mark_readable(key);
+        }
+        if writable {
+            self.flush_blocked(key);
+        }
+    }
+
+    /// The endpoints whose sockets are on this driver.
+    #[cfg(test)]
+    pub fn endpoint_ids(&self) -> Vec<EndpointId> {
+        self.local_endpoints().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The endpoints whose sockets are on this driver, and their addresses.
+    #[cfg(test)]
+    pub fn local_endpoints(&self) -> Vec<(EndpointId, SocketAddr)> {
+        self.endpoints
+            .iter()
+            .filter_map(|(_, ep)| match &ep.kind {
+                Kind::Local(local) => Some((ep.id, local.socket.local_addr().ok()?)),
+                Kind::Remote { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Endpoints on this driver, counting ones standing in for another
+    /// driver's.
+    #[cfg(test)]
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    #[cfg(test)]
+    pub fn connection_count(&self) -> usize {
+        self.conns.len()
+    }
+
+    #[cfg(test)]
+    pub fn connection_stats(&self, conn: ConnId) -> Option<proto::ConnectionStats> {
+        let key = self.conn_keys.get(&conn)?;
+        Some(self.conns[*key].inner.stats())
+    }
+
+    fn emit(&self, event: Event) {
+        // The owner may have gone away; there's nobody left to tell.
+        let _ = self.events.send(event);
+    }
+
+    fn mark_readable(&mut self, key: usize) {
+        if let Some(local) = self.endpoints[key].local()
+            && !local.readable
+        {
+            local.readable = true;
+            self.readable.push(key);
+        }
+    }
+
+    fn mark_dirty(&mut self, key: usize) {
+        mark_dirty(&mut self.dirty, &mut self.conns[key], key);
+    }
+
+    // ---- Commands ----
+
+    fn drain_commands(&mut self) {
+        loop {
+            match self.commands.try_recv() {
+                Ok(command) => self.handle_command(command),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.running = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn handle_command(&mut self, command: Command<I::Socket>) {
+        let now = self.io.now();
+
+        match command {
+            Command::OpenEndpoint {
+                endpoint,
+                socket,
+                setup,
+            } => self.open_endpoint(endpoint, socket, *setup),
+            Command::CloseEndpoint { endpoint } => self.close_endpoint(endpoint, now),
+            Command::ReleaseEndpoint { endpoint } => {
+                if let Some(&key) = self.endpoint_keys.get(&endpoint) {
+                    self.endpoints[key].closing = true;
+                }
+            }
+            Command::Connect {
+                endpoint,
+                conn,
+                connect,
+            } => self.connect(endpoint, conn, &connect, now),
+            Command::Close { conn, code, reason } => {
+                if let Some(key) = self.conn_keys.get(&conn).copied() {
+                    self.close_conn(key, code, reason, now);
+                }
+            }
+            Command::OpenStream { conn, dir, request } => {
+                let Some(key) = self.conn_keys.get(&conn).copied() else {
+                    return;
+                };
+                let c = &mut self.conns[key];
+                if c.lost {
+                    return;
+                }
+                c.pending_opens[dir_index(dir)].push_back(request);
+                open_pending(&self.events, c, dir);
+            }
+            Command::Write { conn, stream, data } => {
+                let Some(key) = self.conn_keys.get(&conn).copied() else {
+                    return;
+                };
+                let c = &mut self.conns[key];
+                let id = to_proto_stream(stream);
+                let Some(send) = c.streams.get_mut(&id).and_then(|s| s.send.as_mut())
+                else {
+                    return;
+                };
+                if data.is_empty() {
+                    return;
+                }
+
+                send.queue.push_back(data);
+                if !send.blocked {
+                    write_queue(&mut c.inner, id, send);
+                }
+                self.mark_dirty(key);
+            }
+            Command::Finish { conn, stream } => {
+                let Some(key) = self.conn_keys.get(&conn).copied() else {
+                    return;
+                };
+                let c = &mut self.conns[key];
+                let id = to_proto_stream(stream);
+                let Some(send) = c.streams.get_mut(&id).and_then(|s| s.send.as_mut())
+                else {
+                    return;
+                };
+
+                send.finish = true;
+                if !send.blocked {
+                    write_queue(&mut c.inner, id, send);
+                }
+                self.mark_dirty(key);
+            }
+            Command::Reset { conn, stream, code } => {
+                let Some(key) = self.conn_keys.get(&conn).copied() else {
+                    return;
+                };
+                let c = &mut self.conns[key];
+                let id = to_proto_stream(stream);
+                if let Some(mut send) = take_send(c, id) {
+                    discard_queue(&mut send);
+                    let _ = c.inner.send_stream(id).reset(to_varint(code));
+                    self.mark_dirty(key);
+                }
+            }
+            Command::Stop { conn, stream, code } => {
+                let Some(key) = self.conn_keys.get(&conn).copied() else {
+                    return;
+                };
+                let c = &mut self.conns[key];
+                let id = to_proto_stream(stream);
+                if take_recv(c, id).is_some() {
+                    let _ = c.inner.recv_stream(id).stop(to_varint(code));
+                    self.mark_dirty(key);
+                }
+            }
+            Command::ResumeRead { conn, stream } => {
+                let Some(key) = self.conn_keys.get(&conn).copied() else {
+                    return;
+                };
+                self.conns[key].pending_reads.push(to_proto_stream(stream));
+                self.mark_dirty(key);
+            }
+            Command::SendDatagrams { conn, data } => {
+                let Some(key) = self.conn_keys.get(&conn).copied() else {
+                    return;
+                };
+                let c = &mut self.conns[key];
+                if c.lost {
+                    return;
+                }
+                c.datagrams.send(&mut c.inner, data);
+                self.mark_dirty(key);
+            }
+            Command::Peer(command) => self.handle_peer(command),
+            Command::Shutdown => self.running = false,
+        }
+    }
+
+    fn handle_peer(&mut self, command: PeerCommand<I::Socket>) {
+        match command {
+            PeerCommand::Adopt(adoption) => self.adopt(*adoption),
+            PeerCommand::ConnEvents(events) => {
+                for (conn, event) in events {
+                    // The connection may have drained since.
+                    if let Some(&key) = self.conn_keys.get(&conn) {
+                        self.conns[key].inner.handle_event(event);
+                        self.mark_dirty(key);
+                    }
+                }
+            }
+            PeerCommand::EndpointEvents(events) => {
+                for (endpoint, handle, event) in events {
+                    self.handle_remote_endpoint_event(endpoint, handle, event);
+                }
+            }
+            PeerCommand::WatchWritable { endpoint, driver } => {
+                let Some(&key) = self.endpoint_keys.get(&endpoint) else {
+                    // Nothing left to wait for. The driver's handle still
+                    // works, so let it try again.
+                    self.send_writable(driver, endpoint);
+                    return;
+                };
+                let ep = &mut self.endpoints[key];
+                if let Some(local) = ep.local()
+                    && !local.watchers.contains(&driver)
+                {
+                    local.watchers.push(driver);
+                }
+                request_writable(&self.io, ep);
+            }
+            PeerCommand::Writable { endpoint } => {
+                let Some(&key) = self.endpoint_keys.get(&endpoint) else {
+                    return;
+                };
+                if let Kind::Remote { watching, .. } = &mut self.endpoints[key].kind {
+                    *watching = false;
+                }
+                self.flush_blocked(key);
+            }
+        }
+    }
+
+    /// Takes a connection another driver's endpoint accepted.
+    fn adopt(&mut self, adoption: Adoption<I::Socket>) {
+        let Adoption {
+            endpoint,
+            home,
+            conn,
+            handle,
+            inner,
+            sender,
+            setup,
+        } = adoption;
+
+        let ep_key = match self.endpoint_keys.get(&endpoint) {
+            Some(&key) => key,
+            None => {
+                let key = self.endpoints.insert(Endpoint {
+                    id: endpoint,
+                    sender,
+                    setup,
+                    conns: HashMap::new(),
+                    blocked: VecDeque::new(),
+                    waiting: Vec::new(),
+                    closing: false,
+                    kind: Kind::Remote {
+                        home,
+                        watching: false,
+                    },
+                });
+                self.endpoint_keys.insert(endpoint, key);
+                key
+            }
+        };
+
+        let remote = inner.remote_address();
+        self.insert_conn(ep_key, handle, inner, conn);
+        self.emit(Event::ConnectionAccepted {
+            endpoint,
+            conn,
+            remote,
+        });
+    }
+
+    /// Hands an event from a connection on another driver to its endpoint
+    /// here, and routes any reply back.
+    fn handle_remote_endpoint_event(
+        &mut self,
+        endpoint: EndpointId,
+        handle: ConnectionHandle,
+        event: EndpointEvent,
+    ) {
+        let Some(&key) = self.endpoint_keys.get(&endpoint) else {
+            return;
+        };
+        let ep = &mut self.endpoints[key];
+        let Some(local) = ep.local() else {
+            return;
+        };
+
+        let drained = event.is_drained();
+        let reply = local.inner.handle_event(handle, event);
+        let route = if drained {
+            ep.conns.remove(&handle)
+        } else {
+            ep.conns.get(&handle).copied()
+        };
+        if let (Some(reply), Some(Route::Remote { driver, conn })) = (reply, route) {
+            outbox(&mut self.outboxes, driver)
+                .conn_events
+                .push((conn, reply));
+        }
+    }
+
+    /// Queues a command for another driver. It's woken at the end of the
+    /// step.
+    fn send_peer(&mut self, driver: usize, command: Command<I::Socket>) {
+        self.io.send_to(driver, command);
+        outbox(&mut self.outboxes, driver).wake = true;
+    }
+
+    fn send_writable(&self, driver: usize, endpoint: EndpointId) {
+        self.io.send_to(
+            driver,
+            Command::Peer(PeerCommand::Writable { endpoint }),
+        );
+        self.io.wake(driver);
+    }
+
+    /// Sends the batched messages for other drivers, and wakes the drivers
+    /// that have commands.
+    fn flush_outboxes(&mut self) {
+        for (driver, outbox) in self.outboxes.iter_mut().enumerate() {
+            if !outbox.conn_events.is_empty() {
+                let events = mem::take(&mut outbox.conn_events);
+                self.io
+                    .send_to(driver, Command::Peer(PeerCommand::ConnEvents(events)));
+                outbox.wake = true;
+            }
+            if !outbox.endpoint_events.is_empty() {
+                let events = mem::take(&mut outbox.endpoint_events);
+                self.io.send_to(
+                    driver,
+                    Command::Peer(PeerCommand::EndpointEvents(events)),
+                );
+                outbox.wake = true;
+            }
+            if mem::take(&mut outbox.wake) {
+                self.io.wake(driver);
+            }
+        }
+    }
+
+    /// Picks the driver for a connection the endpoint accepted: the one with
+    /// the fewest connections.
+    fn pick_driver(&self, ep_key: usize) -> usize {
+        let me = self.io.driver_index();
+        let count = self.io.driver_count();
+        if count == 1 || !self.endpoints[ep_key].setup.spread_connections {
+            return me;
+        }
+
+        // With three or more drivers, the home only receives and routes, the
+        // part of a server's work that can't be spread.
+        (1..=count)
+            .map(|i| (me + i) % count)
+            .filter(|&driver| count < 3 || driver != me)
+            .min_by_key(|&driver| self.io.load(driver))
+            .unwrap_or(me)
+    }
+
+    fn open_endpoint(&mut self, id: EndpointId, socket: I::Socket, setup: EndpointSetup) {
+        let sender = socket.sender().clone();
+        let server_config = match &setup.role {
+            Role::Server(config) => Some(config.clone()),
+            Role::Client(_) => None,
+        };
+        let inner = proto::Endpoint::new(
+            setup.endpoint_config.clone(),
+            server_config,
+            !socket.may_fragment(),
+            None,
+        );
+
+        let payload = setup
+            .endpoint_config
+            .get_max_udp_payload_size()
+            .min(u16::MAX.into()) as usize;
+        let stride = payload * socket.max_receive_segments().max(1);
+        if stride > self.recv_stride {
+            self.recv_stride = stride;
+            self.recv_buf = vec![0; stride * BATCH_SIZE];
+        }
+
+        let key = self.endpoints.insert(Endpoint {
+            id,
+            sender,
+            setup,
+            conns: HashMap::new(),
+            blocked: VecDeque::new(),
+            waiting: Vec::new(),
+            closing: false,
+            kind: Kind::Local(Box::new(LocalEndpoint {
+                socket,
+                inner,
+                readable: false,
+                writable_interest: false,
+                watchers: Vec::new(),
+            })),
+        });
+        self.endpoint_keys.insert(id, key);
+        // Datagrams may have arrived before the socket was handed over, and
+        // their readiness edge was missed.
+        self.mark_readable(key);
+    }
+
+    fn close_endpoint(&mut self, id: EndpointId, now: Instant) {
+        let Some(&key) = self.endpoint_keys.get(&id) else {
+            return;
+        };
+        let ep = &mut self.endpoints[key];
+        ep.closing = true;
+
+        let routes: Vec<Route> = ep.conns.values().copied().collect();
+        for route in routes {
+            match route {
+                Route::Local(conn) => {
+                    self.close_conn(conn, AppErrorCode::UNKNOWN, Bytes::new(), now)
+                }
+                Route::Remote { driver, conn } => self.send_peer(
+                    driver,
+                    Command::Close {
+                        conn,
+                        code: AppErrorCode::UNKNOWN,
+                        reason: Bytes::new(),
+                    },
+                ),
+            }
+        }
+    }
+
+    fn connect(
+        &mut self,
+        endpoint: EndpointId,
+        conn: ConnId,
+        connect: &Connect,
+        now: Instant,
+    ) {
+        let fail = |core: &Self, reason: &str| {
+            core.emit(Event::ConnectionLost {
+                conn,
+                reason: ConnectionError::Transport(reason.to_owned()),
+            });
+        };
+
+        let Some(&ep_key) = self.endpoint_keys.get(&endpoint) else {
+            return fail(self, "the endpoint is closed");
+        };
+        let ep = &mut self.endpoints[ep_key];
+        let (Role::Client(config), Kind::Local(local)) = (&ep.setup.role, &mut ep.kind) else {
+            return fail(self, "the endpoint can't make connections");
+        };
+        if ep.closing {
+            return fail(self, "the endpoint is closed");
+        }
+
+        let server_name = connect
+            .server_name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| connect.addr().ip().to_string());
+
+        match local
+            .inner
+            .connect(now, config.clone(), connect.addr(), &server_name)
+        {
+            Ok((handle, inner)) => {
+                self.io.add_load(self.io.driver_index(), 1);
+                self.insert_conn(ep_key, handle, inner, conn);
+            }
+            Err(e) => fail(self, &e.to_string()),
+        }
+    }
+
+    fn insert_conn(
+        &mut self,
+        ep_key: usize,
+        handle: ConnectionHandle,
+        mut inner: proto::Connection,
+        id: ConnId,
+    ) -> usize {
+        let generation = self.next_generation;
+        self.next_generation += 1;
+
+        let ep = &mut self.endpoints[ep_key];
+        let datagrams = DatagramQueue::new(&mut inner, ep.setup.datagram_send_buffer);
+        let key = self.conns.insert(Conn {
+            id,
+            endpoint: ep_key,
+            handle,
+            inner,
+            generation,
+            timer: None,
+            dirty: false,
+            lost: false,
+            stats_due: false,
+            streams: HashMap::new(),
+            pending_opens: Default::default(),
+            pending_reads: Vec::new(),
+            send_budget: ep.setup.send_budget,
+            recv_budget: ep.setup.recv_budget,
+            datagrams,
+        });
+        ep.conns.insert(handle, Route::Local(key));
+        self.conn_keys.insert(id, key);
+        self.mark_dirty(key);
+        key
+    }
+
+    fn close_conn(
+        &mut self,
+        key: usize,
+        code: AppErrorCode,
+        reason: Bytes,
+        now: Instant,
+    ) {
+        let c = &mut self.conns[key];
+        c.inner.close(now, to_varint(code), reason);
+        c.streams.clear();
+        c.pending_opens = Default::default();
+
+        if !c.lost {
+            c.lost = true;
+            let conn = c.id;
+            self.emit(Event::ConnectionLost {
+                conn,
+                reason: ConnectionError::LocallyClosed,
+            });
+        }
+        self.mark_dirty(key);
+    }
+
+    // ---- Receiving ----
+
+    fn receive(&mut self) {
+        let readable = mem::take(&mut self.readable);
+        for &key in &readable {
+            if self.endpoints.contains(key) {
+                self.receive_endpoint(key);
+            }
+        }
+
+        // Endpoints that hit the per-turn limit are still readable.
+        self.readable = readable;
+        self.readable.retain(|&key| {
+            self.endpoints
+                .get(key)
+                .is_some_and(|ep| matches!(&ep.kind, Kind::Local(local) if local.readable))
+        });
+    }
+
+    fn receive_endpoint(&mut self, key: usize) {
+        let mut meta = [RecvMeta::default(); BATCH_SIZE];
+        let mut received = 0;
+
+        while received < MAX_RECV_DATAGRAMS {
+            let result = {
+                let Kind::Local(local) = &self.endpoints[key].kind else {
+                    return;
+                };
+                let mut chunks = self.recv_buf.chunks_mut(self.recv_stride);
+                let mut bufs: [IoSliceMut<'_>; BATCH_SIZE] =
+                    std::array::from_fn(|_| IoSliceMut::new(chunks.next().unwrap()));
+                local.socket.recv(&mut bufs, &mut meta)
+            };
+
+            match result {
+                Ok(count) => {
+                    for (i, meta) in meta.iter().take(count).enumerate() {
+                        let start = i * self.recv_stride;
+                        let mut data =
+                            BytesMut::from(&self.recv_buf[start..start + meta.len]);
+                        while !data.is_empty() {
+                            let datagram = data.split_to(meta.stride.min(data.len()));
+                            self.handle_datagram(key, meta, datagram);
+                            received += 1;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.set_unreadable(key);
+                    return;
+                }
+                // Windows reports ICMP port unreachable as a reset on the next
+                // receive. It says nothing about the socket itself.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "receive failed on endpoint {}: {e}",
+                        self.endpoints[key].id.0
+                    );
+                    self.set_unreadable(key);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn set_unreadable(&mut self, key: usize) {
+        if let Some(local) = self.endpoints[key].local() {
+            local.readable = false;
+        }
+    }
+
+    fn handle_datagram(&mut self, ep_key: usize, meta: &RecvMeta, data: BytesMut) {
+        let now = self.io.now();
+        let ecn = meta
+            .ecn
+            .and_then(|ecn| proto::EcnCodepoint::from_bits(ecn as u8));
+
+        self.send_buf.clear();
+        let ep = &mut self.endpoints[ep_key];
+        let Some(local) = ep.local() else {
+            return;
+        };
+        let event = local
+            .inner
+            .handle(now, meta.addr, meta.dst_ip, ecn, data, &mut self.send_buf);
+        match event {
+            Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                match ep.conns.get(&handle).copied() {
+                    Some(Route::Local(key)) => {
+                        self.conns[key].inner.handle_event(event);
+                        self.mark_dirty(key);
+                    }
+                    Some(Route::Remote { driver, conn }) => {
+                        outbox(&mut self.outboxes, driver)
+                            .conn_events
+                            .push((conn, event));
+                    }
+                    None => {}
+                }
+            }
+            Some(DatagramEvent::NewConnection(incoming)) => {
+                self.accept(ep_key, incoming, now)
+            }
+            Some(DatagramEvent::Response(transmit)) => {
+                let buf = mem::take(&mut self.send_buf);
+                self.send_response(ep_key, &transmit, &buf);
+                self.send_buf = buf;
+            }
+            None => {}
+        }
+    }
+
+    fn accept(&mut self, ep_key: usize, incoming: Incoming, now: Instant) {
+        let mut buf = mem::take(&mut self.send_buf);
+        buf.clear();
+
+        let ep = &mut self.endpoints[ep_key];
+        let full = ep.closing || ep.conns.len() >= ep.setup.max_connections;
+        let Some(local) = ep.local() else {
+            self.send_buf = buf;
+            return;
+        };
+        if full {
+            let transmit = local.inner.refuse(incoming, &mut buf);
+            self.send_response(ep_key, &transmit, &buf);
+        } else {
+            match local.inner.accept(incoming, now, &mut buf, None) {
+                Ok((handle, inner)) => self.place_accepted(ep_key, handle, inner),
+                Err(e) => {
+                    tracing::debug!("can't accept a connection: {}", e.cause);
+                    if let Some(transmit) = e.response {
+                        self.send_response(ep_key, &transmit, &buf);
+                    }
+                }
+            }
+        }
+
+        self.send_buf = buf;
+    }
+
+    /// Drives a connection the endpoint accepted here, or hands it to the
+    /// driver [`Self::pick_driver`] chooses.
+    fn place_accepted(
+        &mut self,
+        ep_key: usize,
+        handle: ConnectionHandle,
+        inner: proto::Connection,
+    ) {
+        let conn = self.ids.conn();
+        let driver = self.pick_driver(ep_key);
+        // Counted now, so the connections accepted before the driver takes
+        // this one aren't all placed on it too.
+        self.io.add_load(driver, 1);
+
+        let me = self.io.driver_index();
+        let ep = &mut self.endpoints[ep_key];
+        let endpoint = ep.id;
+        if driver == me {
+            let remote = inner.remote_address();
+            self.insert_conn(ep_key, handle, inner, conn);
+            self.emit(Event::ConnectionAccepted {
+                endpoint,
+                conn,
+                remote,
+            });
+            return;
+        }
+
+        ep.conns.insert(handle, Route::Remote { driver, conn });
+        let adoption = Adoption {
+            endpoint,
+            home: me,
+            conn,
+            handle,
+            inner,
+            sender: ep.sender.clone(),
+            setup: ep.setup.clone(),
+        };
+        self.send_peer(driver, Command::Peer(PeerCommand::Adopt(Box::new(adoption))));
+    }
+
+    // ---- Timers ----
+
+    fn expire_timers(&mut self) {
+        let now = self.io.now();
+
+        while let Some(&Reverse((at, key, generation))) = self.timers.peek() {
+            if at > now {
+                break;
+            }
+            self.timers.pop();
+
+            let Some(c) = self.conns.get_mut(key) else {
+                continue;
+            };
+            if c.generation != generation || c.timer != Some(at) {
+                continue;
+            }
+
+            c.timer = None;
+            c.inner.handle_timeout(now);
+            self.mark_dirty(key);
+        }
+
+        // Entries go stale whenever a deadline moves. Drop them before they
+        // outnumber the live ones by too much.
+        if self.timers.len() > 2 * self.conns.len() + 64 {
+            let conns = &self.conns;
+            self.timers.retain(|Reverse((at, key, generation))| {
+                conns
+                    .get(*key)
+                    .is_some_and(|c| c.generation == *generation && c.timer == Some(*at))
+            });
+        }
+    }
+
+    // ---- Driving connections ----
+
+    fn drive_dirty(&mut self) {
+        let mut dirty = mem::take(&mut self.dirty);
+        for key in dirty.drain(..) {
+            match self.conns.get_mut(key) {
+                Some(c) if c.dirty => c.dirty = false,
+                _ => continue,
+            }
+            self.drive(key);
+        }
+
+        if self.dirty.is_empty() {
+            // Keep the allocation.
+            self.dirty = dirty;
+        }
+    }
+
+    fn drive(&mut self, key: usize) {
+        let now = self.io.now();
+
+        self.poll_conn_events(key);
+        if self.poll_endpoint_events(key) {
+            return;
+        }
+        self.transmit(key, now);
+
+        let c = &mut self.conns[key];
+        let deadline = c.inner.poll_timeout();
+        if deadline != c.timer {
+            c.timer = deadline;
+            if let Some(at) = deadline {
+                self.timers.push(Reverse((at, key, c.generation)));
+            }
+        }
+
+        if !c.lost && !c.stats_due {
+            c.stats_due = true;
+            self.stats_due.push(key);
+            self.next_stats.get_or_insert(now + STATS_INTERVAL);
+        }
+    }
+
+    fn report_stats(&mut self) {
+        let now = self.io.now();
+        if !self.next_stats.is_some_and(|at| at <= now) {
+            return;
+        }
+        self.next_stats = None;
+
+        for key in self.stats_due.drain(..) {
+            // The key may have been reused by a newer connection, which is
+            // reported if it's due too.
+            let Some(c) = self.conns.get_mut(key).filter(|c| c.stats_due) else {
+                continue;
+            };
+            c.stats_due = false;
+            if !c.lost {
+                let _ = self.events.send(stats_event(c));
+            }
+        }
+    }
+
+    fn poll_conn_events(&mut self, key: usize) {
+        let c = &mut self.conns[key];
+        let conn = c.id;
+        let events = &self.events;
+        let emit = |event| {
+            let _ = events.send(event);
+        };
+
+        while let Some(event) = c.inner.poll() {
+            match event {
+                proto::Event::HandshakeDataReady => {}
+                proto::Event::Connected => {
+                    emit(stats_event(c));
+                    let (_, min_datagram_size) = datagram_sizes(&mut c.inner);
+                    emit(Event::Connected {
+                        conn,
+                        min_datagram_size,
+                    });
+                }
+                proto::Event::ConnectionLost { reason } => {
+                    c.streams.clear();
+                    c.pending_opens = Default::default();
+                    if !c.lost {
+                        c.lost = true;
+                        emit(Event::ConnectionLost {
+                            conn,
+                            reason: connection_error(reason),
+                        });
+                    }
+                }
+                proto::Event::Stream(StreamEvent::Opened { dir }) => {
+                    while let Some(id) = c.inner.streams().accept(dir) {
+                        let stream = add_stream(c, id, false);
+                        c.pending_reads.push(id);
+                        emit(Event::StreamAccepted { conn, stream });
+                    }
+                }
+                proto::Event::Stream(StreamEvent::Readable { id }) => {
+                    c.pending_reads.push(id)
+                }
+                proto::Event::Stream(StreamEvent::Writable { id }) => {
+                    if let Some(send) =
+                        c.streams.get_mut(&id).and_then(|s| s.send.as_mut())
+                    {
+                        send.blocked = false;
+                        write_queue(&mut c.inner, id, send);
+                    }
+                }
+                proto::Event::Stream(StreamEvent::Finished { id }) => {
+                    take_send(c, id);
+                    emit(Event::SendFinished {
+                        conn,
+                        stream: from_proto_stream(id),
+                    });
+                }
+                proto::Event::Stream(StreamEvent::Stopped { id, error_code }) => {
+                    if let Some(mut send) = take_send(c, id) {
+                        discard_queue(&mut send);
+                    }
+                    emit(Event::StreamStopped {
+                        conn,
+                        stream: from_proto_stream(id),
+                        code: from_varint(error_code),
+                    });
+                }
+                proto::Event::Stream(StreamEvent::Available { dir }) => {
+                    open_pending(events, c, from_proto_dir(dir));
+                }
+                proto::Event::DatagramReceived => {
+                    let data: Vec<Bytes> =
+                        std::iter::from_fn(|| c.inner.datagrams().recv()).collect();
+                    if !data.is_empty() {
+                        emit(Event::Datagrams { conn, data });
+                    }
+                }
+                proto::Event::DatagramsUnblocked => {}
+            }
+        }
+
+        // quinn reports `Available` when the peer raises its stream limit,
+        // but not when the handshake sets the initial one.
+        if !c.lost {
+            open_pending(events, c, Dir::Bi);
+            open_pending(events, c, Dir::Uni);
+        }
+
+        let mut reads = mem::take(&mut c.pending_reads);
+        for id in reads.drain(..) {
+            read_stream(events, c, id);
+        }
+        c.pending_reads = reads;
+    }
+
+    /// Hands the connection's events to its endpoint. Returns `true` if the
+    /// connection drained and was removed.
+    fn poll_endpoint_events(&mut self, key: usize) -> bool {
+        let c = &mut self.conns[key];
+        let ep = &mut self.endpoints[c.endpoint];
+
+        while let Some(event) = c.inner.poll_endpoint_events() {
+            let drained = event.is_drained();
+            match &mut ep.kind {
+                Kind::Local(local) => {
+                    if let Some(reply) = local.inner.handle_event(c.handle, event) {
+                        c.inner.handle_event(reply);
+                    }
+                }
+                Kind::Remote { home, .. } => outbox(&mut self.outboxes, *home)
+                    .endpoint_events
+                    .push((ep.id, c.handle, event)),
+            }
+
+            if drained {
+                self.remove_conn(key);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn remove_conn(&mut self, key: usize) {
+        let c = self.conns.remove(key);
+        self.conn_keys.remove(&c.id);
+        self.endpoints[c.endpoint].conns.remove(&c.handle);
+        self.io.add_load(self.io.driver_index(), -1);
+
+        if !c.lost {
+            self.emit(Event::ConnectionLost {
+                conn: c.id,
+                reason: ConnectionError::LocallyClosed,
+            });
+        }
+    }
+
+    fn transmit(&mut self, key: usize, now: Instant) {
+        let c = &mut self.conns[key];
+        let ep = &mut self.endpoints[c.endpoint];
+        if !ep.blocked.is_empty() {
+            ep.waiting.push(key);
+            return;
+        }
+
+        let max_segments = ep
+            .sender
+            .max_transmit_segments()
+            .min(MAX_TRANSMIT_SEGMENTS)
+            .min(MAX_GSO_BYTES / usize::from(c.inner.current_mtu()))
+            .max(1);
+        let mut sent = 0;
+        loop {
+            if sent >= MAX_TRANSMIT_DATAGRAMS {
+                // Let the other connections go first.
+                mark_dirty(&mut self.dirty, c, key);
+                return;
+            }
+
+            self.send_buf.clear();
+            let Some(transmit) =
+                c.inner.poll_transmit(now, max_segments, &mut self.send_buf)
+            else {
+                return;
+            };
+            sent += transmit
+                .segment_size
+                .map_or(1, |size| transmit.size.div_ceil(size));
+
+            let udp = udp_transmit(&transmit, &self.send_buf[..transmit.size]);
+            match ep.sender.try_send(&udp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ep.blocked.push_back(own_transmit(&udp));
+                    ep.waiting.push(key);
+                    request_writable(&self.io, ep);
+                    return;
+                }
+                Err(e) => log_send_error(&e),
+            }
+        }
+    }
+
+    fn send_response(&mut self, ep_key: usize, transmit: &proto::Transmit, buf: &[u8]) {
+        let ep = &mut self.endpoints[ep_key];
+        let udp = udp_transmit(transmit, &buf[..transmit.size]);
+
+        if !ep.blocked.is_empty() {
+            if ep.blocked.len() < MAX_QUEUED_RESPONSES {
+                ep.blocked.push_back(own_transmit(&udp));
+            }
+            return;
+        }
+
+        match ep.sender.try_send(&udp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                ep.blocked.push_back(own_transmit(&udp));
+                request_writable(&self.io, ep);
+            }
+            Err(e) => log_send_error(&e),
+        }
+    }
+
+    /// Sends the transmits queued while the socket was blocked, then lets the
+    /// waiting connections send again, here and on the drivers watching the
+    /// socket.
+    fn flush_blocked(&mut self, key: usize) {
+        let ep = &mut self.endpoints[key];
+        while let Some(transmit) = ep.blocked.front() {
+            match ep.sender.try_send(&transmit.as_udp()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    request_writable(&self.io, ep);
+                    return;
+                }
+                Err(e) => log_send_error(&e),
+            }
+            ep.blocked.pop_front();
+        }
+
+        let id = ep.id;
+        if let Kind::Local(local) = &mut ep.kind {
+            if local.writable_interest {
+                local.writable_interest = false;
+                self.io.set_writable_interest(&mut local.socket, id, false);
+            }
+            for driver in mem::take(&mut local.watchers) {
+                self.io
+                    .send_to(driver, Command::Peer(PeerCommand::Writable { endpoint: id }));
+                self.io.wake(driver);
+            }
+        }
+        let waiting = mem::take(&mut ep.waiting);
+        for conn in waiting {
+            if let Some(c) = self.conns.get_mut(conn) {
+                mark_dirty(&mut self.dirty, c, conn);
+            }
+        }
+    }
+
+    fn reap_endpoints(&mut self) {
+        let done: Vec<usize> = self
+            .endpoints
+            .iter()
+            .filter(|(_, ep)| {
+                ep.conns.is_empty()
+                    && ep.blocked.is_empty()
+                    && match &ep.kind {
+                        Kind::Local(local) => ep.closing && local.watchers.is_empty(),
+                        Kind::Remote { .. } => true,
+                    }
+            })
+            .map(|(key, _)| key)
+            .collect();
+
+        for key in done {
+            let ep = self.endpoints.remove(key);
+            self.endpoint_keys.remove(&ep.id);
+            if let Kind::Local(_) = ep.kind {
+                self.readable.retain(|&k| k != key);
+                self.emit(Event::EndpointClosed { endpoint: ep.id });
+            }
+        }
+    }
+}
+
+fn outbox(outboxes: &mut Vec<Outbox>, driver: usize) -> &mut Outbox {
+    if outboxes.len() <= driver {
+        outboxes.resize_with(driver + 1, Outbox::default);
+    }
+    &mut outboxes[driver]
+}
+
+/// Arranges to hear when the endpoint's socket is writable again: from the
+/// OS if the socket is on this driver, otherwise from its home driver.
+fn request_writable<I: Io>(io: &I, ep: &mut Endpoint<I::Socket>) {
+    match &mut ep.kind {
+        Kind::Local(local) => {
+            if !local.writable_interest {
+                local.writable_interest = true;
+                io.set_writable_interest(&mut local.socket, ep.id, true);
+            }
+        }
+        Kind::Remote { home, watching } => {
+            if !*watching {
+                *watching = true;
+                io.send_to(
+                    *home,
+                    Command::Peer(PeerCommand::WatchWritable {
+                        endpoint: ep.id,
+                        driver: io.driver_index(),
+                    }),
+                );
+                io.wake(*home);
+            }
+        }
+    }
+}
+
+fn stats_event(c: &mut Conn) -> Event {
+    let (max_datagram_size, _) = datagram_sizes(&mut c.inner);
+    Event::Stats {
+        conn: c.id,
+        stats: connection_stats(&c.inner, c.datagrams.dropped()),
+        max_datagram_size,
+    }
+}
+
+fn mark_dirty(dirty: &mut Vec<usize>, c: &mut Conn, key: usize) {
+    if !c.dirty {
+        c.dirty = true;
+        dirty.push(key);
+    }
+}
+
+fn add_stream(c: &mut Conn, id: proto::StreamId, local: bool) -> StreamInfo {
+    let dir = from_proto_dir(id.dir());
+    let can_send = dir == Dir::Bi || local;
+    let can_recv = dir == Dir::Bi || !local;
+
+    let send = can_send.then(|| Arc::new(SendBudget::new(c.send_budget)));
+    let recv = can_recv.then(|| Arc::new(RecvBudget::new(c.recv_budget)));
+
+    c.streams.insert(
+        id,
+        StreamState {
+            send: send.clone().map(|budget| SendHalf {
+                budget,
+                queue: VecDeque::new(),
+                blocked: false,
+                finish: false,
+            }),
+            recv: recv.clone(),
+        },
+    );
+
+    StreamInfo {
+        id: from_proto_stream(id),
+        dir,
+        send,
+        recv,
+    }
+}
+
+fn take_send(c: &mut Conn, id: proto::StreamId) -> Option<SendHalf> {
+    let stream = c.streams.get_mut(&id)?;
+    let send = stream.send.take();
+    if stream.recv.is_none() {
+        c.streams.remove(&id);
+    }
+    send
+}
+
+fn take_recv(c: &mut Conn, id: proto::StreamId) -> Option<Arc<RecvBudget>> {
+    let stream = c.streams.get_mut(&id)?;
+    let recv = stream.recv.take();
+    if stream.send.is_none() {
+        c.streams.remove(&id);
+    }
+    recv
+}
+
+fn open_pending(events: &Sender<Event>, c: &mut Conn, dir: Dir) {
+    let conn = c.id;
+    while let Some(&request) = c.pending_opens[dir_index(dir)].front() {
+        let Some(id) = c.inner.streams().open(to_proto_dir(dir)) else {
+            return;
+        };
+        c.pending_opens[dir_index(dir)].pop_front();
+
+        let stream = add_stream(c, id, true);
+        let _ = events.send(Event::StreamOpened {
+            conn,
+            request,
+            stream,
+        });
+    }
+}
+
+/// Hands queued data to quinn until it's all accepted or quinn is blocked,
+/// then finishes the stream if asked to. Bytes leave the send budget only
+/// once quinn has accepted them.
+fn write_queue(conn: &mut proto::Connection, id: proto::StreamId, send: &mut SendHalf) {
+    let mut stream = conn.send_stream(id);
+
+    while !send.queue.is_empty() {
+        match stream.write_chunks(send.queue.make_contiguous()) {
+            // A partial write leaves the rest of its chunk in place. The next
+            // write then returns `Blocked`, which registers for `Writable`.
+            Ok(written) => {
+                send.budget.release(written.bytes);
+                send.queue.drain(..written.chunks);
+            }
+            Err(WriteError::Blocked) => {
+                send.blocked = true;
+                return;
+            }
+            // The peer stopped the stream (also reported as an event), or it
+            // was already finished or reset. Nothing queued can be sent.
+            Err(WriteError::Stopped(_) | WriteError::ClosedStream) => {
+                discard_queue(send);
+                return;
+            }
+        }
+    }
+
+    if send.finish {
+        // Fails only if the stream was stopped, which arrives as an event.
+        let _ = stream.finish();
+        send.finish = false;
+    }
+}
+
+fn discard_queue(send: &mut SendHalf) {
+    let queued: usize = send.queue.drain(..).map(|data| data.len()).sum();
+    send.budget.release(queued);
+}
+
+/// Reads the stream until it's empty or its receive budget is full.
+fn read_stream(events: &Sender<Event>, c: &mut Conn, id: proto::StreamId) {
+    enum End {
+        Finished,
+        Reset(VarInt),
+    }
+
+    let Some(budget) = c.streams.get(&id).and_then(|s| s.recv.clone()) else {
+        return;
+    };
+    let mut recv = c.inner.recv_stream(id);
+    let Ok(mut chunks) = recv.read(true) else {
+        return;
+    };
+
+    let mut data = Vec::new();
+    let mut end = None;
+    loop {
+        let room = budget.room();
+        if room == 0 {
+            if budget.pause() {
+                break;
+            }
+            continue;
+        }
+
+        match chunks.next(room) {
+            Ok(Some(chunk)) => {
+                budget.deliver(chunk.bytes.len());
+                data.push(chunk.bytes);
+            }
+            Ok(None) => {
+                end = Some(End::Finished);
+                break;
+            }
+            Err(ReadError::Blocked) => break,
+            Err(ReadError::Reset(code)) => {
+                end = Some(End::Reset(code));
+                break;
+            }
+        }
+    }
+    // Any flow control update this queues is sent when the connection
+    // transmits, later in the same drive.
+    let _ = chunks.finalize();
+
+    let conn = c.id;
+    let stream = from_proto_stream(id);
+    if !data.is_empty() {
+        let _ = events.send(Event::StreamData {
+            conn,
+            stream,
+            chunks: data,
+        });
+    }
+
+    let event = match end {
+        None => return,
+        Some(End::Finished) => Event::StreamFinished { conn, stream },
+        Some(End::Reset(code)) => Event::StreamReset {
+            conn,
+            stream,
+            code: from_varint(code),
+        },
+    };
+    take_recv(c, id);
+    let _ = events.send(event);
+}
+
+fn udp_transmit<'a>(
+    transmit: &proto::Transmit,
+    contents: &'a [u8],
+) -> quinn_udp::Transmit<'a> {
+    quinn_udp::Transmit {
+        destination: transmit.destination,
+        ecn: transmit
+            .ecn
+            .and_then(|ecn| quinn_udp::EcnCodepoint::from_bits(ecn as u8)),
+        contents,
+        segment_size: transmit.segment_size,
+        src_ip: transmit.src_ip,
+    }
+}
+
+fn own_transmit(transmit: &quinn_udp::Transmit<'_>) -> OwnedTransmit {
+    OwnedTransmit {
+        destination: transmit.destination,
+        ecn: transmit.ecn,
+        segment_size: transmit.segment_size,
+        src_ip: transmit.src_ip,
+        contents: transmit.contents.to_vec(),
+    }
+}
+
+fn log_send_error(e: &io::Error) {
+    // UDP sends are best effort; QUIC retransmits whatever is lost. Path MTU
+    // probes larger than the interface MTU fail with EMSGSIZE by design.
+    if quinn_udp::is_msg_size_err(e) {
+        tracing::trace!("send failed: {e}");
+    } else {
+        tracing::debug!("send failed: {e}");
+    }
+}
+
+fn dir_index(dir: Dir) -> usize {
+    match dir {
+        Dir::Bi => 0,
+        Dir::Uni => 1,
+    }
+}
+
+fn to_proto_dir(dir: Dir) -> proto::Dir {
+    match dir {
+        Dir::Bi => proto::Dir::Bi,
+        Dir::Uni => proto::Dir::Uni,
+    }
+}
+
+fn from_proto_dir(dir: proto::Dir) -> Dir {
+    match dir {
+        proto::Dir::Bi => Dir::Bi,
+        proto::Dir::Uni => Dir::Uni,
+    }
+}
+
+fn to_proto_stream(id: StreamId) -> proto::StreamId {
+    // Stream IDs only ever come from quinn, so they fit.
+    proto::StreamId::from(VarInt::from_u64(id.0).unwrap_or(VarInt::MAX))
+}
+
+fn from_proto_stream(id: proto::StreamId) -> StreamId {
+    StreamId(id.into())
+}

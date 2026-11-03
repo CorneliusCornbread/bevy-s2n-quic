@@ -1,58 +1,222 @@
-use std::cmp::max;
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    time::Duration,
+};
 
 use bevy::{ecs::resource::Resource, tasks::available_parallelism};
-use tokio::runtime::{Handle, Runtime};
 
-use crate::common::orchestrator::{AsyncOrchestrator, handle::OrchestratorHandle};
+use crate::driver::{
+    Command, Driver, DriverGroup, DriverHandle, DriverOptions, EndpointOptions, Event,
+    IdAllocator, UdpSocket,
+};
 
-/// The number of workers determined by a percentage of total threads available.
-const DEFAULT_WORKER_PERCENT: f32 = 0.25;
+use super::router::Notice;
 
-const MIN_WORKERS: usize = 2;
+/// Machines with at least this many logical processors get a second network
+/// thread by default.
+const TWO_THREAD_MIN_CPUS: usize = 8;
 
+/// Name given to the network threads unless one is configured.
+const DEFAULT_THREAD_NAME: &str = "bevy-s2n-quic";
+
+pub(crate) type ThreadStartHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Settings for building a [QuicRuntime].
+#[derive(Default)]
+pub(crate) struct RuntimeOptions {
+    pub threads: Option<usize>,
+    pub max_connections: Option<usize>,
+    /// `(send, receive)` datagram buffer sizes, in bytes.
+    pub datagram_buffers: Option<(usize, usize)>,
+    /// `(send, receive)` byte budgets per stream.
+    pub stream_budgets: Option<(usize, usize)>,
+    pub spread_connections: Option<bool>,
+    pub thread_name: Option<String>,
+    pub on_thread_start: Option<ThreadStartHook>,
+}
+
+/// The background threads that run all QUIC network IO.
+///
+/// Each thread runs one event loop. Every server and client is assigned to
+/// one thread. A client's connections run on its thread. A server receives
+/// on its thread, and hands each connection it accepts to the thread with the
+/// fewest connections, so one busy server can use every thread.
+///
+/// [QuicDriverPlugin][crate::driver_plugin::QuicDriverPlugin] inserts this
+/// resource. Servers and clients are created with it.
 #[derive(Resource)]
-pub struct TokioRuntime {
-    pub(crate) runtime: Runtime,
-    orchestrator: AsyncOrchestrator,
+pub struct QuicRuntime {
+    drivers: Vec<DriverSlot>,
+    next_driver: AtomicUsize,
+    endpoint_options: EndpointOptions,
+    notices: Sender<Notice>,
+    notice_rx: Mutex<Receiver<Notice>>,
 }
 
-impl Default for TokioRuntime {
+struct DriverSlot {
+    driver: Driver,
+    events: Mutex<Receiver<Event>>,
+}
+
+impl Default for QuicRuntime {
     fn default() -> Self {
-        let mut worker_count =
-            ((available_parallelism() as f32) * DEFAULT_WORKER_PERCENT).ceil() as usize;
-
-        worker_count = max(MIN_WORKERS, worker_count);
-
-        Self::new(worker_count)
+        Self::with_options(RuntimeOptions::default())
     }
 }
 
-impl TokioRuntime {
-    /// Get the Tokio runtime [Handle] used for all
-    /// async tasks.
-    pub fn handle(&self) -> &Handle {
-        self.runtime.handle()
+impl QuicRuntime {
+    /// Creates a runtime with `threads` network threads.
+    pub fn new(threads: usize) -> Self {
+        Self::with_options(RuntimeOptions {
+            threads: Some(threads),
+            ..Default::default()
+        })
     }
 
-    pub(crate) fn new(worker_threads: usize) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()
-            .expect("Unable to create async runtime.");
-
-        let orchestrator =
-            AsyncOrchestrator::new(runtime.handle().clone(), worker_threads);
-
-        Self {
-            runtime,
-            orchestrator,
+    /// The number of network threads used when none is configured: 2 on
+    /// machines with at least 8 logical processors, otherwise 1.
+    ///
+    /// Useful for sizing other thread pools (such as Bevy's) around the runtime.
+    pub fn default_thread_count() -> usize {
+        if available_parallelism() >= TWO_THREAD_MIN_CPUS {
+            2
+        } else {
+            1
         }
     }
 
-    /// Returns a handle to the async task orchestrator.
-    /// This allows for the management and scheduling of async tasks.
-    pub(crate) fn orchestrator(&self) -> &OrchestratorHandle {
-        self.orchestrator.handle()
+    /// The number of network threads.
+    pub fn thread_count(&self) -> usize {
+        self.drivers.len()
+    }
+
+    pub(crate) fn with_options(options: RuntimeOptions) -> Self {
+        let threads = options
+            .threads
+            .unwrap_or_else(Self::default_thread_count)
+            .max(1);
+        let thread_name = options
+            .thread_name
+            .unwrap_or_else(|| DEFAULT_THREAD_NAME.to_owned());
+        let ids = Arc::new(IdAllocator::default());
+        let group = Arc::new(DriverGroup::new(threads));
+
+        let drivers: Vec<DriverSlot> = (0..threads)
+            .map(|index| {
+                let (driver, events) = Driver::spawn(DriverOptions {
+                    thread_name: Some(thread_name.clone()),
+                    on_thread_start: options.on_thread_start.clone(),
+                    ids: Some(ids.clone()),
+                    group: Some((group.clone(), index)),
+                })
+                .expect("Unable to start the QUIC network thread.");
+
+                DriverSlot {
+                    driver,
+                    events: Mutex::new(events),
+                }
+            })
+            .collect();
+        group.start(
+            drivers
+                .iter()
+                .map(|slot| slot.driver.handle().clone())
+                .collect(),
+        );
+
+        let mut endpoint_options = EndpointOptions {
+            max_connections: options.max_connections.unwrap_or(usize::MAX),
+            ..Default::default()
+        };
+        if let Some((send, receive)) = options.datagram_buffers {
+            endpoint_options.datagram_send_buffer = send;
+            endpoint_options.datagram_receive_buffer = receive;
+        }
+        if let Some((send, receive)) = options.stream_budgets {
+            endpoint_options.send_budget = send;
+            endpoint_options.recv_budget = receive;
+        }
+        if let Some(spread) = options.spread_connections {
+            endpoint_options.spread_connections = spread;
+        }
+        let (notices, notice_rx) = mpsc::channel();
+
+        Self {
+            drivers,
+            next_driver: AtomicUsize::new(0),
+            endpoint_options,
+            notices,
+            notice_rx: Mutex::new(notice_rx),
+        }
+    }
+
+    /// Picks the driver for a new endpoint, round robin.
+    pub(crate) fn pick_driver(&self) -> usize {
+        self.next_driver.fetch_add(1, Ordering::Relaxed) % self.drivers.len()
+    }
+
+    pub(crate) fn link(&self, driver: usize) -> Link {
+        Link {
+            driver: self.drivers[driver].driver.handle().clone(),
+            notices: self.notices.clone(),
+        }
+    }
+
+    pub(crate) fn endpoint_options(&self) -> &EndpointOptions {
+        &self.endpoint_options
+    }
+
+    pub(crate) fn notice_receiver(&self) -> &Mutex<Receiver<Notice>> {
+        &self.notice_rx
+    }
+
+    /// Each driver's event receiver, by driver index.
+    pub(crate) fn event_receivers(
+        &self,
+    ) -> impl Iterator<Item = &Mutex<Receiver<Event>>> {
+        self.drivers.iter().map(|slot| &slot.events)
+    }
+
+    /// Wakes every driver that has commands waiting.
+    pub(crate) fn flush(&self) {
+        for slot in &self.drivers {
+            slot.driver.handle().flush();
+        }
+    }
+
+    /// Each driver's `(wakes, peer wakes, busy time)`.
+    pub(crate) fn metrics(&self) -> impl Iterator<Item = (u64, u64, Duration)> + '_ {
+        self.drivers.iter().map(|slot| {
+            let metrics = slot.driver.handle().metrics();
+            (
+                metrics.wakes.load(Ordering::Relaxed),
+                metrics.peer_wakes.load(Ordering::Relaxed),
+                Duration::from_nanos(metrics.busy_nanos.load(Ordering::Relaxed)),
+            )
+        })
+    }
+}
+
+/// How a connection or stream object reaches its driver, and tells the
+/// router when it's dropped.
+#[derive(Clone)]
+pub(crate) struct Link {
+    pub driver: DriverHandle,
+    notices: Sender<Notice>,
+}
+
+impl Link {
+    /// Queues a command for the driver. It's sent when the frame ends.
+    pub fn send(&self, command: Command<UdpSocket>) {
+        self.driver.send(command);
+    }
+
+    pub fn notify(&self, notice: Notice) {
+        // The router is gone only when the app is shutting down.
+        let _ = self.notices.send(notice);
     }
 }

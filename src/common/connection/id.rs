@@ -9,7 +9,7 @@ pub struct ConnectionId {
 }
 
 impl ConnectionId {
-    pub fn new(id: u64, parent_id: QuicParentId) -> Self {
+    pub(crate) fn new(id: u64, parent_id: QuicParentId) -> Self {
         Self { parent_id, id }
     }
 

@@ -1,8 +1,9 @@
-use aeronet_io::connection::DisconnectReason;
+use aeronet_io::{Session, connection::DisconnectReason};
 use bevy::{
     app::{Plugin, Update},
     ecs::{
         entity::Entity,
+        query::Without,
         system::{Commands, Query},
     },
 };
@@ -17,7 +18,11 @@ use crate::common::{
 /// Connection disconnects will trigger aeronet's [Disconnected][aeronet_io::connection::Disconnected]
 /// event.
 ///
-/// Streams will be disconnected without an event firing
+/// Streams will be despawned without an event firing, except streams that
+/// are aeronet sessions (see
+/// [QuicSessionMode::Streams][crate::common::stream::session::QuicSessionMode::Streams]):
+/// [QuicAeronetEventPlugin][crate::common::stream::session::QuicAeronetEventPlugin]
+/// triggers `Disconnected` for those, and aeronet despawns them.
 pub struct DisconnectHandlerPlugin;
 
 impl Plugin for DisconnectHandlerPlugin {
@@ -44,29 +49,29 @@ fn handle_connection_disconnections(
                 entity,
                 reason: disconnect_reason,
             });
-            commands.entity(entity).remove::<QuicConnection>();
+            commands.entity(entity).try_remove::<QuicConnection>();
         }
     }
 }
 
 fn handle_rec_stream_disconnections(
     mut commands: Commands,
-    query: Query<(Entity, &mut QuicReceiveStream)>,
+    query: Query<(Entity, &mut QuicReceiveStream), Without<Session>>,
 ) {
     for (entity, mut stream) in query {
         if let Some(_reason) = stream.get_disconnect_reason() {
-            commands.entity(entity).despawn();
+            commands.entity(entity).try_despawn();
         }
     }
 }
 
 fn handle_send_stream_disconnections(
     mut commands: Commands,
-    query: Query<(Entity, &mut QuicSendStream)>,
+    query: Query<(Entity, &mut QuicSendStream), Without<Session>>,
 ) {
     for (entity, mut stream) in query {
         if let Some(_reason) = stream.get_disconnect_reason() {
-            commands.entity(entity).despawn();
+            commands.entity(entity).try_despawn();
         }
     }
 }

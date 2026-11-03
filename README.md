@@ -27,18 +27,22 @@ let app = App::new()
     .add_plugins(QuicAeronetPlugins)
 ```
 
-You can open a server in the following way:
+You can open a server in the following way, from a system with a `runtime: Res<QuicRuntime>` parameter:
 ```rs
-let server_comp = QuicServer::bind(&runtime, ip, cert_path, key_path)
-        .expect("Unable to bind to server address");
+let config = QuicServerConfig::from_pem_files(cert_path, key_path).expect("Invalid cert");
+let server_comp = QuicServer::bind(&runtime, ip, &config)
+    .expect("Unable to bind to server address");
 
-    commands.spawn(server_comp);
+commands.spawn(server_comp);
 ```
 
 We can then spawn a client component:
 ```rs
-// Spawn a new client with our cert
-let mut client_comp = QuicClient::new_with_tls(&runtime, cert_path).expect("Invalid cert");
+// Spawn a new client which trusts our self-signed cert
+let config = QuicClientConfig::new()
+    .with_root_pem_file(cert_path)
+    .expect("Invalid cert");
+let mut client_comp = QuicClient::new(&runtime, &config).expect("Unable to start client");
 let connect = Connect::new(ip).with_server_name("localhost");
 let conn_bundle = client_comp.open_connection(connect);
 

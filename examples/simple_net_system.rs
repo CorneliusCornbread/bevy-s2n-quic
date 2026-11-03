@@ -24,16 +24,16 @@ use bevy::{
 };
 use bevy_s2n_quic::{
     QuicDefaultPlugins,
-    client::{QuicClient, marker::QuicClientMarker},
+    client::{Connect, QuicClient, marker::QuicClientMarker},
     common::{
         connection::QuicConnection,
-        runtime::TokioRuntime,
+        runtime::QuicRuntime,
         stream::{receive::QuicReceiveStream, send::QuicSendStream},
     },
+    config::{QuicClientConfig, QuicServerConfig},
     server::{QuicServer, marker::QuicServerMarker},
 };
-use s2n_quic::client::Connect;
-use std::{net::SocketAddr, path::Path};
+use std::net::SocketAddr;
 
 fn main() {
     let _app = App::new()
@@ -76,30 +76,31 @@ fn main() {
 /// Server address we want to connect to
 const IP: &str = "127.0.0.1:7777";
 
-fn setup(mut commands: Commands, runtime: Res<TokioRuntime>) {
+fn setup(mut commands: Commands, runtime: Res<QuicRuntime>) {
     // We need to load our certs and keys to make a proper connection.
-    // QUIC requires TLS to function, there's ways to make insecure
-    // connections with s2n-quic but it's genuinely easier to use
-    // test certs.
+    // QUIC requires TLS to function, so we use self-signed test certs
+    // and have the client trust them.
 
     // REMEMBER TO USE DIFFERENT CERTS IN A PRODUCTION ENVIRONMENT!!
-    let cert_str_path = format!("{}/examples/certs/cert.pem", env!("CARGO_MANIFEST_DIR"));
-    let cert_path = Path::new(&cert_str_path);
-
-    let key_str_path = format!("{}/examples/certs/key.pem", env!("CARGO_MANIFEST_DIR"));
-    let key_path = Path::new(&key_str_path);
+    let cert_path = format!("{}/examples/certs/cert.pem", env!("CARGO_MANIFEST_DIR"));
+    let key_path = format!("{}/examples/certs/key.pem", env!("CARGO_MANIFEST_DIR"));
 
     let ip: SocketAddr = IP.parse().unwrap();
     info!("IP set to: {}", ip);
     // Spawn a new server with our given cert and private key
-    let server_comp = QuicServer::bind(&runtime, ip, cert_path, key_path)
+    let server_config =
+        QuicServerConfig::from_pem_files(&cert_path, &key_path).expect("Invalid cert");
+    let server_comp = QuicServer::bind(&runtime, ip, &server_config)
         .expect("Unable to bind to server address");
 
     commands.spawn(server_comp);
 
-    // Spawn a new client with our cert
+    // Spawn a new client which trusts our cert
+    let client_config = QuicClientConfig::new()
+        .with_root_pem_file(&cert_path)
+        .expect("Invalid cert");
     let mut client_comp =
-        QuicClient::new_with_tls(&runtime, cert_path).expect("Invalid cert");
+        QuicClient::new(&runtime, &client_config).expect("Unable to start client");
     let connect = Connect::new(ip).with_server_name("localhost");
     let conn_bundle = client_comp.open_connection(connect);
 

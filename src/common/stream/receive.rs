@@ -1,157 +1,193 @@
 use aeronet_io::packet::RecvPacket;
 use bevy::{
-    ecs::component::Component,
-    log::{
-        error, info,
-        tracing::{self},
-        warn,
+    ecs::{component::Component, lifecycle::HookContext, world::DeferredWorld},
+    log::error,
+};
+use std::{collections::VecDeque, fmt, sync::Arc};
+
+use crate::{
+    common::{
+        QuicParentId,
+        connection::disconnect::ConnectionDisconnectReason,
+        error::AppErrorCode,
+        router::{self, Half, Notice, RecvDelivery},
+        runtime::Link,
+        stream::id::StreamId,
     },
-};
-use bytes::Bytes;
-use s2n_quic::application::{self, Error as ErrorCode};
-use s2n_quic::stream::ReceiveStream;
-use std::error::Error;
-use tokio::{
-    select,
-    sync::mpsc::{self, Receiver, Sender},
-    time::Instant as TokioInstant,
+    driver::{Command, ConnId, RecvBudget, StreamId as DriverStreamId},
 };
 
-use crate::common::{
-    HandleChannelError, QuicParentId,
-    connection::{disconnect::ConnectionDisconnectReason, id::ConnectionId},
-    orchestrator::{ORCHESTRATOR_ERROR_CODE, handle::OrchestratorHandle},
-    stream::id::StreamId,
-    task_state::{OnceLockState, TaskState},
-};
-
-type AddrResult = Result<std::net::SocketAddr, s2n_quic::connection::Error>;
-
-/// How many errors can be sent at a single time without being dropped
-const DEBUG_CHANNEL_SIZE: usize = 64;
-/// How many commands can be sent to the receive socket without being processed before being dropped
-const CONTROL_CHANNEL_SIZE: usize = 32;
-/// How many messages can sit between async and bevy before being dropped
-const INBOUND_CHANNEL_SIZE: usize = 512;
-
-/// How big the receive buffer of Bytes chunks we can receive at once is to be sent to Bevy
-const INBOUND_BUFF_SIZE: usize = 128;
-
-#[derive(Debug, Component)]
+/// The receiving half of a QUIC stream.
+///
+/// Data is delivered once per frame, in
+/// [IoSystems::Poll](https://docs.rs/aeronet_io/latest/aeronet_io/enum.IoSystems.html).
+/// At most a fixed number of unread bytes are buffered; past that, the
+/// stream stops reading and QUIC flow control slows the peer down until the
+/// data is read.
+///
+/// Dropping the component asks the peer to stop sending.
+#[derive(Component)]
+#[component(on_insert, on_discard)]
 pub struct QuicReceiveStream {
-    task_state: OnceLockState<ConnectionDisconnectReason>,
-    inbound_data: Receiver<RecvPacket>,
-    inbound_control: Sender<RecControlMessage>,
-    receive_errors: Receiver<Box<dyn Error + Send + Sync>>,
+    link: Link,
+    conn: ConnId,
+    stream: DriverStreamId,
+    budget: Arc<RecvBudget>,
+    queue: VecDeque<RecvPacket>,
+    /// Why the stream ended. It's reported once `queue` is empty.
+    end: Option<ConnectionDisconnectReason>,
     stream_id: StreamId,
-    _orchestrator: OrchestratorHandle,
+    error_logged: bool,
+}
+
+impl fmt::Debug for QuicReceiveStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuicReceiveStream")
+            .field("id", &self.stream_id)
+            .field("open", &self.is_open())
+            .field("unread_packets", &self.queue.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuicReceiveStream {
-    pub fn new(
-        orchestrator: OrchestratorHandle,
-        rec: ReceiveStream,
-        parent_id: ConnectionId,
+    pub(crate) fn new(
+        link: Link,
+        conn: ConnId,
+        stream: DriverStreamId,
+        stream_id: StreamId,
+        budget: Arc<RecvBudget>,
     ) -> Self {
-        let stream_id = StreamId::new(parent_id, rec.id());
-        let addr = rec.connection().remote_addr();
-
-        let (receive_error_sender, receive_errors) = mpsc::channel(DEBUG_CHANNEL_SIZE);
-        let (inbound_control, inbound_control_receiver) =
-            mpsc::channel(CONTROL_CHANNEL_SIZE);
-        let (inbound_data_sender, inbound_data) = mpsc::channel(INBOUND_CHANNEL_SIZE);
-
-        let mut task_state = OnceLockState::new();
-
-        let task = RecTask {
-            rec,
-            control: inbound_control_receiver,
-            inbound_sender: inbound_data_sender,
-            receive_errors: receive_error_sender,
-            disconnect_flag: None,
-            task_state: task_state.clone(),
-            addr,
-            stream_id,
-        };
-
-        let res = orchestrator.push_receive(task);
-
-        if let Err(e) = res {
-            error!(
-                "Unable to push new task for stream {}, with reason: {}",
-                stream_id, e
-            );
-
-            let _ = task_state.set(ConnectionDisconnectReason::OrchestratorError);
-
-            match e {
-                mpsc::error::TrySendError::Full(mut task)
-                | mpsc::error::TrySendError::Closed(mut task) => {
-                    task.stop_sending(ORCHESTRATOR_ERROR_CODE.into());
-                }
-            }
-        }
-
         Self {
-            task_state,
-            inbound_data,
-            inbound_control,
-            receive_errors,
+            link,
+            conn,
+            stream,
+            budget,
+            queue: VecDeque::new(),
+            end: None,
             stream_id,
-            _orchestrator: orchestrator,
+            error_logged: false,
         }
+    }
+
+    fn on_insert(world: DeferredWorld, context: HookContext) {
+        router::bind::<Self>(world, context);
+    }
+
+    fn on_discard(world: DeferredWorld, context: HookContext) {
+        router::unbind::<Self>(world, context);
+    }
+
+    pub(crate) fn key(&self) -> (ConnId, DriverStreamId) {
+        (self.conn, self.stream)
+    }
+
+    pub(crate) fn deliver(&mut self, delivery: RecvDelivery) {
+        let end = match delivery {
+            RecvDelivery::Data(chunks, recv_at) => {
+                // Data still in flight when the stream was stopped.
+                if self.end.is_none() {
+                    self.queue.extend(
+                        chunks
+                            .into_iter()
+                            .map(|payload| RecvPacket { recv_at, payload }),
+                    );
+                }
+                return;
+            }
+            RecvDelivery::Finished => ConnectionDisconnectReason::PeerClosed,
+            RecvDelivery::Reset(code) => ConnectionDisconnectReason::Reset(code),
+            RecvDelivery::Lost(reason) => {
+                ConnectionDisconnectReason::ConnectionError(reason)
+            }
+        };
+        self.end.get_or_insert(end);
+    }
+
+    /// Releases `bytes` from the receive buffer, resuming reads if they were
+    /// paused.
+    fn consumed(&mut self, bytes: usize) {
+        if bytes > 0 && self.budget.consume(bytes) && self.end.is_none() {
+            self.link.send(Command::ResumeRead {
+                conn: self.conn,
+                stream: self.stream,
+            });
+        }
+    }
+
+    pub(crate) fn has_unread(&self) -> bool {
+        !self.queue.is_empty()
     }
 
     /// Receives a single packet from the QUIC stream.
     pub fn recv(&mut self) -> Option<RecvPacket> {
-        self.inbound_data.try_recv().ok()
+        let packet = self.queue.pop_front()?;
+        self.consumed(packet.payload.len());
+        Some(packet)
     }
 
-    /// Receive multiple packets of data and push them to the given
-    /// buffer for reading.
-    pub fn recv_many(&mut self, buffer: &mut Vec<RecvPacket>, limit: usize) -> usize {
-        self.inbound_data.blocking_recv_many(buffer, limit)
-    }
-
-    /// Returns `true` if this stream is still open
-    pub fn is_open(&self) -> bool {
-        !self.task_state.is_finished()
-    }
-
-    /// Gets the disconnect reason if the stream has closed.
-    /// Returns `None` if the stream is still open.
-    pub fn get_disconnect_reason(&mut self) -> Option<ConnectionDisconnectReason> {
-        self.task_state.get_disconnect_reason()
-    }
-
-    /// Notifies the peer to stop sending data on the stream.
+    /// Receive up to `limit` packets that are already waiting and push them
+    /// to the given buffer for reading.
     ///
-    /// This requests the peer to finish the stream as soon as possible by issuing a reset with the provided error_code.
-    pub fn stop_send(&mut self, err_code: ErrorCode) {
-        let Err(_e) = self
-            .inbound_control
-            .blocking_send(RecControlMessage::StopSend(err_code))
-        else {
-            return;
-        };
+    /// Never blocks. Returns the number of packets pushed, which is `0` when
+    /// no data is waiting or the stream is closed and drained. Use
+    /// [`Self::is_open`] to tell those apart.
+    pub fn recv_many(&mut self, buffer: &mut Vec<RecvPacket>, limit: usize) -> usize {
+        let count = limit.min(self.queue.len());
+        let start = buffer.len();
+        buffer.extend(self.queue.drain(..count));
 
-        warn!(
-            "Stop_send() called on stopped connection with ID: {}.",
-            self.stream_id
-        );
+        let bytes = buffer[start..].iter().map(|p| p.payload.len()).sum();
+        self.consumed(bytes);
+        count
     }
 
-    /// Outputs any outstanding errors that have happened on the
-    /// async side of this stream.
-    pub fn log_outstanding_errors(&mut self) {
-        while !self.receive_errors.is_empty() {
-            let Some(err) = self.receive_errors.blocking_recv() else {
-                continue;
-            };
+    /// Returns `true` until the stream has ended and all of its data has been
+    /// read.
+    pub fn is_open(&self) -> bool {
+        self.end.is_none() || !self.queue.is_empty()
+    }
 
+    /// Gets the disconnect reason once the stream has ended and all of its
+    /// data has been read. Returns `None` until then.
+    pub fn get_disconnect_reason(&mut self) -> Option<ConnectionDisconnectReason> {
+        if self.queue.is_empty() {
+            self.end.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Asks the peer to stop sending, with `err_code`, and discards any data
+    /// that hasn't been read.
+    pub fn stop_send(&mut self, err_code: AppErrorCode) {
+        if self.end.is_some() {
+            return;
+        }
+
+        self.link.send(Command::Stop {
+            conn: self.conn,
+            stream: self.stream,
+            code: err_code,
+        });
+        self.end = Some(ConnectionDisconnectReason::UserClosed);
+        self.queue.clear();
+    }
+
+    /// Logs why the stream closed, once, if it closed because of an error.
+    pub fn log_outstanding_errors(&mut self) {
+        if let Some(reason) = &self.end
+            && !self.error_logged
+            && !matches!(
+                reason,
+                ConnectionDisconnectReason::UserClosed
+                    | ConnectionDisconnectReason::PeerClosed
+            )
+        {
+            self.error_logged = true;
             error!(
-                "Receiver ID: {}, encountered error:\n{}",
-                self.stream_id, err
+                "Receiver ID: {}, encountered error:\n{:?}",
+                self.stream_id, reason
             );
         }
     }
@@ -167,176 +203,19 @@ impl QuicReceiveStream {
     }
 }
 
-enum RecControlMessage {
-    StopSend(ErrorCode),
-}
-
-#[derive(Debug)]
-pub(crate) struct RecTask {
-    task_state: OnceLockState<ConnectionDisconnectReason>,
-    rec: ReceiveStream,
-    control: Receiver<RecControlMessage>,
-    inbound_sender: Sender<RecvPacket>,
-    receive_errors: Sender<Box<dyn Error + Send + Sync>>,
-    disconnect_flag: Option<ConnectionDisconnectReason>,
-    addr: AddrResult,
-    stream_id: StreamId,
-}
-
-impl RecTask {
-    pub(crate) fn id(&self) -> StreamId {
-        self.stream_id
-    }
-
-    pub(crate) fn stop_sending(&mut self, error_code: application::Error) {
-        let _ = self.rec.stop_sending(error_code);
-    }
-
-    #[tracing::instrument(
-        name = "quic_rec_poll"
-        skip(self),
-        fields(stream_id = %self.stream_id, remote_address = ?self.addr)
-    )]
-    pub(crate) async fn poll_once(&mut self) -> &Option<ConnectionDisconnectReason> {
-        if self.disconnect_flag.is_some() {
-            return &self.disconnect_flag;
+impl Drop for QuicReceiveStream {
+    fn drop(&mut self) {
+        if self.end.is_none() {
+            self.link.send(Command::Stop {
+                conn: self.conn,
+                stream: self.stream,
+                code: AppErrorCode::UNKNOWN,
+            });
         }
-
-        let mut read_buf: [Bytes; INBOUND_BUFF_SIZE] =
-            std::array::from_fn(|_| Bytes::new());
-
-        select! {
-            biased;
-
-            result = self.rec.receive_vectored(&mut read_buf) => {
-                self.handle_receive_result(&mut read_buf, result);
-            }
-
-            cmd_opt = self.control.recv() => {
-                if let Some(cmd) = cmd_opt {
-                    match cmd {
-                        RecControlMessage::StopSend(error_code) => {
-                            self.disconnect_flag = Some(ConnectionDisconnectReason::UserClosed);
-
-                            if let Err(stream_err) = self.rec.stop_sending(error_code) {
-                                warn!("Stream error on receive stop_send():\n{stream_err}");
-                            }
-                        }
-                    }
-                }
-                else {
-                    info!("Receive control channel is closed, closing receive stream.");
-                    self.disconnect_flag = Some(ConnectionDisconnectReason::MspcChannelClosed {
-                        channel_name: "Control channel"
-                    })
-                };
-            }
-        }
-
-        if let Some(disconnect) = &self.disconnect_flag {
-            let state = disconnect.clone();
-            let _ = disconnect;
-
-            self.stop_and_empty().await;
-
-            let _ = self.task_state.set(state);
-
-            info!("Receive stream has been closed");
-        }
-
-        &self.disconnect_flag
-    }
-
-    fn handle_receive_result(
-        &mut self,
-        read_buf: &mut [Bytes; INBOUND_BUFF_SIZE],
-        result: Result<(usize, bool), s2n_quic::stream::Error>,
-    ) {
-        match result {
-            Ok((size, is_open)) => {
-                let instant = TokioInstant::now();
-
-                for data in &mut read_buf[..size] {
-                    let payload = std::mem::take(data);
-
-                    let packet = RecvPacket {
-                        recv_at: instant.into_std(),
-                        payload,
-                    };
-
-                    self.transfer_payload_data(packet);
-                }
-
-                if !is_open {
-                    self.disconnect_flag = Some(ConnectionDisconnectReason::PeerClosed);
-                }
-            }
-            Err(e) => {
-                match e {
-                    s2n_quic::stream::Error::ConnectionError { error, .. } => {
-                        error!("Receive stream connection error: {error}");
-                        self.disconnect_flag =
-                            Some(ConnectionDisconnectReason::ConnectionError(error));
-                    }
-
-                    s2n_quic::stream::Error::InvalidStream { source, .. } => {
-                        error!("Invalid receive stream: {source}");
-                        self.disconnect_flag =
-                            Some(ConnectionDisconnectReason::InvalidStream);
-                    }
-
-                    s2n_quic::stream::Error::StreamReset { error, source, .. } => {
-                        error!("Receive stream reset: {error}, Source: {source}");
-                        self.disconnect_flag =
-                            Some(ConnectionDisconnectReason::Reset(error));
-                    }
-
-                    _ => {
-                        error!("Error when reading from receive stream: {}", e);
-                    }
-                }
-
-                self.receive_errors.try_send(Box::new(e)).handle_err();
-            }
-        }
-    }
-
-    fn transfer_payload_data(&mut self, packet: RecvPacket) {
-        let Err(inbound_err) = self.inbound_sender.try_send(packet) else {
-            return;
-        };
-
-        match inbound_err {
-            mpsc::error::TrySendError::Full(_) => {
-                error!(
-                    "The inbound receive channel, is full. The message received will be dropped."
-                );
-            }
-            mpsc::error::TrySendError::Closed(_) => {
-                warn!(
-                    "The inbound receive channel, is closed. The message received will be dropped and the stream will be closed."
-                );
-
-                self.disconnect_flag =
-                    Some(ConnectionDisconnectReason::MspcChannelClosed {
-                        channel_name: "Inbound receive channel",
-                    });
-            }
-        }
-    }
-
-    async fn stop_and_empty(&mut self) {
-        let _send_res = self.rec.stop_sending(ErrorCode::UNKNOWN);
-        let instant = TokioInstant::now();
-
-        // Empty out receiver
-        while let Ok(Some(payload)) = self.rec.receive().await {
-            let packet = RecvPacket {
-                recv_at: instant.into_std(),
-                payload,
-            };
-
-            self.transfer_payload_data(packet);
-        }
+        self.link.notify(Notice::HalfReleased {
+            conn: self.conn,
+            stream: self.stream,
+            half: Half::Recv,
+        });
     }
 }
