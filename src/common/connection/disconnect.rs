@@ -1,6 +1,7 @@
 use std::{error::Error, sync::Arc};
 
-use aeronet_io::{anyhow::anyhow, connection::DisconnectReason};
+use aeronet_io::connection::DisconnectReason;
+use anyhow::anyhow;
 use s2n_quic::connection::Error as ConnectionError;
 
 #[derive(Clone, Debug)]

@@ -98,7 +98,7 @@ async fn build_tls<C: IntoCertificate>(certificate: C) -> Result<Client, TlsErro
         .with_certificate(certificate)?
         .build()?;
 
-    let client = Client::builder()
+    /* let client = Client::builder()
         .with_io("0.0.0.0:0")
         .expect("Unable to build client... are we... out of sockets??")
         .with_tls(tls)
@@ -106,5 +106,7 @@ async fn build_tls<C: IntoCertificate>(certificate: C) -> Result<Client, TlsErro
         .start()
         .expect("Unable to start client");
 
-    Ok(client)
+    Ok(client) */
+
+    todo!("To be removed/rewritten");
 }

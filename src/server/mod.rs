@@ -101,8 +101,9 @@ async fn build_server<C: IntoCertificate, PK: IntoPrivateKey>(
         .with_certificate(certificate, private_key)?
         .build()?;
 
-    let server = Server::builder().with_tls(tls)?.with_io(ip)?.start()?;
-    Ok(server)
+    //let server = Server::builder().with_tls(tls)?.with_io(ip)?.start()?;
+    //Ok(server)
+    todo!("To be removed/rewritten");
 }
 
 pub enum QuitReason {
